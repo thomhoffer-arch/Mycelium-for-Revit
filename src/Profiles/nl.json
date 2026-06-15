@@ -4,7 +4,9 @@
     "NLRS_C_breedte_01",
     "breedte_01",
     "clear_width",
-    "width"
+    "width",
+    "NLRS_C_doorgangsbreedte",
+    "Breedte"
   ],
   "roomFunctionParams": [
     "function",
