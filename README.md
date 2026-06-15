@@ -31,45 +31,38 @@ PDRA names the tools `pdra_get_model_revision` etc. internally; the MCP listener
 
 ---
 
-## Build
+## Install (one shot)
 
-Multi-targeted: `net48` for Revit 2024, `net8.0-windows` for Revit 2025/2026. From repo root:
-
-```powershell
-# Revit 2024 (.NET Framework 4.8)
-dotnet build .\LoamRevitConnector.sln -c Release -f net48 -p:RevitVersion=2024
-
-# Revit 2025 (.NET 8)
-dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows -p:RevitVersion=2025
-
-# Revit 2026 (.NET 8)
-dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows -p:RevitVersion=2026
-```
-
-Override the API path if Revit isn't at the default location:
-```powershell
--p:RevitApiDir="D:\Autodesk\Revit 2025"
-```
-
-Prereqs: .NET SDK 8+ with the **.NET Framework 4.8 Developer Pack** (for 2024 builds), and `RevitAPI.dll` / `RevitAPIUI.dll` present in the per-version Revit install dir (they ship with Revit; not redistributable).
-
-## Install
-
-Copy the build output into the version-matching add-in folder:
+`install.ps1` builds for a Revit version, deploys to Revit's add-in folder, and registers the MCP server in both **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`) and **Claude Code** (via `claude mcp add` when the CLI is on PATH):
 
 ```powershell
-$year = "2025"  # or 2024 / 2026
-$tfm  = if ($year -eq "2024") { "net48" } else { "net8.0-windows" }
-$dst  = "$env:APPDATA\Autodesk\Revit\Addins\$year"
-New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item -Recurse -Force .\src\bin\Release\$tfm\* $dst
+.\install.ps1 -RevitVersion 2025
 ```
 
-Launch Revit; the MCP server starts on port 47100. Point Loam at it:
+Flags: `-RevitApiDir <path>` (override Revit install location), `-Url <url>` (defaults to `http://127.0.0.1:47100/mcp`), `-Name <name>` (MCP entry name in Claude configs; defaults to `loam-revit`), `-SkipBuild`, `-SkipDeploy`, `-SkipClaude`.
+
+Prereqs: .NET SDK 8+, **.NET Framework 4.8 Developer Pack** for 2024 builds, and `RevitAPI.dll` / `RevitAPIUI.dll` present in the per-version Revit install dir (they ship with Revit; not redistributable).
+
+Launch Revit, open a project, restart Claude Desktop (so it reloads its config), and the 5 tools appear under the `loam-revit` MCP server. Point Loam at the same URL:
 
 ```
 LOAM_MODEL_SOURCE=revit-connector
 LOAM_REVIT_URL=http://127.0.0.1:47100/mcp
+```
+
+### Build only (manual)
+
+If you only want the build step (e.g. CI):
+
+```powershell
+# Revit 2024 -> net48
+dotnet build .\LoamRevitConnector.sln -c Release -f net48           -p:RevitVersion=2024
+
+# Revit 2025 -> net8.0-windows
+dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows  -p:RevitVersion=2025
+
+# Revit 2026 -> net8.0-windows
+dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows  -p:RevitVersion=2026
 ```
 
 ---
