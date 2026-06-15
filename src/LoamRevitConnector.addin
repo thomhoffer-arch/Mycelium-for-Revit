@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>Loam Revit Connector</Name>
+    <Assembly>LoamRevitConnector.dll</Assembly>
+    <AddInId>5b1f9e2c-9a8d-4b0d-9f12-7b3e4d5a6c01</AddInId>
+    <FullClassName>Loam.Revit.Connector.App</FullClassName>
+    <VendorId>LOAM</VendorId>
+    <VendorDescription>Loam — Connective Spine</VendorDescription>
+  </AddIn>
+</RevitAddIns>

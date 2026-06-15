@@ -1,0 +1,28 @@
+{
+  "id": "nl",
+  "doorClearWidthParams": [
+    "NLRS_C_breedte_01",
+    "NLRS_C_doorgangsbreedte",
+    "Breedte"
+  ],
+  "roomFunctionParams": [
+    "function",
+    "ruimtefunctie",
+    "gebruiksfunctie",
+    "NLRS_C_ruimtefunctie",
+    "Name"
+  ],
+  "classificationCodeParams": [
+    "NL/SfB",
+    "NL-SfB",
+    "Assembly Code",
+    "Omniclass Number"
+  ],
+  "classificationDescriptionParams": [
+    "NL/SfB omschrijving",
+    "Assembly Description",
+    "Omniclass Title"
+  ],
+  "classificationCodeRegex": "^\\d{1,2}(\\.\\d{1,3})?$",
+  "doorTypeNameParam": null
+}
