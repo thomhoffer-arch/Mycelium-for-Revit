@@ -20,6 +20,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             "project name without manual seeding.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
+        public Verifiability Verifiability => Verifiability.Auto;
 
         public JsonNode InputSchema => JsonHelpers.EmptyObjectSchema();
 
