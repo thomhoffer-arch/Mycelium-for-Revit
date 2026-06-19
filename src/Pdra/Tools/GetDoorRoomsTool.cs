@@ -61,7 +61,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             int limit = 200;
             if (args.TryGetProperty("limit", out var limEl) && limEl.ValueKind == JsonValueKind.Number)
-                limit = Math.Clamp(limEl.GetInt32(), 1, 2000);
+                limit = JsonHelpers.Clamp(limEl.GetInt32(), 1, 2000);
 
             var doors = ResolveElements(uidoc, doc, args, defaultCategory: BuiltInCategory.OST_Doors, out var targErr);
             if (targErr is not null) return ToolResult.Error(targErr);

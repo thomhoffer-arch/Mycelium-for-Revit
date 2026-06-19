@@ -64,8 +64,13 @@ namespace PDRA.Services.Ai.Tools.Queries
 
         private static string Hash(string s)
         {
-            var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(s));
-            return Convert.ToHexString(bytes, 0, 8).ToLowerInvariant();
+            // SHA256.HashData / Convert.ToHexString are .NET 5+, absent on net48
+            // (Revit 2024); use the instance API and manual hex instead.
+            using var sha = SHA256.Create();
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+            var sb = new StringBuilder(16);
+            for (var i = 0; i < 8; i++) sb.Append(bytes[i].ToString("x2"));
+            return sb.ToString();
         }
     }
 }

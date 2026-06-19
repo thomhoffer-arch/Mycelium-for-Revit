@@ -88,6 +88,6 @@ namespace PDRA.Services.Ai.Tools.Queries
 
         private static (string, BuiltInParameter)[] ResolveLabelled(params (string Label, string Bip)[] pairs)
             => pairs.Where(p => Enum.TryParse<BuiltInParameter>(p.Bip, out _))
-                    .Select(p => (p.Label, Enum.Parse<BuiltInParameter>(p.Bip))).ToArray();
+                    .Select(p => (p.Label, (BuiltInParameter)Enum.Parse(typeof(BuiltInParameter), p.Bip))).ToArray();
     }
 }

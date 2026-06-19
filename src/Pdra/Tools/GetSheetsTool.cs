@@ -66,7 +66,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 && ieProp.ValueKind == JsonValueKind.True;
 
             var elemLimit = args.TryGetInt("element_limit", out var elRaw)
-                ? Math.Clamp(elRaw, 1, 1000) : 100;
+                ? JsonHelpers.Clamp(elRaw, 1, 1000) : 100;
 
             var limit  = args.GetLimit(100, 500);
             var fields = args.GetFields();

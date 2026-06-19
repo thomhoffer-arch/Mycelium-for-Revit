@@ -71,7 +71,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             int limit = 1000;
             if (args.TryGetProperty("limit", out var limEl) && limEl.ValueKind == JsonValueKind.Number)
-                limit = Math.Clamp(limEl.GetInt32(), 1, 10000);
+                limit = JsonHelpers.Clamp(limEl.GetInt32(), 1, 10000);
 
             var elements = ResolveElements(uidoc, doc, args, out var targErr);
             if (targErr is not null) return ToolResult.Error(targErr);

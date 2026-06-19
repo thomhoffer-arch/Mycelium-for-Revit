@@ -6,6 +6,11 @@ namespace PDRA.Services.Ai.Tools.Queries
 {
     internal static class JsonHelpers
     {
+        /// <summary>Clamp an int into [min, max]. Hand-rolled because Math.Clamp
+        /// is not available on .NET Framework 4.8 (Revit 2024 target).</summary>
+        public static int Clamp(int value, int min, int max)
+            => value < min ? min : (value > max ? max : value);
+
         public static JsonNode EmptyObjectSchema() =>
             new JsonObject
             {
@@ -24,7 +29,7 @@ namespace PDRA.Services.Ai.Tools.Queries
         /// in one result; callers report <c>total</c>/<c>truncated</c> so it can refine.
         /// </summary>
         public static int GetLimit(this JsonElement el, int def = 200, int max = 1000)
-            => el.TryGetInt("limit", out var l) ? System.Math.Clamp(l, 1, max) : def;
+            => el.TryGetInt("limit", out var l) ? Clamp(l, 1, max) : def;
 
         /// <summary>Standard schema fragment for the "limit" arg (see <see cref="GetLimit"/>).</summary>
         public static JsonObject LimitSchemaProp(int def = 200, int max = 1000) =>
