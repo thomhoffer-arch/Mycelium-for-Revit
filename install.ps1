@@ -117,7 +117,6 @@ if (-not $SkipClaude) {
 }
 
 Write-Host ""
-Write-Host "Done. Start Revit $RevitVersion, open a project, then verify:" -ForegroundColor Cyan
-$verifyBody = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
-Write-Host "  Invoke-RestMethod -Method Post -Uri $Url -ContentType application/json ``" -ForegroundColor Gray
-Write-Host "    -Body '$verifyBody'" -ForegroundColor Gray
+Write-Host "Done. Start Revit $RevitVersion and open a project." -ForegroundColor Cyan
+Write-Host "The MCP server starts automatically with Revit." -ForegroundColor Gray
+Write-Host "Verify it is running: GET $Url (should return JSON)" -ForegroundColor Gray
