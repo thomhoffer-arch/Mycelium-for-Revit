@@ -11,27 +11,39 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
-  <!--
-    Revit API per version (RevitAPI.dll, RevitAPIUI.dll — not redistributable).
-    Resolution order:
-      1. -p:RevitApiDir=<path>            (explicit override, any build)
-      2. -p:RevitVersion=2024|2025|2026   (picks the matching default install path)
-      3. TFM default: net48 -> Revit 2024, net8.0-windows -> Revit 2026
-  -->
-  <PropertyGroup>
-    <RevitApiDir Condition="'$(RevitApiDir)' == '' AND '$(RevitVersion)' == '2024'">C:\Program Files\Autodesk\Revit 2024</RevitApiDir>
-    <RevitApiDir Condition="'$(RevitApiDir)' == '' AND '$(RevitVersion)' == '2025'">C:\Program Files\Autodesk\Revit 2025</RevitApiDir>
-    <RevitApiDir Condition="'$(RevitApiDir)' == '' AND '$(RevitVersion)' == '2026'">C:\Program Files\Autodesk\Revit 2026</RevitApiDir>
-    <RevitApiDir Condition="'$(RevitApiDir)' == '' AND '$(TargetFramework)' == 'net48'">C:\Program Files\Autodesk\Revit 2024</RevitApiDir>
-    <RevitApiDir Condition="'$(RevitApiDir)' == '' AND '$(TargetFramework)' == 'net8.0-windows'">C:\Program Files\Autodesk\Revit 2026</RevitApiDir>
-  </PropertyGroup>
-
   <ItemGroup>
     <!-- System.Text.Json is in-box on net8.0, packaged for net48. -->
     <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />
   </ItemGroup>
 
-  <ItemGroup>
+  <!--
+    Revit API reference assemblies via NuGet (Nice3point packages — compile-time
+    only, excluded from output; Revit provides the real DLLs at runtime).
+    net48  → Revit 2024 API.
+    net8.0 → Revit 2026 API (binary-compatible with Revit 2025 and 2026).
+
+    For local builds against a physical Revit install, pass:
+      -p:RevitApiDir="C:\Program Files\Autodesk\Revit 2024"
+    and the HintPath block below will take priority over the NuGet packages.
+  -->
+  <PropertyGroup>
+    <UseLocalRevitApi Condition="'$(RevitApiDir)' != ''">true</UseLocalRevitApi>
+  </PropertyGroup>
+
+  <!-- NuGet path (CI + local without Revit installed) -->
+  <ItemGroup Condition="'$(UseLocalRevitApi)' != 'true' AND '$(TargetFramework)' == 'net48'">
+    <PackageReference Include="Nice3point.Revit.Api" Version="[2024.0,2025.0)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalRevitApi)' != 'true' AND '$(TargetFramework)' == 'net8.0-windows'">
+    <PackageReference Include="Nice3point.Revit.Api" Version="[2026.0,2027.0)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <!-- Local Revit install override (kept for dev convenience) -->
+  <ItemGroup Condition="'$(UseLocalRevitApi)' == 'true'">
     <Reference Include="RevitAPI">
       <HintPath>$(RevitApiDir)\RevitAPI.dll</HintPath>
       <Private>false</Private>

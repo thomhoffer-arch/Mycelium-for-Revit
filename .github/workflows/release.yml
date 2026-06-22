@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Version tag (e.g. v1.0.0)'
+        required: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/LoamRevitConnector.csproj
+
+      - name: Build Revit 2024 (net48)
+        run: dotnet build src/LoamRevitConnector.csproj -c Release -f net48 --no-restore
+
+      - name: Build Revit 2025-2026 (net8.0-windows)
+        run: dotnet build src/LoamRevitConnector.csproj -c Release -f net8.0-windows --no-restore
+
+      - name: Package Revit 2024
+        shell: pwsh
+        run: |
+          $out = "src/bin/Release/net48"
+          $zip = "loam-revit-connector-revit2024.zip"
+          Compress-Archive -Path "$out/*" -DestinationPath $zip
+          Write-Host "Created $zip"
+
+      - name: Package Revit 2025-2026
+        shell: pwsh
+        run: |
+          $out = "src/bin/Release/net8.0-windows"
+          $zip = "loam-revit-connector-revit2025-2026.zip"
+          Compress-Archive -Path "$out/*" -DestinationPath $zip
+          Write-Host "Created $zip"
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ github.event.inputs.tag }}"
+          } else {
+            "${{ github.ref_name }}"
+          }
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          draft: false
+          prerelease: false
+          body: |
+            ## Installation
+
+            1. Download the ZIP for your Revit version
+            2. Extract the contents into your Revit add-ins folder:
+               - **Revit 2024**: `%APPDATA%\Autodesk\Revit\Addins\2024\`
+               - **Revit 2025**: `%APPDATA%\Autodesk\Revit\Addins\2025\`
+               - **Revit 2026**: `%APPDATA%\Autodesk\Revit\Addins\2026\`
+            3. Open Revit and a project — the MCP server starts automatically
+            4. Register the server in Claude Desktop or Claude Code:
+               - URL: `http://127.0.0.1:47100/mcp`
+
+            If multiple Revit instances are open, only the first one serves MCP requests.
+          files: |
+            loam-revit-connector-revit2024.zip
+            loam-revit-connector-revit2025-2026.zip
