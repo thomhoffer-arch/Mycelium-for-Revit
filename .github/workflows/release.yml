@@ -69,10 +69,10 @@ jobs:
           body: |
             ## One-click install
 
-            1. Download **`install.ps1`** below
-            2. Right-click it → **Run with PowerShell**
+            1. Download **`install.bat`** below
+            2. Double-click it
 
-            The script auto-detects Revit 2024/2025/2026, downloads and installs
+            The installer auto-detects Revit 2024/2025/2026, downloads and installs
             the connector for each version found, and registers the MCP server in
             Claude Desktop and Claude Code.
 
@@ -81,6 +81,7 @@ jobs:
             If multiple Revit instances are open simultaneously, only the first one
             serves MCP requests — subsequent instances load silently.
           files: |
+            install.bat
             install.ps1
             loam-revit-connector-revit2024.zip
             loam-revit-connector-revit2025-2026.zip
