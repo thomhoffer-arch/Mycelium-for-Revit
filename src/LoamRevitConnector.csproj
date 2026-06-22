@@ -32,12 +32,18 @@
 
   <!-- NuGet path (CI + local without Revit installed) -->
   <ItemGroup Condition="'$(UseLocalRevitApi)' != 'true' AND '$(TargetFramework)' == 'net48'">
-    <PackageReference Include="Nice3point.Revit.Api" Version="[2024.0,2025.0)">
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPI" Version="[2024.0,2025.0)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPIUI" Version="[2024.0,2025.0)">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
   </ItemGroup>
   <ItemGroup Condition="'$(UseLocalRevitApi)' != 'true' AND '$(TargetFramework)' == 'net8.0-windows'">
-    <PackageReference Include="Nice3point.Revit.Api" Version="[2026.0,2027.0)">
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPI" Version="[2026.0,2027.0)">
+      <ExcludeAssets>runtime</ExcludeAssets>
+    </PackageReference>
+    <PackageReference Include="Nice3point.Revit.Api.RevitAPIUI" Version="[2026.0,2027.0)">
       <ExcludeAssets>runtime</ExcludeAssets>
     </PackageReference>
   </ItemGroup>
