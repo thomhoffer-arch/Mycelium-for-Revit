@@ -1,73 +1,55 @@
-# loam-revit-connector
+# Mycelium Studio — Revit Connector
 
-A **Revit model source** for the [Loam](https://github.com/thomhoffer-arch/Loam) orchestrator. Exposes Revit data over **MCP** so Loam can build spine records — the connector itself does **not** emit spine records and does **not** maintain a provenance ledger.
+A **Revit MCP connector** for [Mycelium Studio](https://github.com/thomhoffer-arch/Mycelium). Loads as a Revit add-in, starts an MCP-over-HTTP server on port 47100, and exposes Revit model data as tools that Mycelium Studio (or any MCP client) can call. The connector is **read-only** — it surfaces raw Revit data; Mycelium Studio builds spine records and runs all orchestration logic from that data.
 
-The five Revit ops are **PDRA's implementations verbatim** (vendored under `src/Pdra/`). One contract, one implementation, two front-ends (PDRA and this connector).
-
-Authoritative wire contract: [REVIT_MODEL_SOURCE_CONTRACT.md](https://github.com/thomhoffer-arch/loam/blob/main/docs/connectors/REVIT_MODEL_SOURCE_CONTRACT.md) (Loam) — `docs/CONTRACT.md` here is a local mirror. See `ROADMAP.md` for what's done / next / out-of-scope.
+The Revit tool implementations are **PDRA's verbatim** (vendored under `src/Pdra/`). One contract, two front-ends (PDRA and this connector).
 
 ---
 
-## Contract
+## What it exposes
 
-Transport: **MCP over Streamable HTTP**, JSON-RPC (`initialize` → `tools/call`). Tool output is returned as a JSON string in `result.content[0].text`. Optional bearer auth via `Authorization: Bearer <token>`.
+All tools are read-only. No writes, no transactions, no side effects.
 
-Defaults:
+| Tool | What it returns |
+|---|---|
+| `get_model_revision` | Freshness stamp: `version_guid`, `number_of_saves`, `has_unsaved_changes`, document title and path |
+| `get_project_info` | Project identity from `Document.ProjectInformation`: name, number, client, address, building |
+| `get_rooms` | All rooms with number, name, level, area (ft² and display units), `unique_id` |
+| `get_levels` | All levels sorted by elevation — `unique_id`, `id`, name, elevation in internal and display units |
+| `get_views` | All non-sheet views (plans, sections, elevations, 3D, drafting, schedules) excluding templates |
+| `get_sheets` | All drawing sheets with placed views; optionally includes visible element data per view |
+| `get_links` | All Revit links — name, loaded status, `project_key` for loaded links |
+| `filter_elements_by_scope_box` | Elements inside (or intersecting) a scope box, by category — with `unique_id`, numeric `id`, `ifc_guid`, level, design option, link flag |
+| `get_element_by_uniqueid` | Resolves one or more UniqueIds (host + loaded links) → name, type, level, classification |
+| `get_element_by_ifcguid` | Finds elements by IFC GlobalId — fallback identity path |
+| `get_door_rooms` | Rooms on both sides of each door (Revit From/To Room or geometric fallback) with clear-width parameter and room function |
+
+PDRA tool names (`pdra_get_model_revision` etc.) are also accepted; the server advertises the unprefixed names via `tools/list`.
+
+---
+
+## Transport
+
+**MCP over Streamable HTTP**, JSON-RPC: `initialize` → `tools/call`. Tool output is a JSON string in `result.content[0].text`. Optional bearer auth via `Authorization: Bearer <token>`.
 
 | env var | default |
 |---|---|
-| `LOAM_REVIT_LISTEN` | `http://127.0.0.1:47100/mcp` |
-| `LOAM_REVIT_TOKEN`  | _unset = no auth_ |
+| `MYCELIUM_REVIT_LISTEN` | `http://127.0.0.1:47100/mcp` |
+| `MYCELIUM_REVIT_TOKEN`  | _unset = no auth_ |
 
-The five tools — snake_case wire names, dispatched to PDRA's `IPdraTool` implementations:
-
-1. `get_model_revision`
-2. `filter_elements_by_scope_box`
-3. `get_element_by_uniqueid`
-4. `get_element_by_ifcguid`
-5. `get_door_rooms`
-
-Plus one optional tool — `get_project_info` (`{}` → `{ name, number, client?, address?, building? }`
-from `Document.ProjectInformation`). Additive: when present it lets Loam auto-seed the project; absent,
-Loam degrades to learning the project from mail.
-
-PDRA names the tools `pdra_get_model_revision` etc. internally; the MCP listener accepts **both** forms but advertises the unprefixed contract names via `tools/list`.
+If multiple Revit instances are open, only the first one serves MCP requests — subsequent instances load silently (port already owned).
 
 ---
 
-## Install (one shot)
+## Install (one click)
 
-`install.ps1` builds for a Revit version, deploys to Revit's add-in folder, and registers the MCP server in both **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`) and **Claude Code** (via `claude mcp add` when the CLI is on PATH):
+Download **`install.bat`** from the [latest release](https://github.com/thomhoffer-arch/Mycelium-for-Revit/releases/latest) and double-click it.
 
-```powershell
-.\install.ps1 -RevitVersion 2025
-```
+The installer auto-detects Revit 2024, 2025, and 2026, downloads the correct build for each version found, installs it to Revit's add-in folder, and registers the MCP server in both **Claude Desktop** (`%APPDATA%\Claude\claude_desktop_config.json`) and **Claude Code** (via `claude mcp add` when the CLI is on PATH).
 
-Flags: `-RevitApiDir <path>` (override Revit install location), `-Url <url>` (defaults to `http://127.0.0.1:47100/mcp`), `-Name <name>` (MCP entry name in Claude configs; defaults to `loam-revit`), `-SkipBuild`, `-SkipDeploy`, `-SkipClaude`.
+**MCP URL:** `http://127.0.0.1:47100/mcp`
 
-Prereqs: .NET SDK 8+, **.NET Framework 4.8 Developer Pack** for 2024 builds, and `RevitAPI.dll` / `RevitAPIUI.dll` present in the per-version Revit install dir (they ship with Revit; not redistributable).
-
-Launch Revit, open a project, restart Claude Desktop (so it reloads its config), and the 5 tools appear under the `loam-revit` MCP server. Point Loam at the same URL:
-
-```
-LOAM_MODEL_SOURCE=revit-connector
-LOAM_REVIT_URL=http://127.0.0.1:47100/mcp
-```
-
-### Build only (manual)
-
-If you only want the build step (e.g. CI):
-
-```powershell
-# Revit 2024 -> net48
-dotnet build .\LoamRevitConnector.sln -c Release -f net48           -p:RevitVersion=2024
-
-# Revit 2025 -> net8.0-windows
-dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows  -p:RevitVersion=2025
-
-# Revit 2026 -> net8.0-windows
-dotnet build .\LoamRevitConnector.sln -c Release -f net8.0-windows  -p:RevitVersion=2026
-```
+Launch Revit and open a project — the MCP server starts automatically.
 
 ---
 
@@ -80,7 +62,7 @@ src/
     McpServer.cs                    # HttpListener + JSON-RPC dispatcher → IPdraTool
   RevitBridge/
     RevitContext.cs                 # ExternalEvent marshalling to UI thread
-  Pdra/                             # PDRA main @ 9df8a97 — VERBATIM, do not fork
+  Pdra/                             # PDRA main — VERBATIM, do not fork
     IPdraTool.cs / ToolMetadata.cs / PdraJson.cs / JsonHelpers.cs
     SpineKeys.cs / ElementContextReader.cs
     Tools/
@@ -92,7 +74,7 @@ src/
   LoamRevitConnector.addin
   LoamRevitConnector.csproj
 docs/
-  CONTRACT.md                       # field-level Loam contract reference (mirror)
+  CONTRACT.md                       # field-level wire contract
 ROADMAP.md
 ```
 
@@ -102,7 +84,5 @@ Files under `src/Pdra/` are PDRA `main` verbatim — bug fixes go upstream to PD
 
 ## See also
 
-- [Loam (orchestrator)](https://github.com/thomhoffer-arch/Loam)
-- [Mycelium (Connective Spine)](https://github.com/thomhoffer-arch/Mycelium)
+- [Mycelium Studio](https://github.com/thomhoffer-arch/Mycelium)
 - [PDRA (Revit MCP tools — source of `src/Pdra/`)](https://github.com/thomhoffer-arch/PDRA)
-- [Full contract spec (REVIT_MODEL_SOURCE_CONTRACT.md)](https://github.com/thomhoffer-arch/loam/blob/main/docs/connectors/REVIT_MODEL_SOURCE_CONTRACT.md)

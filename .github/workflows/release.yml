@@ -67,19 +67,21 @@ jobs:
           draft: false
           prerelease: false
           body: |
-            ## One-click install
+            ## Mycelium Studio — Revit Connector
+
+            ### One-click install
 
             1. Download **`install.bat`** below
             2. Double-click it
 
-            The installer auto-detects Revit 2024/2025/2026, downloads and installs
-            the connector for each version found, and registers the MCP server in
-            Claude Desktop and Claude Code.
+            Auto-detects Revit 2024/2025/2026, installs the connector for each
+            version found, and registers the MCP server in Claude Desktop and Claude Code.
 
             **MCP URL:** `http://127.0.0.1:47100/mcp`
 
-            If multiple Revit instances are open simultaneously, only the first one
-            serves MCP requests — subsequent instances load silently.
+            Start Revit and open a project — the MCP server starts automatically.
+            If multiple Revit instances are open, only the first one serves MCP
+            requests; subsequent instances load silently.
           files: |
             install.bat
             install.ps1

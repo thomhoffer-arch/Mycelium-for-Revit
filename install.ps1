@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  One-click installer for the Loam Revit Connector.
+  One-click installer for the Mycelium Studio Revit Connector.
 
 .DESCRIPTION
   Downloads the latest pre-built release from GitHub, installs it into every
@@ -9,20 +9,19 @@
   listener in Claude Desktop's config and (when the CLI is on PATH) Claude
   Code's config.
 
-  Run as: right-click -> "Run with PowerShell", or:
-    irm https://raw.githubusercontent.com/thomhoffer-arch/Mycelium-for-Revit/main/install.ps1 | iex
+  Run as: right-click -> "Run with PowerShell", or via install.bat (double-click).
 
   Environment overrides (optional):
-    $env:LOAM_REVIT_URL   MCP server URL (default http://127.0.0.1:47100/mcp)
-    $env:LOAM_MCP_NAME    MCP entry name  (default loam-revit)
+    $env:MYCELIUM_REVIT_URL   MCP server URL (default http://127.0.0.1:47100/mcp)
+    $env:MYCELIUM_MCP_NAME    MCP entry name  (default mycelium-revit)
 #>
 
 $ErrorActionPreference = 'Stop'
-$Url  = if ($env:LOAM_REVIT_URL)  { $env:LOAM_REVIT_URL }  else { 'http://127.0.0.1:47100/mcp' }
-$Name = if ($env:LOAM_MCP_NAME)   { $env:LOAM_MCP_NAME }   else { 'loam-revit' }
+$Url  = if ($env:MYCELIUM_REVIT_URL)  { $env:MYCELIUM_REVIT_URL }  else { 'http://127.0.0.1:47100/mcp' }
+$Name = if ($env:MYCELIUM_MCP_NAME)   { $env:MYCELIUM_MCP_NAME }   else { 'mycelium-revit' }
 
 Write-Host ""
-Write-Host "==> Loam Revit Connector installer" -ForegroundColor Cyan
+Write-Host "==> Mycelium Studio Revit Connector installer" -ForegroundColor Cyan
 Write-Host ""
 
 # ── Detect installed Revit versions ────────────────────────────────────────────
@@ -44,7 +43,7 @@ Write-Host "==> Fetching latest release from GitHub..." -ForegroundColor Cyan
 $release = Invoke-RestMethod 'https://api.github.com/repos/thomhoffer-arch/Mycelium-for-Revit/releases/latest'
 Write-Host "    Release: $($release.tag_name)" -ForegroundColor Green
 
-$tmpDir = Join-Path $env:TEMP 'loam-revit-install'
+$tmpDir = Join-Path $env:TEMP 'mycelium-revit-install'
 New-Item -ItemType Directory -Force $tmpDir | Out-Null
 
 # ── Download + install per version ─────────────────────────────────────────────
