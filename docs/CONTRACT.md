@@ -55,6 +55,7 @@ Request: `{}`
 - `client` / `address` / `building` — optional context from `ProjectInformation`.
 
 Mycelium Studio uses these to auto-seed the project — if absent, it degrades to learning the project from mail.
+
 ---
 
 ### `get_rooms`
