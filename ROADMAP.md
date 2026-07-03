@@ -23,6 +23,7 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 - [x] Multi-targeted: `net48` (Revit 2024) and `net8.0-windows` (Revit 2025/2026)
 - [x] Silent multi-instance load (second Revit skips port, loads without error)
 - [x] One-click `install.bat` — auto-detects Revit versions, registers MCP in Claude Desktop and Claude Code
+- [x] Event push — fire-and-forget `POST /api/model-event` on Revit document open/save/change/close (debounced), so the orchestrator doesn't poll. Additive; silent no-op when the orchestrator is down.
 
 ## Near-term — polish (no contract change)
 
