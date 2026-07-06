@@ -16,6 +16,12 @@
     <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />
   </ItemGroup>
 
+  <ItemGroup Condition="'$(TargetFramework)' == 'net48'">
+    <!-- HttpClient (System.Net.Http) is in-box on net8.0 but a separate,
+         non-default assembly reference on net48. -->
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
   <!--
     Revit API reference assemblies via NuGet (Nice3point packages — compile-time
     only, excluded from output; Revit provides the real DLLs at runtime).
