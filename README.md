@@ -41,6 +41,19 @@ If multiple Revit instances are open, only the first one serves MCP requests —
 
 ---
 
+## Event push (additive)
+
+Besides answering MCP calls, the connector **pushes** Revit document events to the orchestrator so it doesn't have to poll. On open / save / sync / change / close it fires a fire-and-forget `POST` to:
+
+```
+POST http://127.0.0.1:47600/api/model-event      (override port with LOAM_HTTP_PORT)
+{ "kind": "opened", "model": "Bomenhof.rvt", "project": "2233 IKC Poeldijk", "revision": "<version guid>" }
+```
+
+`kind` is one of `opened` | `saved` | `changed` | `closed`. `DocumentChanged` is throttled to at most one POST per ~45s (it fires per transaction); the others send immediately. Loopback only, short timeout, all errors swallowed — if the orchestrator isn't running it's a silent no-op and Revit never blocks. An optional `X-Loam-Token` header is sent when `LOAM_MODEL_EVENT_TOKEN` is set.
+
+---
+
 ## Install (one click)
 
 Download **`install.bat`** from the [latest release](https://github.com/thomhoffer-arch/Mycelium-for-Revit/releases/latest) and double-click it.
