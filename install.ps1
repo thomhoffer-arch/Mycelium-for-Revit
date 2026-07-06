@@ -37,6 +37,14 @@ if ($detected.Count -eq 0) {
     exit 0
 }
 
+# ── Refuse to install while Revit is running (it locks the loaded DLL) ──────────
+if (Get-Process -Name 'Revit' -ErrorAction SilentlyContinue) {
+    Write-Host ""
+    Write-Host "Revit is running. Close ALL Revit windows, then run this installer again." -ForegroundColor Yellow
+    Write-Host "(The connector DLL is locked while Revit is open, so it can't be replaced.)" -ForegroundColor Gray
+    exit 1
+}
+
 # ── Fetch latest release metadata ──────────────────────────────────────────────
 Write-Host ""
 Write-Host "==> Fetching latest release from GitHub..." -ForegroundColor Cyan
