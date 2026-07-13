@@ -10,6 +10,11 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 
 - [x] `get_model_revision`
 - [x] `get_project_info` *(optional — `Document.ProjectInformation` → enables auto-seed)*
+- [x] `list_elements` *(general enumeration — no scope box, no id, no category required; unscoped it walks the
+      whole document bounded by `limit`. The primitive Loam's connector-agnostic layer looks for by name
+      pattern (`list_/find_/enumerate_elements`) — without it, this connector could never be sampled for
+      `list_elements`, only used by-id, so Loam's conformance probe correctly reported "no element-LIST tool
+      to enumerate rows" even when the connector was fully reachable.)*
 - [x] `filter_elements_by_scope_box`
 - [x] `get_element_by_uniqueid`
 - [x] `get_element_by_ifcguid`
@@ -28,6 +33,15 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 ## Near-term — polish (no contract change)
 
 - [ ] **Self-test script** — call each tool against a sample model and check the response shape against `docs/CONTRACT.md`, so field-name drift fails loudly.
+
+## Fixed
+
+- [x] **`filter_elements_by_scope_box` and `get_door_rooms` were silently non-joinable** — `docs/CONTRACT.md`
+      always documented `unique_id`/`ifc_guid` on both tools' rows (the connective-spine identity keys), but
+      neither tool ever actually set them — a doc/implementation drift that meant the ONE tool that enumerates
+      elements (before `list_elements` existed) returned rows with nothing a caller could join on. Fixed by
+      setting both fields from the same `Element.UniqueId` / `IFC_GUID` parameter every other identity-bearing
+      tool already reads.
 
 ## Robustness
 

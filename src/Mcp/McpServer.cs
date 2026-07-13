@@ -48,6 +48,7 @@ namespace Loam.Revit.Connector.Mcp
             {
                 new GetModelRevisionTool(),
                 new GetProjectInfoTool(),
+                new ListElementsTool(),
                 new FilterElementsByScopeBoxTool(),
                 new GetElementByUniqueIdTool(),
                 new GetElementByIfcGuidTool(),

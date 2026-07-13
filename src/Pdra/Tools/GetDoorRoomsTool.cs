@@ -78,12 +78,17 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                 var row = new JsonObject
                 {
+                    ["unique_id"] = fi.UniqueId,
                     ["id"]        = fi.Id.Value,
                     ["name"]      = fi.Name,
                     ["type_name"] = typeElem?.Name,
                     ["mark"]      = fi.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)?.AsString(),
                     ["host_id"]   = fi.Host?.Id.Value,
                 };
+                // CONTRACT.md documents unique_id + ifc_guid on this row; neither was ever set — a caller
+                // joining a door back onto the connective spine got nothing to key on.
+                var ifcGuid = fi.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
+                if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
 
                 foreach (var pn in doorParams)
                 {
