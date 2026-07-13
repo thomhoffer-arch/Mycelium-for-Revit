@@ -14,6 +14,7 @@ All tools are read-only. No writes, no transactions, no side effects.
 |---|---|
 | `get_model_revision` | Freshness stamp: `version_guid`, `number_of_saves`, `has_unsaved_changes`, document title and path |
 | `get_project_info` | Project identity from `Document.ProjectInformation`: name, number, client, address, building |
+| `list_elements` | The general identity primitive — no scope box, no id, no category required. Omit `category` to walk the whole document (bounded by `limit`); each row carries `unique_id`, `ifc_guid`, `category`, level, classification |
 | `get_rooms` | All rooms with number, name, level, area (ft² and display units), `unique_id` |
 | `get_levels` | All levels sorted by elevation — `unique_id`, `id`, name, elevation in internal and display units |
 | `get_views` | All non-sheet views (plans, sections, elevations, 3D, drafting, schedules) excluding templates |
@@ -75,11 +76,13 @@ src/
     McpServer.cs                    # HttpListener + JSON-RPC dispatcher → IPdraTool
   RevitBridge/
     RevitContext.cs                 # ExternalEvent marshalling to UI thread
-  Pdra/                             # PDRA main — VERBATIM, do not fork
+  Pdra/                             # started as a PDRA vendor drop; Mycelium is the primary connector now —
+                                     # see "Repo layout" note below before assuming this is untouchable
     IPdraTool.cs / ToolMetadata.cs / PdraJson.cs / JsonHelpers.cs
     SpineKeys.cs / ElementContextReader.cs
     Tools/
       GetModelRevisionTool.cs
+      ListElementsTool.cs
       FilterElementsByScopeBoxTool.cs
       GetElementByUniqueIdTool.cs
       GetElementByIfcGuidTool.cs
@@ -91,7 +94,11 @@ docs/
 ROADMAP.md
 ```
 
-Files under `src/Pdra/` are PDRA `main` verbatim — bug fixes go upstream to PDRA, then re-vendor here. Don't fork in-tree.
+Files under `src/Pdra/` started as a PDRA vendor drop (bootstrap: reuse proven implementations instead of
+starting from zero). That no longer means "don't touch" — **Mycelium-for-Revit is the primary connector;
+PDRA is a fallback**, so contract-compliance fixes and new capability land directly here, not gated on an
+upstream PDRA change. Where a fix is ALSO a genuine PDRA bug (not Mycelium-specific), upstreaming it too is
+still worthwhile so the two don't silently diverge on a shared defect — but it isn't a prerequisite.
 
 ---
 

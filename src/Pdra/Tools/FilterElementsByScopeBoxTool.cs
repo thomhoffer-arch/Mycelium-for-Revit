@@ -91,11 +91,18 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                 var row = new JsonObject
                 {
-                    ["id"]       = el.Id.Value,
-                    ["name"]     = el.Name,
-                    ["category"] = el.Category?.Name,
-                    ["in_box"]   = hit,
+                    ["unique_id"] = el.UniqueId,
+                    ["id"]        = el.Id.Value,
+                    ["name"]      = el.Name,
+                    ["category"]  = el.Category?.Name,
+                    ["in_box"]    = hit,
                 };
+                // CONTRACT.md documents ifc_guid on this row (the fallback join key); it was never actually
+                // set here — a caller joining on the connective spine (unique_id/ifc_guid) got nothing back
+                // from the one tool that enumerates elements, regardless of the scope box filter working
+                // correctly. Same pattern as GetSheetsTool's include_elements rows.
+                var ifcGuid = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
+                if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
 
                 // Provenance / scoping fields so a zone resolver filters on real model
                 // data (primary-option / arch-levels / project) instead of heuristics.

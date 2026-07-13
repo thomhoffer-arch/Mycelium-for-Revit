@@ -131,6 +131,37 @@ Request: `{}`
 
 ---
 
+### `list_elements`
+Request: `{ "category": "OST_Walls", "view_id": 123, "limit": 200 }` — every field optional; omit `category` to enumerate the whole document.
+
+```json
+{
+  "count": 200,
+  "truncated": true,
+  "elements": [
+    {
+      "unique_id": "f382087d-…",
+      "id": 1234567,
+      "category": "OST_Walls",
+      "name": "Basic Wall: Exterior",
+      "ifc_guid": "0X3$tP9…",
+      "level": { "id": 456, "name": "01 begane grond", "elevation_ft": 0.0, "elevation_user_units": "0.00 m" },
+      "classification": { "assembly_code": "22.20", "assembly_description": "…" }
+    }
+  ]
+}
+```
+
+The general identity primitive — no scope box, no id, no category all required. `filter_elements_by_scope_box`
+needs a scope box; `get_element_by_uniqueid`/`get_element_by_ifcguid` need an id you already have; the typed
+getters (`get_rooms`/`get_levels`/`get_views`/`get_sheets`/`get_links`) each cover one narrow category. This
+is how a caller with no prior identity discovers what's in the model. Unscoped (`category` omitted) it walks
+the whole document, bounded by `limit`, in document order (no natural sort across mixed categories);
+scoped, it behaves like `filter_elements_by_scope_box`'s own category resolution. `ifc_guid`, `level`, and
+`classification` are omitted (not blanked) when the element carries none.
+
+---
+
 ### `filter_elements_by_scope_box`
 Request: `{ "scope_box_id": 123, "category": "OST_Doors", "inside_only": true }`
 
