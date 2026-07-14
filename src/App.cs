@@ -70,6 +70,13 @@ namespace Loam.Revit.Connector
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)
             => Emit("closed", e.Document);
 
+        // Mirrors LoamEventClient.MaxChangedIds — past this, a batch lookup isn't worth it anyway, so
+        // there is no point paying the per-id doc.GetElement() cost below just to have it discarded
+        // downstream. Kept as its OWN constant (not a shared reference) because the two live in separate
+        // assemblies (the add-in vs. the bridge) and bounding them at the SAME value is a coincidence of
+        // today's tuning, not a coupling either side should rely on.
+        private const int MaxChangedIdsToResolve = 300;
+
         private void OnDocumentChanged(object sender, DocumentChangedEventArgs e)
         {
             var doc = e.GetDocument();
@@ -84,15 +91,29 @@ namespace Loam.Revit.Connector
             // Loam's next full sweep naturally drops a deleted element from its index anyway (this is the
             // SAME lag today's design already has for deletes, not a regression). Best-effort: a failure
             // enumerating ids must never block or throw out of a Revit document-changed callback.
+            //
+            // REGRESSION FIX (live report: "even Revit file opening was slow and impossible" with this
+            // connector installed + Loam pulse running): opening a document fires DocumentChanged ONCE
+            // with the ENTIRE model reported as "added" — tens of thousands of ids. Resolving each via
+            // doc.GetElement() is a per-element Revit API call; doing that unconditionally, before
+            // LoamEventClient's own MaxChangedIds cap ever gets a say, is exactly what hung the UI thread
+            // during the one case that matters most (a big/worksharing-enabled model loading in). Check
+            // the RAW counts first and skip resolution entirely once they already exceed what would ever
+            // be sent — Loam falls back to its own bounded full sweep, same as any other unresolvable case.
+            var added = e.GetAddedElementIds();
+            var modified = e.GetModifiedElementIds();
             var changedIds = new List<string>();
-            try
+            if (added.Count + modified.Count <= MaxChangedIdsToResolve)
             {
-                foreach (var id in e.GetAddedElementIds())
-                { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
-                foreach (var id in e.GetModifiedElementIds())
-                { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                try
+                {
+                    foreach (var id in added)
+                    { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                    foreach (var id in modified)
+                    { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                }
+                catch { /* enumeration failure — fall back to "something changed", no ids */ }
             }
-            catch { /* enumeration failure — fall back to "something changed", no ids */ }
 
             _events?.SendChanged(model, project, revision, changedIds);
         }
