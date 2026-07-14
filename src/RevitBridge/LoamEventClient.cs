@@ -113,6 +113,27 @@ namespace Loam.Revit.Connector.RevitBridge
             }
         }
 
+        /// <summary>
+        /// Called from the host's Idling event (live request: "when Revit is idling, it can send extra
+        /// data to Loam if needed — that would work both ways"). A pending "changed" batch otherwise only
+        /// flushes on the Timer's own schedule, which can land at ANY moment — including mid-edit, the
+        /// exact disruption the debounce window exists to avoid. If the window has already elapsed by the
+        /// time Revit reports itself idle, flush right now instead of waiting for the Timer callback — a
+        /// send then only ever happens when Revit is confirmed not busy. A no-op when nothing is pending or
+        /// the window hasn't elapsed yet; the Timer remains the fallback for a long stretch with no idle tick.
+        /// </summary>
+        public void TryFlushIfIdle()
+        {
+            lock (_gate)
+            {
+                if (!_hasPending) return;
+                if (DateTime.UtcNow - _lastChangedSentUtc < ChangedWindow) return;
+                _changedTimer?.Dispose();
+                _changedTimer = null;
+                FlushChangedLocked();
+            }
+        }
+
         private void FlushChangedLocked()
         {
             _lastChangedSentUtc = DateTime.UtcNow;
