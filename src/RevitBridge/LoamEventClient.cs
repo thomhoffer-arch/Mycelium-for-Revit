@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -30,6 +31,19 @@ namespace Loam.Revit.Connector.RevitBridge
 
         private static readonly TimeSpan ChangedWindow = TimeSpan.FromSeconds(45);
 
+        // ENERGY EFFICIENCY — "Loam should always only ask for new/changed things" (live request). A
+        // DocumentChanged transaction's touched UniqueIds ride along with the "changed" push so Loam can
+        // resolve ONLY those elements (pdra_get_element_by_uniqueid — a direct per-id lookup) instead of
+        // re-walking every sheet/view via get_sheets(include_elements) on its next read. Accumulated (a
+        // HashSet, unioned) across the WHOLE debounce window, not just the latest transaction — several
+        // small edits within one window must all be covered. Bounded: past MaxChangedIds a transaction
+        // touched more elements than a batch lookup is worth (Purge Unused, an IFC reload) — the list is
+        // dropped entirely (never silently truncated) so Loam falls back to its own bounded full sweep
+        // instead of acting on a partial, misleadingly-complete-looking id list.
+        private const int MaxChangedIds = 300;
+        private readonly HashSet<string> _pendingChangedIds = new HashSet<string>();
+        private bool _pendingIdsOverflowed;
+
         private readonly string _endpoint;
         private readonly string _token;
 
@@ -56,13 +70,25 @@ namespace Loam.Revit.Connector.RevitBridge
         /// <summary>
         /// Record a DocumentChanged and emit at most one "changed" POST per window:
         /// leading-edge send when idle, plus a trailing send for continuous edits.
+        /// <paramref name="changedIds"/> (optional) — the UniqueIds this transaction touched (added or
+        /// modified elements only; a deleted element has no UniqueId left to report). Unioned into the
+        /// pending set across the whole debounce window.
         /// </summary>
-        public void SendChanged(string model, string project, string revision)
+        public void SendChanged(string model, string project, string revision, IEnumerable<string> changedIds = null)
         {
             lock (_gate)
             {
                 _pending = (model, project, revision);
                 _hasPending = true;
+                if (changedIds is not null)
+                {
+                    foreach (var id in changedIds)
+                    {
+                        if (string.IsNullOrEmpty(id)) continue;
+                        if (_pendingChangedIds.Count >= MaxChangedIds) { _pendingIdsOverflowed = true; break; }
+                        _pendingChangedIds.Add(id);
+                    }
+                }
 
                 var elapsed = DateTime.UtcNow - _lastChangedSentUtc;
                 if (elapsed >= ChangedWindow)
@@ -92,10 +118,15 @@ namespace Loam.Revit.Connector.RevitBridge
             _lastChangedSentUtc = DateTime.UtcNow;
             _hasPending = false;
             var (model, project, revision) = _pending;
-            Post("changed", model, project, revision);
+            // Overflowed (a huge transaction) -> send NO ids, never a silently-truncated partial list; Loam
+            // then falls back to its own bounded full sweep, exactly today's behaviour.
+            var ids = (!_pendingIdsOverflowed && _pendingChangedIds.Count > 0) ? new List<string>(_pendingChangedIds) : null;
+            _pendingChangedIds.Clear();
+            _pendingIdsOverflowed = false;
+            Post("changed", model, project, revision, ids);
         }
 
-        private void Post(string kind, string model, string project, string revision)
+        private void Post(string kind, string model, string project, string revision, IReadOnlyList<string> changedIds = null)
         {
             _ = Task.Run(async () =>
             {
@@ -105,6 +136,12 @@ namespace Loam.Revit.Connector.RevitBridge
                     if (!string.IsNullOrEmpty(model))    body["model"]    = model;
                     if (!string.IsNullOrEmpty(project))  body["project"]  = project;
                     if (!string.IsNullOrEmpty(revision)) body["revision"] = revision;
+                    if (changedIds is { Count: > 0 })
+                    {
+                        var arr = new JsonArray();
+                        foreach (var id in changedIds) arr.Add(id);
+                        body["changedElementIds"] = arr;
+                    }
 
                     using var req = new HttpRequestMessage(HttpMethod.Post, _endpoint)
                     {

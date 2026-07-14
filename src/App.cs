@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Events;
 using Autodesk.Revit.ApplicationServices;
@@ -74,7 +75,26 @@ namespace Loam.Revit.Connector
             var doc = e.GetDocument();
             if (doc is null) return;
             var (model, project, revision) = Describe(doc);
-            _events?.SendChanged(model, project, revision);
+
+            // ENERGY EFFICIENCY (live request: "Loam should always only ask for new/changed things") —
+            // hand Loam the ACTUAL touched UniqueIds for THIS transaction, not just "something changed",
+            // so it can resolve only those elements (pdra_get_element_by_uniqueid) instead of re-walking
+            // the whole model on its next read. Added + Modified only: a DELETED element's ElementId no
+            // longer resolves to anything (the element is gone), so there is no UniqueId left to report —
+            // Loam's next full sweep naturally drops a deleted element from its index anyway (this is the
+            // SAME lag today's design already has for deletes, not a regression). Best-effort: a failure
+            // enumerating ids must never block or throw out of a Revit document-changed callback.
+            var changedIds = new List<string>();
+            try
+            {
+                foreach (var id in e.GetAddedElementIds())
+                { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                foreach (var id in e.GetModifiedElementIds())
+                { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+            }
+            catch { /* enumeration failure — fall back to "something changed", no ids */ }
+
+            _events?.SendChanged(model, project, revision, changedIds);
         }
 
         private void Emit(string kind, Document doc)
