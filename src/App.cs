@@ -35,6 +35,7 @@ namespace Loam.Revit.Connector
             _ctrl.DocumentSynchronizedWithCentral += OnDocumentSynced;
             _ctrl.DocumentChanged                 += OnDocumentChanged;
             _ctrl.DocumentClosing                 += OnDocumentClosing;
+            application.Idling                    += OnIdling;
 
             return Result.Succeeded;
         }
@@ -49,6 +50,7 @@ namespace Loam.Revit.Connector
                 _ctrl.DocumentChanged                 -= OnDocumentChanged;
                 _ctrl.DocumentClosing                 -= OnDocumentClosing;
             }
+            application.Idling -= OnIdling;
             _events?.Dispose();
             _server?.Stop();
             return Result.Succeeded;
@@ -58,8 +60,37 @@ namespace Loam.Revit.Connector
         // Handlers run on Revit's UI thread; read the doc fields here (Revit API is
         // thread-affine) and hand plain strings to the fire-and-forget client.
 
+        // REAL READINESS SIGNAL, not a blind delay (live request: "can there also be a signal for extra
+        // delay if the thread is still full?"): DocumentOpened fires while Revit is STILL finishing its own
+        // open sequence (view generation, sheet-list computation) — sending "opened" here told Loam to start
+        // its heavy read before Revit was actually ready, racing them on the same UI thread. Idling is
+        // Revit's own "I'm caught up, ready for the next command" signal (the standard add-in pattern for
+        // deferring background work). Defer the send to the FIRST Idling tick after open instead of firing
+        // immediately — it naturally adapts to model size (a big/worksharing model that takes longer to
+        // settle in just delays the signal longer, no guessing a fixed number). Loam's own pulse-side settle
+        // delay (LOAM_MODEL_OPENED_SETTLE_MS) stays on top of this as a floor for older connector builds.
+        private volatile bool _pendingOpenSignal;
+        private Document _pendingOpenDoc;
+
         private void OnDocumentOpened(object sender, DocumentOpenedEventArgs e)
-            => Emit("opened", e.Document);
+        {
+            _pendingOpenDoc = e.Document;
+            _pendingOpenSignal = true;
+        }
+
+        private void OnIdling(object sender, Autodesk.Revit.UI.Events.IdlingEventArgs e)
+        {
+            if (_pendingOpenSignal)
+            {
+                _pendingOpenSignal = false;
+                var doc = _pendingOpenDoc;
+                _pendingOpenDoc = null;
+                if (doc is not null) Emit("opened", doc);
+            }
+            // BOTH WAYS (live request): idle is also the moment to flush any pending "changed" batch whose
+            // debounce window has already elapsed — see LoamEventClient.TryFlushIfIdle for the full reasoning.
+            _events?.TryFlushIfIdle();
+        }
 
         private void OnDocumentSaved(object sender, DocumentSavedEventArgs e)
             => Emit("saved", e.Document);
