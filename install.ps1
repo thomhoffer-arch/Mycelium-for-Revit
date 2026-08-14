@@ -103,7 +103,13 @@ if (Test-Path $desktopDir) {
     } else {
         $cfg.mcpServers | Add-Member -NotePropertyName $Name -NotePropertyValue $entry
     }
-    $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $desktopPath -Encoding UTF8
+    # NOT Set-Content -Encoding UTF8: on Windows PowerShell 5.1 (what install.bat launches on a
+    # stock machine) that writes a UTF-8 byte-order-mark, which Claude Desktop's own JSON parser
+    # doesn't tolerate — it fails to load app settings with "Unexpected token ''" (the invisible
+    # BOM) pointing at the start of an otherwise-valid file. WriteAllText with UTF8Encoding($false)
+    # writes plain UTF-8, no BOM, identically on 5.1 and 7+.
+    $json = $cfg | ConvertTo-Json -Depth 10
+    [System.IO.File]::WriteAllText($desktopPath, $json, [System.Text.UTF8Encoding]::new($false))
     Write-Host "    Claude Desktop: updated $desktopPath" -ForegroundColor Green
 } else {
     Write-Host "    Claude Desktop config dir not found — skipping ($desktopDir)" -ForegroundColor Yellow
