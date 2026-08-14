@@ -112,12 +112,24 @@ if (Test-Path $desktopDir) {
 # ── Claude Code CLI registration ───────────────────────────────────────────────
 $claudeCli = Get-Command claude -ErrorAction SilentlyContinue
 if ($claudeCli) {
-    & claude mcp remove $Name --scope user 2>$null | Out-Null
-    & claude mcp add --scope user --transport http $Name $Url
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "    Claude Code: registered (user scope)" -ForegroundColor Green
-    } else {
-        Write-Host "    Claude Code: 'claude mcp add' returned $LASTEXITCODE" -ForegroundColor Yellow
+    # 'remove' is best-effort cleanup of any prior registration and is EXPECTED to
+    # "fail" with no matching entry on a fresh install. Piping stderr to $null only
+    # silences the message — it doesn't stop PowerShell 7.3+'s
+    # $PSNativeCommandUseErrorActionPreference from turning claude.exe's non-zero exit
+    # into a terminating error under $ErrorActionPreference = 'Stop' above, which used
+    # to abort the whole installer on every first-time run. Must be caught, not just
+    # redirected.
+    try { & claude mcp remove $Name --scope user 2>$null | Out-Null } catch { }
+
+    try {
+        & claude mcp add --scope user --transport http $Name $Url
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "    Claude Code: registered (user scope)" -ForegroundColor Green
+        } else {
+            Write-Host "    Claude Code: 'claude mcp add' returned $LASTEXITCODE" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "    Claude Code: 'claude mcp add' failed: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 } else {
     Write-Host "    Claude Code CLI not on PATH — skipping." -ForegroundColor Yellow
