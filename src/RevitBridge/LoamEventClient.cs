@@ -37,10 +37,19 @@ namespace Loam.Revit.Connector.RevitBridge
         // re-walking every sheet/view via get_sheets(include_elements) on its next read. Accumulated (a
         // HashSet, unioned) across the WHOLE debounce window, not just the latest transaction — several
         // small edits within one window must all be covered. Bounded: past MaxChangedIds a transaction
-        // touched more elements than a batch lookup is worth (Purge Unused, an IFC reload) — the list is
-        // dropped entirely (never silently truncated) so Loam falls back to its own bounded full sweep
-        // instead of acting on a partial, misleadingly-complete-looking id list.
-        private const int MaxChangedIds = 300;
+        // touched more elements than a batch lookup is worth (an IFC reload, a whole-model import) — the
+        // list is dropped entirely (never silently truncated) so Loam falls back to its own bounded full
+        // sweep instead of acting on a partial, misleadingly-complete-looking id list.
+        //
+        // DISRUPTION FIX (live report: "a whole list of views generating graphics" interrupting normal
+        // Revit use) — Loam's full-sweep fallback walks get_sheets(include_elements=true), which forces
+        // Revit to regenerate graphics for every view it touches (GetSheetsTool's view_limit now bounds
+        // that per call, but the fallback is still best avoided). Kept at 300, the threshold was cheaply
+        // crossed by an everyday batch edit (e.g. Purge Unused on a few hundred elements), triggering the
+        // disruptive fallback far more often than a genuinely-too-big transaction warrants. Raised so
+        // routine batch edits still get precise, targeted updates; only edits an order of magnitude
+        // bigger (a full IFC reload, tens of thousands of elements) still overflow into the fallback.
+        private const int MaxChangedIds = 2000;
         private readonly HashSet<string> _pendingChangedIds = new HashSet<string>();
         private bool _pendingIdsOverflowed;
 

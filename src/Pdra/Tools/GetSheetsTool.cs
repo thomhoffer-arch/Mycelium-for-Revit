@@ -23,7 +23,11 @@ namespace PDRA.Services.Ai.Tools.Queries
             "unique_id, and for each placed view: name, view_type, unique_id. Set " +
             "include_elements=true to also return the unique_id, ifc_guid (when present), " +
             "and classification of every model element visible in each view — can be slow on " +
-            "large models, pair with element_limit. Filter to one sheet via sheet_number.";
+            "large models, pair with element_limit. Each view Revit hasn't cached graphics for " +
+            "yet is regenerated on demand (visible in Revit's status bar as \"Generating " +
+            "graphics for ...\"), so a call spanning many views can surface as a burst of that " +
+            "in the host UI; view_limit bounds how many views a single call touches. Filter to " +
+            "one sheet via sheet_number.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -48,6 +52,14 @@ namespace PDRA.Services.Ai.Tools.Queries
                     ["type"]        = "integer",
                     ["description"] = "Max elements returned per view when include_elements=true (default 100, max 1000).",
                 },
+                ["view_limit"] = new JsonObject
+                {
+                    ["type"]        = "integer",
+                    ["description"] = "Max number of views, across all returned sheets, to fetch elements for when " +
+                        "include_elements=true (default 20, max 200). Each view beyond this cap is still listed " +
+                        "(name, view_type, unique_id) but without elements — bounds how many views a single call " +
+                        "can force Revit to regenerate graphics for. Re-request remaining views via sheet_number.",
+                },
                 ["limit"]  = JsonHelpers.LimitSchemaProp(100, 500),
                 ["fields"] = JsonHelpers.FieldsSchemaProp(),
             },
@@ -68,6 +80,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             var elemLimit = args.TryGetInt("element_limit", out var elRaw)
                 ? JsonHelpers.Clamp(elRaw, 1, 1000) : 100;
 
+            var viewLimit = args.TryGetInt("view_limit", out var vlRaw)
+                ? JsonHelpers.Clamp(vlRaw, 1, 200) : 20;
+
             var limit  = args.GetLimit(100, 500);
             var fields = args.GetFields();
 
@@ -84,6 +99,8 @@ namespace PDRA.Services.Ai.Tools.Queries
             var page = all.Take(limit).ToList();
 
             var rows = new JsonArray();
+            var viewsWithElements = 0;
+            var viewsCapped = false;
             foreach (var sheet in page)
             {
                 var row = new JsonObject
@@ -114,8 +131,15 @@ namespace PDRA.Services.Ai.Tools.Queries
                         ["view_type"] = view.ViewType.ToString(),
                     };
 
-                    if (includeElems)
+                    if (includeElems && viewsWithElements < viewLimit)
                     {
+                        // Scoping the collector to view.Id is what makes Revit compute/regenerate that
+                        // view's graphics (the "Generating graphics for ..." status-bar message) if it
+                        // isn't already cached — viewLimit bounds how many views one call can do this to,
+                        // so a full-model sweep doesn't surface as an uninterrupted burst across every
+                        // view in the document.
+                        viewsWithElements++;
+
                         var elemArr = new JsonArray();
                         try
                         {
@@ -145,6 +169,11 @@ namespace PDRA.Services.Ai.Tools.Queries
                         vRow["elements"]           = elemArr;
                         vRow["elements_truncated"] = (int)elemArr.Count == elemLimit;
                     }
+                    else if (includeElems)
+                    {
+                        viewsCapped = true;
+                        vRow["elements_skipped"] = true;
+                    }
 
                     viewsArr.Add(vRow);
                 }
@@ -155,10 +184,11 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["total"]     = all.Count,
-                ["count"]     = rows.Count,
-                ["truncated"] = rows.Count < all.Count,
-                ["sheets"]    = rows,
+                ["total"]           = all.Count,
+                ["count"]           = rows.Count,
+                ["truncated"]       = rows.Count < all.Count,
+                ["views_truncated"] = viewsCapped,
+                ["sheets"]          = rows,
             }));
         }
     }

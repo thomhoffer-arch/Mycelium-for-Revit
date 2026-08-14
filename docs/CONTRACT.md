@@ -112,7 +112,12 @@ Request: `{ "include_elements": false }`
 }
 ```
 
-`include_elements: true` adds visible element data per view.
+`include_elements: true` adds visible element data per view. Fetching a view's elements this way
+makes Revit regenerate that view's graphics if it isn't already cached (the "Generating graphics
+for ..." status-bar message); `view_limit` (default 20, max 200) bounds how many views a single
+call does this to, so a broad sweep across many sheets can't surface as an uninterrupted burst
+across the whole document. Views beyond the cap are still listed (without elements, `elements_skipped:
+true`) and the response sets `views_truncated: true` — page through the rest via `sheet_number`.
 
 ---
 
