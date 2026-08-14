@@ -112,7 +112,13 @@ Request: `{ "include_elements": false }`
 }
 ```
 
-`include_elements: true` adds visible element data per view.
+`include_elements: true` adds visible element data per view, and **requires `sheet_number`**.
+Fetching a view's elements this way makes Revit regenerate that view's graphics if it isn't
+already cached (the "Generating graphics for ..." status-bar message); requiring `sheet_number`
+keeps that to the handful of views placed on one sheet instead of every view in the document. A
+call with `include_elements: true` and no `sheet_number` is rejected with an error pointing at
+`list_elements` — use that tool for bulk/model-wide element enumeration (e.g. resyncing after a
+large change); it walks the document directly and never touches per-view graphics.
 
 ---
 
