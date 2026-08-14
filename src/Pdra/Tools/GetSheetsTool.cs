@@ -11,8 +11,9 @@ namespace PDRA.Services.Ai.Tools.Queries
     /// Enumerates ViewSheets, the views placed on each, and optionally the model
     /// elements visible in those views. sheet_number matches the raw Revit sheet
     /// number (e.g. "A101"), which is also the stem used for exported PDF filenames.
-    /// When include_elements=true each element carries unique_id + ifc_guid (when
-    /// present) + classification, the same fields as pdra_get_element_by_uniqueid.
+    /// When include_elements=true (requires sheet_number — see the ROOT FIX note in
+    /// Run) each element carries unique_id + ifc_guid (when present) + classification,
+    /// the same fields as pdra_get_element_by_uniqueid.
     /// </summary>
     public sealed class GetSheetsTool : IPdraTool
     {
@@ -21,13 +22,14 @@ namespace PDRA.Services.Ai.Tools.Queries
             "Enumerate drawing sheets (ViewSheets) with the views placed on each. Returns " +
             "sheet_number (matches PDF export filename stem, e.g. \"A101\"), sheet_name, " +
             "unique_id, and for each placed view: name, view_type, unique_id. Set " +
-            "include_elements=true to also return the unique_id, ifc_guid (when present), " +
-            "and classification of every model element visible in each view — can be slow on " +
-            "large models, pair with element_limit. Each view Revit hasn't cached graphics for " +
-            "yet is regenerated on demand (visible in Revit's status bar as \"Generating " +
-            "graphics for ...\"), so a call spanning many views can surface as a burst of that " +
-            "in the host UI; view_limit bounds how many views a single call touches. Filter to " +
-            "one sheet via sheet_number.";
+            "include_elements=true to also return the unique_id, ifc_guid (when present), and " +
+            "classification of every model element visible in one view — requires sheet_number " +
+            "(fetching a view's visible-element set is what makes Revit regenerate that view's " +
+            "graphics, shown in its status bar as \"Generating graphics for ...\"; scoping to one " +
+            "sheet keeps that to the handful of views placed on it instead of every view in the " +
+            "document). For bulk/model-wide element enumeration — e.g. resyncing after a large " +
+            "change — use pdra_list_elements instead, which walks the document directly and never " +
+            "touches per-view graphics.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -40,25 +42,20 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["sheet_number"] = new JsonObject
                 {
                     ["type"]        = "string",
-                    ["description"] = "Return only the sheet whose SheetNumber equals this value (case-insensitive). Omit for all sheets.",
+                    ["description"] = "Return only the sheet whose SheetNumber equals this value (case-insensitive). " +
+                        "Omit for all sheets — required when include_elements=true.",
                 },
                 ["include_elements"] = new JsonObject
                 {
                     ["type"]        = "boolean",
-                    ["description"] = "When true, each view also lists model elements visible in it (unique_id, ifc_guid, classification). Pair with element_limit to cap output.",
+                    ["description"] = "When true, list model elements visible in the views on ONE sheet (unique_id, " +
+                        "ifc_guid, classification) — requires sheet_number. Pair with element_limit to cap output. " +
+                        "For model-wide enumeration use pdra_list_elements, not a sheet_number-less call here.",
                 },
                 ["element_limit"] = new JsonObject
                 {
                     ["type"]        = "integer",
                     ["description"] = "Max elements returned per view when include_elements=true (default 100, max 1000).",
-                },
-                ["view_limit"] = new JsonObject
-                {
-                    ["type"]        = "integer",
-                    ["description"] = "Max number of views, across all returned sheets, to fetch elements for when " +
-                        "include_elements=true (default 20, max 200). Each view beyond this cap is still listed " +
-                        "(name, view_type, unique_id) but without elements — bounds how many views a single call " +
-                        "can force Revit to regenerate graphics for. Re-request remaining views via sheet_number.",
                 },
                 ["limit"]  = JsonHelpers.LimitSchemaProp(100, 500),
                 ["fields"] = JsonHelpers.FieldsSchemaProp(),
@@ -77,11 +74,23 @@ namespace PDRA.Services.Ai.Tools.Queries
                 && args.TryGetProperty("include_elements", out var ieProp)
                 && ieProp.ValueKind == JsonValueKind.True;
 
+            // ROOT FIX (live report: "a whole list of views generating graphics" interrupting normal
+            // Revit use) — include_elements walks each placed view with a view-scoped
+            // FilteredElementCollector, which is what makes Revit regenerate that view's graphics
+            // (the "Generating graphics for ..." status-bar message) if it isn't already cached.
+            // Refusing this without sheet_number makes it structurally impossible for one call to do
+            // that across every view in the document — no cap, no truncation, the disruptive access
+            // pattern simply can't be expressed through this tool. Bulk/model-wide enumeration has a
+            // correct, non-disruptive tool already: pdra_list_elements walks the document directly
+            // (no view scoping, so no forced graphics regen) and is what a full resync should use.
+            if (includeElems && string.IsNullOrEmpty(filterNum))
+                return ToolResult.Error(
+                    "include_elements=true requires sheet_number (scopes element enumeration to the " +
+                    "views on one sheet). For model-wide element enumeration, use pdra_list_elements " +
+                    "instead — it doesn't force per-view graphics regeneration.");
+
             var elemLimit = args.TryGetInt("element_limit", out var elRaw)
                 ? JsonHelpers.Clamp(elRaw, 1, 1000) : 100;
-
-            var viewLimit = args.TryGetInt("view_limit", out var vlRaw)
-                ? JsonHelpers.Clamp(vlRaw, 1, 200) : 20;
 
             var limit  = args.GetLimit(100, 500);
             var fields = args.GetFields();
@@ -99,8 +108,6 @@ namespace PDRA.Services.Ai.Tools.Queries
             var page = all.Take(limit).ToList();
 
             var rows = new JsonArray();
-            var viewsWithElements = 0;
-            var viewsCapped = false;
             foreach (var sheet in page)
             {
                 var row = new JsonObject
@@ -131,15 +138,11 @@ namespace PDRA.Services.Ai.Tools.Queries
                         ["view_type"] = view.ViewType.ToString(),
                     };
 
-                    if (includeElems && viewsWithElements < viewLimit)
+                    if (includeElems)
                     {
-                        // Scoping the collector to view.Id is what makes Revit compute/regenerate that
-                        // view's graphics (the "Generating graphics for ..." status-bar message) if it
-                        // isn't already cached — viewLimit bounds how many views one call can do this to,
-                        // so a full-model sweep doesn't surface as an uninterrupted burst across every
+                        // sheet_number is required above whenever includeElems is set, so this loop
+                        // only ever runs over the handful of views placed on ONE sheet — never every
                         // view in the document.
-                        viewsWithElements++;
-
                         var elemArr = new JsonArray();
                         try
                         {
@@ -169,11 +172,6 @@ namespace PDRA.Services.Ai.Tools.Queries
                         vRow["elements"]           = elemArr;
                         vRow["elements_truncated"] = (int)elemArr.Count == elemLimit;
                     }
-                    else if (includeElems)
-                    {
-                        viewsCapped = true;
-                        vRow["elements_skipped"] = true;
-                    }
 
                     viewsArr.Add(vRow);
                 }
@@ -184,11 +182,10 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["total"]           = all.Count,
-                ["count"]           = rows.Count,
-                ["truncated"]       = rows.Count < all.Count,
-                ["views_truncated"] = viewsCapped,
-                ["sheets"]          = rows,
+                ["total"]     = all.Count,
+                ["count"]     = rows.Count,
+                ["truncated"] = rows.Count < all.Count,
+                ["sheets"]    = rows,
             }));
         }
     }

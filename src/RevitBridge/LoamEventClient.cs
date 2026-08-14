@@ -41,14 +41,17 @@ namespace Loam.Revit.Connector.RevitBridge
         // list is dropped entirely (never silently truncated) so Loam falls back to its own bounded full
         // sweep instead of acting on a partial, misleadingly-complete-looking id list.
         //
-        // DISRUPTION FIX (live report: "a whole list of views generating graphics" interrupting normal
-        // Revit use) — Loam's full-sweep fallback walks get_sheets(include_elements=true), which forces
-        // Revit to regenerate graphics for every view it touches (GetSheetsTool's view_limit now bounds
-        // that per call, but the fallback is still best avoided). Kept at 300, the threshold was cheaply
-        // crossed by an everyday batch edit (e.g. Purge Unused on a few hundred elements), triggering the
-        // disruptive fallback far more often than a genuinely-too-big transaction warrants. Raised so
-        // routine batch edits still get precise, targeted updates; only edits an order of magnitude
-        // bigger (a full IFC reload, tens of thousands of elements) still overflow into the fallback.
+        // DISRUPTION (live report: "a whole list of views generating graphics" interrupting normal
+        // Revit use) — this used to be caused by Loam's full-sweep fallback calling
+        // get_sheets(include_elements=true) unscoped, which forced Revit to regenerate graphics for
+        // every view in the document. That path is now closed at the source: GetSheetsTool rejects
+        // include_elements=true without sheet_number, so it can no longer touch more than one sheet's
+        // views per call (see GetSheetsTool.Run's ROOT FIX note). Raising MaxChangedIds here is a
+        // separate, complementary change — 300 was cheaply crossed by an everyday batch edit (e.g.
+        // Purge Unused on a few hundred elements), pushing Loam into a full re-sync more often than a
+        // genuinely-too-big transaction warrants. Raised so routine batch edits still get precise,
+        // targeted updates; only edits an order of magnitude bigger (a full IFC reload, tens of
+        // thousands of elements) still overflow into "something changed, re-sync yourself".
         private const int MaxChangedIds = 2000;
         private readonly HashSet<string> _pendingChangedIds = new HashSet<string>();
         private bool _pendingIdsOverflowed;

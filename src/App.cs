@@ -106,9 +106,9 @@ namespace Loam.Revit.Connector
         // downstream. Kept as its OWN constant (not a shared reference) because the two live in separate
         // assemblies (the add-in vs. the bridge) and bounding them at the SAME value is a coincidence of
         // today's tuning, not a coupling either side should rely on. Raised alongside its sibling — see
-        // the DISRUPTION FIX note there — so an everyday batch edit doesn't needlessly trip Loam's
-        // view-regenerating fallback sweep; still far below the tens-of-thousands-of-ids case the
-        // raw-count pre-check above exists for.
+        // the DISRUPTION note there — so an everyday batch edit doesn't needlessly push Loam into a
+        // full re-sync; still far below the tens-of-thousands-of-ids case the raw-count pre-check
+        // above exists for.
         private const int MaxChangedIdsToResolve = 2000;
 
         private void OnDocumentChanged(object sender, DocumentChangedEventArgs e)
