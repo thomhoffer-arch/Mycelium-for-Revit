@@ -27,9 +27,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             "(fetching a view's visible-element set is what makes Revit regenerate that view's " +
             "graphics, shown in its status bar as \"Generating graphics for ...\"; scoping to one " +
             "sheet keeps that to the handful of views placed on it instead of every view in the " +
-            "document). For bulk/model-wide element enumeration — e.g. resyncing after a large " +
-            "change — use pdra_list_elements instead, which walks the document directly and never " +
-            "touches per-view graphics.";
+            "document). Accepts classification_params (see pdra_get_element_by_uniqueid); the " +
+            "response carries classification_sources. For bulk/model-wide element enumeration — " +
+            "e.g. resyncing after a large change — use pdra_list_elements instead, which walks the " +
+            "document directly and never touches per-view graphics.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -59,6 +60,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 },
                 ["limit"]  = JsonHelpers.LimitSchemaProp(100, 500),
                 ["fields"] = JsonHelpers.FieldsSchemaProp(),
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -94,6 +96,8 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             var limit  = args.GetLimit(100, 500);
             var fields = args.GetFields();
+            var clsParams = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
             IEnumerable<ViewSheet> query = new FilteredElementCollector(doc)
                 .OfClass(typeof(ViewSheet))
@@ -161,7 +165,8 @@ namespace PDRA.Services.Ai.Tools.Queries
                                 var ifc = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                                 if (!string.IsNullOrEmpty(ifc)) eRow["ifc_guid"] = ifc;
 
-                                var cls = ElementContextReader.ResolveClassification(el);
+                                var cls = ElementContextReader.ResolveClassification(el, clsParams);
+                                clsEnvelope.Record(cls);
                                 if (cls != null) eRow["classification"] = cls;
 
                                 elemArr.Add(eRow);
@@ -182,10 +187,11 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["total"]     = all.Count,
-                ["count"]     = rows.Count,
-                ["truncated"] = rows.Count < all.Count,
-                ["sheets"]    = rows,
+                ["total"]                  = all.Count,
+                ["count"]                  = rows.Count,
+                ["truncated"]               = rows.Count < all.Count,
+                ["sheets"]                  = rows,
+                ["classification_sources"]  = clsEnvelope.Build(),
             }));
         }
     }

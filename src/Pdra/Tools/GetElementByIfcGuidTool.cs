@@ -17,9 +17,11 @@ namespace PDRA.Services.Ai.Tools.Queries
             "Find Revit element(s) by IFC GlobalId (IfcGUID) — the cross-tool join key. Pass a single " +
             "ifc_guid or an array ifc_guids[]. Matches each element's stored IFC_GUID parameter " +
             "(populated after an IFC export/round-trip). Returns [{ifc_guid, id, unique_id, name, " +
-            "category, type_id, type_name, found, source, sourceLocalId, projectKey}]; found=false for " +
-            "GUIDs with no match. Use to turn a " +
-            "ClashControl clash's globalIdA/globalIdB into the corresponding Revit element.";
+            "category, type_id, type_name, level, classification, found, source, sourceLocalId, " +
+            "projectKey}] — the same element shape as pdra_get_element_by_uniqueid; found=false for " +
+            "GUIDs with no match. Use to turn a ClashControl clash's globalIdA/globalIdB into the " +
+            "corresponding Revit element. Accepts classification_params (see " +
+            "pdra_get_element_by_uniqueid); the response carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -36,6 +38,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                     ["items"] = new JsonObject { ["type"] = "string" },
                     ["description"] = "Multiple IFC GlobalIds to resolve in one call.",
                 },
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -44,6 +47,9 @@ namespace PDRA.Services.Ai.Tools.Queries
         {
             var doc = ctx.UiApp.ActiveUIDocument?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
+
+            var clsParams = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
             // Collect requested GUIDs (single and/or array).
             var wanted = new List<string>();
@@ -85,6 +91,14 @@ namespace PDRA.Services.Ai.Tools.Queries
                         ["type_name"] = typeElem?.Name,
                     };
                     SpineKeys.Add(row, el, projectKey);
+
+                    var level = ElementContextReader.ResolveLevel(el);
+                    if (level is not null) row["level"] = level;
+
+                    var cls = ElementContextReader.ResolveClassification(el, clsParams);
+                    clsEnvelope.Record(cls);
+                    if (cls is not null) row["classification"] = cls;
+
                     results.Add(row);
                 }
                 else
@@ -95,8 +109,9 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["count"]    = results.Count,
-                ["elements"] = results,
+                ["count"]                  = results.Count,
+                ["elements"]               = results,
+                ["classification_sources"] = clsEnvelope.Build(),
             }));
         }
     }

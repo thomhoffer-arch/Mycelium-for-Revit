@@ -21,9 +21,11 @@ namespace PDRA.Services.Ai.Tools.Queries
             "everything in scope box X'). Identify the box by scope_box_id or scope_box_name. mode: 'centroid' " +
             "(default — location/centroid inside the box) or 'intersects' (element bbox overlaps the box). The " +
             "box's own rotation is respected. Each row carries {id, name, category, in_box, " +
-            "design_option{name,is_primary}|null, level|null, from_link, project} so a zone resolver filters on " +
+            "design_option{name,is_primary} (omitted when none), level (omitted when unresolvable), " +
+            "classification (omitted when unpopulated), from_link, project} so a zone resolver filters on " +
             "real data (primary-option / arch-levels / project), plus a summary {count_in, count_out}; set " +
-            "inside_only=true to return only the members.";
+            "inside_only=true to return only the members. Accepts classification_params; the response " +
+            "carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -41,6 +43,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["mode"]           = new JsonObject { ["type"] = "string", ["description"] = "'centroid' (default) or 'intersects'." },
                 ["inside_only"]    = new JsonObject { ["type"] = "boolean", ["description"] = "Return only elements inside the box. Default false (all, each with in_box)." },
                 ["limit"]          = new JsonObject { ["type"] = "integer", ["description"] = "Max elements to test. Default 1000." },
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -76,6 +79,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             var elements = ResolveElements(uidoc, doc, args, out var targErr);
             if (targErr is not null) return ToolResult.Error(targErr);
 
+            var clsParams = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
+
             var inv = box.Transform?.Inverse;  // world → box-local (handles rotation)
             var rows = new JsonArray();
             int inCount = 0, tested = 0;
@@ -106,21 +112,31 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                 // Provenance / scoping fields so a zone resolver filters on real model
                 // data (primary-option / arch-levels / project) instead of heuristics.
-                row["design_option"] = DesignOptionNode(el);
-                row["level"]         = ElementContextReader.ResolveLevel(el);
-                row["from_link"]     = el.Document.IsLinked;
-                row["project"]       = el.Document.Title;
+                // design_option and level are omitted (not blanked) when unresolvable —
+                // previously assigned unconditionally, which serialized as an explicit
+                // "level": null / "design_option": null against the connector's own
+                // omit-never-blank rule (SpineKeys.cs).
+                var designOption = DesignOptionNode(el);
+                if (designOption is not null) row["design_option"] = designOption;
+                var level = ElementContextReader.ResolveLevel(el);
+                if (level is not null) row["level"] = level;
+                var cls = ElementContextReader.ResolveClassification(el, clsParams);
+                clsEnvelope.Record(cls);
+                if (cls is not null) row["classification"] = cls;
+                row["from_link"] = el.Document.IsLinked;
+                row["project"]   = el.Document.Title;
 
                 rows.Add(row);
             }
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["scope_box"] = new JsonObject { ["id"] = sb.Id.Value, ["name"] = sb.Name },
-                ["mode"]      = intersects ? "intersects" : "centroid",
-                ["count_in"]  = inCount,
-                ["count_out"] = tested - inCount,
-                ["elements"]  = rows,
+                ["scope_box"]               = new JsonObject { ["id"] = sb.Id.Value, ["name"] = sb.Name },
+                ["mode"]                    = intersects ? "intersects" : "centroid",
+                ["count_in"]                = inCount,
+                ["count_out"]               = tested - inCount,
+                ["elements"]                = rows,
+                ["classification_sources"]  = clsEnvelope.Build(),
             }));
         }
 

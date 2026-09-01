@@ -25,8 +25,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             "category (a BuiltInCategory, e.g. OST_Walls) to scope to one category; omit it to walk the whole " +
             "document (bounded by limit — no category means no natural sort, results come in document order). " +
             "Each row carries unique_id (primary join key), id, category, name, ifc_guid (when present), " +
-            "level (when resolvable), and classification (assembly/OmniClass codes, when populated). Supports " +
-            "limit, fields, and view_id (scope a category query to one view).";
+            "level (when resolvable), and classification (assembly/OmniClass codes, plus classification_params " +
+            "when passed, when populated). Supports limit, fields, view_id (scope a category query to one " +
+            "view), and classification_params. The response also carries classification_sources — see that " +
+            "arg's description for what it tells you.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -40,6 +42,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["view_id"]  = new JsonObject { ["type"] = "integer", ["description"] = "Limit a category query to elements visible in this view." },
                 ["limit"]    = JsonHelpers.LimitSchemaProp(def: 200, max: 2000),
                 ["fields"]   = JsonHelpers.FieldsSchemaProp(),
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -51,6 +54,8 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             var limit  = args.GetLimit(def: 200, max: 2000);
             var fields = args.GetFields();
+            var clsParams = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
             View? scopeView = null;
             if (args.TryGetLong("view_id", out var vid)) scopeView = doc.GetElement(new ElementId(vid)) as View;
@@ -95,7 +100,8 @@ namespace PDRA.Services.Ai.Tools.Queries
                 var level = ElementContextReader.ResolveLevel(el);
                 if (level is not null) row["level"] = level;
 
-                var cls = ElementContextReader.ResolveClassification(el);
+                var cls = ElementContextReader.ResolveClassification(el, clsParams);
+                clsEnvelope.Record(cls);
                 if (cls is not null) row["classification"] = cls;
 
                 rows.Add(JsonHelpers.Project(row, fields));
@@ -103,9 +109,10 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["count"]     = rows.Count,
-                ["truncated"] = truncated,
-                ["elements"]  = rows,
+                ["count"]                 = rows.Count,
+                ["truncated"]             = truncated,
+                ["elements"]              = rows,
+                ["classification_sources"] = clsEnvelope.Build(),
             }));
         }
     }

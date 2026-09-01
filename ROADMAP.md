@@ -19,6 +19,9 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 - [x] `get_element_by_uniqueid`
 - [x] `get_element_by_ifcguid`
 - [x] `get_door_rooms`
+- [x] `get_classification_sources` *(discovery for "which parameter IS classification here" — samples the
+      model and reports candidate parameters with a populated count and sample values, rather than picking
+      a winner; see "Fixed" below)*
 - [x] `get_rooms`
 - [x] `get_levels`
 - [x] `get_views`
@@ -32,7 +35,11 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 
 ## Near-term — polish (no contract change)
 
-- [ ] **Self-test script** — call each tool against a sample model and check the response shape against `docs/CONTRACT.md`, so field-name drift fails loudly.
+- [x] **Self-test script** — `tools/selftest.ps1` drives every tool against a live model over the real MCP
+      endpoint and checks field names/shapes against `docs/CONTRACT.md`, including a bulk-vs-by-ID
+      classification equality check (`list_elements` vs `get_element_by_uniqueid`/`get_element_by_ifcguid`
+      for the same element). Can't run in CI — needs Revit + an open model — so it's a manual/scheduled
+      check, not a build gate.
 
 ## Fixed
 
@@ -42,6 +49,22 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
       elements (before `list_elements` existed) returned rows with nothing a caller could join on. Fixed by
       setting both fields from the same `Element.UniqueId` / `IFC_GUID` parameter every other identity-bearing
       tool already reads.
+- [x] **Classification was unreachable for any non-Uniformat/OmniClass scheme, and unevenly wired across
+      tools** — an external analysis (Loam, on a Dutch NLRS model) reported 0 of 2,213 elements classified
+      and read that as "no classification field at all." The field existed and was correctly omitting empty
+      values, not missing — the real gap was that `ElementContextReader.ResolveClassification` only ever
+      probed Revit's own Assembly Code / OmniClass built-ins, which Dutch (NL-SfB) and UK (Uniclass) offices
+      never populate; their classification lives in an office-named shared/project parameter the connector
+      had no way to reach or even name. Fixed with `classification_params` (probe a caller-named parameter,
+      type then instance, on every element-returning tool), `get_classification_sources` (discover the name
+      instead of guessing it), and a `classification_sources` response envelope that reports what was probed
+      and how many returned rows had it populated — so "field unsupported" and "no element has a value" stay
+      distinguishable without ever writing `classification: null` onto a row (kept to the omit-never-blank
+      rule; see `docs/CONTRACT.md`'s Classification section for the full contract). Also closed while in
+      there: `get_element_by_ifcguid` was documented as returning "the same element shape" as
+      `get_element_by_uniqueid` but never carried `level`/`classification` — now it does; and
+      `filter_elements_by_scope_box` was writing `"level": null` / `"design_option": null` instead of
+      omitting them, the same blanking bug the entry above fixed for `unique_id`/`ifc_guid` on this tool.
 
 ## Robustness
 

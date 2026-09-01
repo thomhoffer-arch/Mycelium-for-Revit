@@ -70,6 +70,46 @@ namespace PDRA.Services.Ai.Tools.Queries
             };
 
         /// <summary>
+        /// Reads a JSON string-array arg (e.g. door_params, classification_params). Returns null
+        /// when the key is absent, not an array, or empty after dropping blanks — callers then
+        /// fall back to their own default. Shared so every tool that names a set of parameters
+        /// reads the arg the same way.
+        /// </summary>
+        public static System.Collections.Generic.List<string>? GetStringArray(this JsonElement el, string name)
+        {
+            if (el.ValueKind != JsonValueKind.Object ||
+                !el.TryGetProperty(name, out var p) ||
+                p.ValueKind != JsonValueKind.Array)
+                return null;
+            var list = new System.Collections.Generic.List<string>();
+            foreach (var item in p.EnumerateArray())
+                if (item.ValueKind == JsonValueKind.String)
+                {
+                    var v = item.GetString();
+                    if (!string.IsNullOrWhiteSpace(v)) list.Add(v!);
+                }
+            return list.Count > 0 ? list : null;
+        }
+
+        /// <summary>Standard schema fragment for the "classification_params" arg (see
+        /// <see cref="ElementContextReader.ResolveClassification"/>).</summary>
+        public static JsonObject ClassificationParamsSchemaProp() =>
+            new JsonObject
+            {
+                ["type"]        = "array",
+                ["items"]       = new JsonObject { ["type"] = "string" },
+                ["description"] = "Extra parameter names to probe for classification, beyond the built-in " +
+                                  "Assembly Code / OmniClass fields — e.g. an office's NL-SfB or Uniclass " +
+                                  "shared-parameter name. Use pdra_get_classification_sources to discover it " +
+                                  "instead of guessing. Read off the type first, then the instance; merged " +
+                                  "into classification{} under the parameter's own name. The response also " +
+                                  "carries classification_sources, listing every field probed (built-in and " +
+                                  "requested) with how many returned rows had it populated — present even " +
+                                  "when every count is 0, so 'field unsupported' and 'no element has a value' " +
+                                  "stay distinguishable without ever putting classification: null on a row.",
+            };
+
+        /// <summary>
         /// Projects <paramref name="row"/> down to <paramref name="fields"/> (id always kept).
         /// Returns the row unchanged when no field filter is set. Use to honour the
         /// "fields" arg uniformly across query tools.
