@@ -24,7 +24,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             "geometric fallback (a point each side of the door → enclosing room). Targets doors via " +
             "element_ids[] OR category (default OST_Doors) OR selection. door_params[] read flat onto each " +
             "door (default NLRS_C_breedte_01); room_params[] onto each room (default NLRS_C_ruimtefunctie, " +
-            "gebruiksfunctie). type_name carries the door type token (e.g. dm###). Each row has from_room/" +
+            "gebruiksfunctie). type_name carries the door type token (e.g. dm###). Each door also carries " +
+            "classification (assembly/OmniClass codes, plus classification_params when passed, when " +
+            "populated) — the response carries classification_sources. Each row has from_room/" +
             "to_room {id, name, number, level_name, params} and resolution = from_to_room | geometric | none.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
@@ -43,6 +45,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["phase"]       = new JsonObject { ["type"] = "string", ["description"] = "Phase name for From/To Room and the geometric lookup. Default: the active view's phase, else the last phase." },
                 ["phase_id"]    = new JsonObject { ["type"] = "integer", ["description"] = "Phase element id (alternative to phase)." },
                 ["limit"]       = new JsonObject { ["type"] = "integer", ["description"] = "Max doors to return. Default 200." },
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -53,8 +56,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             var doc   = uidoc?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
 
-            var doorParams = ReadStrings(args, "door_params") ?? new List<string> { "NLRS_C_breedte_01" };
-            var roomParams = ReadStrings(args, "room_params") ?? new List<string> { "NLRS_C_ruimtefunctie", "gebruiksfunctie" };
+            var doorParams = args.GetStringArray("door_params") ?? new List<string> { "NLRS_C_breedte_01" };
+            var roomParams = args.GetStringArray("room_params") ?? new List<string> { "NLRS_C_ruimtefunctie", "gebruiksfunctie" };
+            var clsParams  = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
             var phase = ResolvePhase(doc, uidoc, args, out var phaseErr);
             if (phaseErr is not null) return ToolResult.Error(phaseErr);
@@ -92,9 +97,13 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                 foreach (var pn in doorParams)
                 {
-                    var v = ReadParamValue(fi, pn) ?? ReadParamValue(typeElem, pn);
+                    var v = ElementContextReader.ReadParamValue(fi, pn) ?? ElementContextReader.ReadParamValue(typeElem, pn);
                     if (v is not null) row[pn] = v;
                 }
+
+                var cls = ElementContextReader.ResolveClassification(fi, clsParams);
+                clsEnvelope.Record(cls);
+                if (cls is not null) row["classification"] = cls;
 
                 Room? fromR = TryFromRoom(fi, phase);
                 Room? toR   = TryToRoom(fi, phase);
@@ -116,9 +125,10 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["count"]     = count,
-                ["phase"]     = phase?.Name,
-                ["elements"]  = rows,
+                ["count"]                  = count,
+                ["phase"]                  = phase?.Name,
+                ["elements"]               = rows,
+                ["classification_sources"] = clsEnvelope.Build(),
             }));
         }
 
@@ -174,7 +184,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             JsonObject? p = null;
             foreach (var pn in roomParams)
             {
-                var v = ReadParamValue(r, pn);
+                var v = ElementContextReader.ReadParamValue(r, pn);
                 if (v is null) continue;
                 p ??= new JsonObject();
                 p[pn] = v;
@@ -184,30 +194,6 @@ namespace PDRA.Services.Ai.Tools.Queries
         }
 
         // ── Helpers ────────────────────────────────────────────────────────────────
-
-        private static string? ReadParamValue(Element? el, string name)
-        {
-            var p = el?.LookupParameter(name);
-            if (p is null) return null;
-            var vs = p.AsValueString();
-            if (!string.IsNullOrEmpty(vs)) return vs;
-            return p.StorageType switch
-            {
-                StorageType.String    => p.AsString(),
-                StorageType.Integer   => p.AsInteger().ToString(),
-                StorageType.Double    => p.AsDouble().ToString("0.######"),
-                StorageType.ElementId => p.AsElementId().Value.ToString(),
-                _                     => null,
-            };
-        }
-
-        private static List<string>? ReadStrings(JsonElement args, string key)
-        {
-            if (!args.TryGetProperty(key, out var el) || el.ValueKind != JsonValueKind.Array) return null;
-            var list = el.EnumerateArray().Where(e => e.ValueKind == JsonValueKind.String)
-                         .Select(e => e.GetString()!).Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
-            return list.Count > 0 ? list : null;
-        }
 
         private static Phase? ResolvePhase(Document doc, Autodesk.Revit.UI.UIDocument? uidoc, JsonElement args, out string? err)
         {

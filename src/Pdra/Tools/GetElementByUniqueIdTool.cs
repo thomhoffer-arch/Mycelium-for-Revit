@@ -24,7 +24,8 @@ namespace PDRA.Services.Ai.Tools.Queries
             "own projectKey. Each result also returns level and classification (assembly/omniclass) — the " +
             "way to read the storey/Assembly code of elements INSIDE linked models, which the host-only " +
             "param tools cannot reach. Plus spine keys (source, sourceLocalId, projectKey) and ifc_guid " +
-            "when present; found=false for ids with no match.";
+            "when present; found=false for ids with no match. Accepts classification_params to also probe " +
+            "an office's own classification parameter; the response carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -41,6 +42,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                     ["items"] = new JsonObject { ["type"] = "string" },
                     ["description"] = "Multiple Revit UniqueIds to resolve in one call.",
                 },
+                ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
         };
@@ -49,6 +51,9 @@ namespace PDRA.Services.Ai.Tools.Queries
         {
             var doc = ctx.UiApp.ActiveUIDocument?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
+
+            var clsParams = args.GetStringArray("classification_params");
+            var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
             var wanted = new List<string>();
             if (args.TryGetString("unique_id", out var single) && single.Length > 0) wanted.Add(single);
@@ -67,7 +72,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             {
                 // 1) Host document.
                 var host = SafeGet(doc, uid);
-                if (host is not null) { results.Add(BuildFound(uid, host, link: null)); continue; }
+                if (host is not null) { results.Add(BuildFound(uid, host, link: null, clsParams, clsEnvelope)); continue; }
 
                 // 2) Each loaded link's document.
                 links ??= new FilteredElementCollector(doc)
@@ -83,14 +88,15 @@ namespace PDRA.Services.Ai.Tools.Queries
                 }
 
                 results.Add(linked is not null
-                    ? BuildFound(uid, linked, foundLink)
+                    ? BuildFound(uid, linked, foundLink, clsParams, clsEnvelope)
                     : new JsonObject { ["unique_id"] = uid, ["found"] = false });
             }
 
             return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
             {
-                ["count"]    = results.Count,
-                ["elements"] = results,
+                ["count"]                  = results.Count,
+                ["elements"]               = results,
+                ["classification_sources"] = clsEnvelope.Build(),
             }));
         }
 
@@ -102,7 +108,9 @@ namespace PDRA.Services.Ai.Tools.Queries
         /// <summary>Build the row for a resolved element. Spine keys come from the
         /// element's OWN document (host or link), so a linked element gets the link's
         /// projectKey. <paramref name="link"/> is the host-side instance when found in a link.</summary>
-        private static JsonObject BuildFound(string uid, Element el, RevitLinkInstance? link)
+        private static JsonObject BuildFound(
+            string uid, Element el, RevitLinkInstance? link,
+            List<string>? clsParams, ElementContextReader.ClassificationEnvelope clsEnvelope)
         {
             var d        = el.Document;
             var typeId   = el.GetTypeId();
@@ -129,7 +137,8 @@ namespace PDRA.Services.Ai.Tools.Queries
             var level = ElementContextReader.ResolveLevel(el);
             if (level is not null) row["level"] = level;
 
-            var cls = ElementContextReader.ResolveClassification(el);
+            var cls = ElementContextReader.ResolveClassification(el, clsParams);
+            clsEnvelope.Record(cls);
             if (cls is not null) row["classification"] = cls;
 
             if (link is not null)
