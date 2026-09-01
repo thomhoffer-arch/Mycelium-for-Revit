@@ -14,17 +14,17 @@ All tools are read-only. No writes, no transactions, no side effects.
 |---|---|
 | `get_model_revision` | Freshness stamp: `version_guid`, `number_of_saves`, `has_unsaved_changes`, document title and path |
 | `get_project_info` | Project identity from `Document.ProjectInformation`: name, number, client, address, building |
-| `list_elements` | The general identity primitive — no scope box, no id, no category required. Omit `category` to walk the whole document (bounded by `limit`); each row carries `unique_id`, `ifc_guid`, `category`, level, classification |
+| `list_elements` | The general identity primitive — no scope box, no id, no category required. Omit `category` to walk the whole document (bounded by `limit`); each row carries `unique_id`, `ifc_guid`, `category` (display name), `category_id` (BuiltInCategory enum name), level, classification |
 | `get_rooms` | All rooms with number, name, level, area (ft² and display units), `unique_id` |
 | `get_levels` | All levels sorted by elevation — `unique_id`, `id`, name, elevation in internal and display units |
 | `get_views` | All non-sheet views (plans, sections, elevations, 3D, drafting, schedules) excluding templates |
 | `get_sheets` | All drawing sheets with placed views; optionally includes visible element data (incl. classification) per view |
 | `get_links` | All Revit links — name, loaded status, `project_key` for loaded links |
-| `filter_elements_by_scope_box` | Elements inside (or intersecting) a scope box, by category — with `unique_id`, numeric `id`, `ifc_guid`, level, design option, classification, link flag |
+| `filter_elements_by_scope_box` | Elements inside (or intersecting) a scope box, by category — with `unique_id`, numeric `id`, `category`/`category_id`, `ifc_guid`, level, design option, classification, link flag |
 | `get_element_by_uniqueid` | Resolves one or more UniqueIds (host + loaded links) → name, type, level, classification |
 | `get_element_by_ifcguid` | Finds elements by IFC GlobalId — fallback identity path; same element shape as `get_element_by_uniqueid` |
 | `get_door_rooms` | Rooms on both sides of each door (Revit From/To Room or geometric fallback) with clear-width parameter, classification, and room function |
-| `get_classification_sources` | Samples the model and reports candidate classification parameters (name, populated count, sample values) — for finding an office's NL-SfB/Uniclass parameter name |
+| `get_classification_sources` | Samples the model and reports candidate classification parameters (name, level, storage type, populated count, sample values) — for finding an office's NL-SfB/Uniclass parameter name. `scope: "instance"` / `"all"` scan name- and storage-agnostically, including instance parameters, for when the value isn't set at type level |
 
 Every element-returning tool above accepts `classification_params` (extra parameter names to read, beyond the built-in Assembly Code / OmniClass fields) and returns a `classification_sources` envelope reporting what was probed and how many rows had it populated — see `docs/CONTRACT.md`'s Classification section.
 
