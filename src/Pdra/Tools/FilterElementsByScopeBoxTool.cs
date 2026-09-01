@@ -38,7 +38,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["scope_box_id"]   = new JsonObject { ["type"] = "integer", ["description"] = "Scope box element id (OST_VolumeOfInterest)." },
                 ["scope_box_name"] = new JsonObject { ["type"] = "string", ["description"] = "Scope box name (alternative to scope_box_id)." },
                 ["element_ids"]    = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "integer" }, ["description"] = "Elements to test. Omit with category to use the current selection." },
-                ["category"]       = new JsonObject { ["type"] = "string", ["description"] = "BuiltInCategory to test in bulk, e.g. OST_Doors." },
+                ["category"]       = new JsonObject { ["type"] = "string", ["description"] = "Category to test in bulk — the BuiltInCategory enum name (e.g. OST_Doors) or the document's display name (e.g. Doors), enum name tried first." },
                 ["view_id"]        = new JsonObject { ["type"] = "integer", ["description"] = "Limit a category query to this view." },
                 ["mode"]           = new JsonObject { ["type"] = "string", ["description"] = "'centroid' (default) or 'intersects'." },
                 ["inside_only"]    = new JsonObject { ["type"] = "boolean", ["description"] = "Return only elements inside the box. Default false (all, each with in_box)." },
@@ -103,6 +103,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                     ["category"]  = el.Category?.Name,
                     ["in_box"]    = hit,
                 };
+                if (CategoryResolver.CategoryId(el.Category) is { } catId) row["category_id"] = catId;
                 // CONTRACT.md documents ifc_guid on this row (the fallback join key); it was never actually
                 // set here — a caller joining on the connective spine (unique_id/ifc_guid) got nothing back
                 // from the one tool that enumerates elements, regardless of the scope box filter working
@@ -217,7 +218,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             if (args.TryGetString("category", out var catName))
             {
-                if (!Enum.TryParse<BuiltInCategory>(catName, out var bic)) { err = $"Unknown BuiltInCategory '{catName}'."; return Enumerable.Empty<Element>(); }
+                if (!CategoryResolver.TryResolve(doc, catName, out var bic, out err)) return Enumerable.Empty<Element>();
                 return (scopeView is not null
                         ? new FilteredElementCollector(doc, scopeView.Id)
                         : new FilteredElementCollector(doc))

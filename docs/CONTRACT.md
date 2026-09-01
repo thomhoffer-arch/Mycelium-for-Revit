@@ -55,6 +55,14 @@ is the expected, correct result on a model whose office classification lives in 
 was never passed via `classification_params`. `populated` counts only the rows the call actually returned
 (bounded by `limit`/`sample`), not the whole document.
 
+**Finding the parameter when it isn't type-level.** `get_classification_sources`' default (`scope:
+"heuristic"`, unchanged) only matches classification-looking names, and its type-only mode (`scope: "type"`,
+same as the legacy `all: true`) never sees instance parameters — an office's classification value is often
+set per instance, not per type, and in that case neither mode can find it. Pass `scope: "instance"` (every
+instance parameter, no name or storage filter) or `scope: "all"` (both levels, no name or storage filter)
+to search name-agnostically. Omit `category` to sample across the whole document — the sample is now spread
+across the categories present, not just the first ones in document order.
+
 ---
 
 ## Tools
@@ -186,7 +194,8 @@ Request: `{ "category": "OST_Walls", "view_id": 123, "limit": 200, "classificati
     {
       "unique_id": "f382087d-…",
       "id": 1234567,
-      "category": "OST_Walls",
+      "category": "Walls",
+      "category_id": "OST_Walls",
       "name": "Basic Wall: Exterior",
       "ifc_guid": "0X3$tP9…",
       "level": { "id": 456, "name": "01 begane grond", "elevation_ft": 0.0, "elevation_user_units": "0.00 m" },
@@ -202,9 +211,14 @@ needs a scope box; `get_element_by_uniqueid`/`get_element_by_ifcguid` need an id
 getters (`get_rooms`/`get_levels`/`get_views`/`get_sheets`/`get_links`) each cover one narrow category. This
 is how a caller with no prior identity discovers what's in the model. Unscoped (`category` omitted) it walks
 the whole document, bounded by `limit`, in document order (no natural sort across mixed categories);
-scoped, it behaves like `filter_elements_by_scope_box`'s own category resolution. `ifc_guid`, `level`, and
-`classification` are omitted (not blanked) when the element carries none — see the Classification section
-above for `classification_params` / `classification_sources`.
+scoped, it behaves like `filter_elements_by_scope_box`'s own category resolution. The `category` **request**
+arg accepts either the BuiltInCategory enum name (`"OST_Walls"`) or the document's display name (`"Walls"`,
+enum name tried first) — so a value read off a row's own `category` or `category_id` **response** field
+round-trips into a later call without a Revit-specific name table on the caller's side. `category_id` is
+the row's BuiltInCategory enum name, present only for a built-in category (omitted for a custom/family
+category with no BuiltInCategory equivalent). `ifc_guid`, `level`, and `classification` are omitted (not
+blanked) when the element carries none — see the Classification section above for `classification_params`
+/ `classification_sources`.
 
 ---
 
@@ -222,7 +236,8 @@ Request: `{ "scope_box_id": 123, "category": "OST_Doors", "inside_only": true }`
       "unique_id": "f382087d-…",
       "id": 1234567,
       "name": "M_Single-Flush",
-      "category": "OST_Doors",
+      "category": "Doors",
+      "category_id": "OST_Doors",
       "in_box": true,
       "ifc_guid": "0X3$tP9…",
       "design_option": { "id": 111, "name": "Option 1", "is_primary": true },
@@ -241,6 +256,8 @@ Request: `{ "scope_box_id": 123, "category": "OST_Doors", "inside_only": true }`
 - `ifc_guid`, `design_option`, `level`, and `classification` are omitted (not blanked) when the element
   carries none — a prior version of this tool set `level`/`design_option` to `null` instead of omitting
   them; that has been fixed to match every other tool's convention.
+- `category_id` (BuiltInCategory enum name) is present alongside `category` (display name) for a built-in
+  category — see `list_elements`' entry above for the round-trip this enables on the `category` request arg.
 - `from_link: true` — element is from a linked model.
 
 ---
@@ -256,7 +273,8 @@ Request: `{ "unique_ids": ["…", "…"], "classification_params": ["NL-SfB"] }`
       "found": true,
       "id": 1234567,
       "name": "…",
-      "category": "OST_Walls",
+      "category": "Walls",
+      "category_id": "OST_Walls",
       "type_id": 654321,
       "type_name": "…",
       "ifc_guid": "…",
@@ -317,7 +335,8 @@ Uses Revit From/To Room assignment; falls back to geometric room lookup (`resolu
 ---
 
 ### `get_classification_sources`
-Request: `{ "category": "OST_Walls", "sample": 500 }` — every field optional; see the Classification section above.
+Request: `{ "category": "OST_Walls", "sample": 500, "scope": "instance" }` — every field optional (`category`
+accepts the enum name or the document's display name); see the Classification section above.
 
 ```json
 {
@@ -332,9 +351,27 @@ Request: `{ "category": "OST_Walls", "sample": 500 }` — every field optional; 
 ```
 
 Reports candidates, ordered by `populated` descending — it does **not** decide which one is authoritative
-(that judgment stays out of the connector; see Role boundary above). Pass `parameter_names` to check exact
-names instead of the default name-pattern heuristic (`sfb`, `uniclass`, `omniclass`, `uniformat`, `assembly
-code`, `classification`), or `all: true` to list every text-valued **type** parameter regardless of name.
+(that judgment stays out of the connector; see Role boundary above). `storage` (`String`, `Integer`,
+`ElementId`, …) is always reported as evidence, never used to filter out a candidate except in `scope:
+"type"` (below). Pass `parameter_names` to check exact names instead of `scope`'s name-pattern heuristic.
+
+`scope` controls what gets scanned:
+
+| `scope` | Levels scanned | Name filter | Storage filter |
+|---|---|---|---|
+| `heuristic` (default) | type + instance | `sfb`, `uniclass`, `omniclass`, `uniformat`, `assembly code`, `classification` | none |
+| `type` | type only | none | `String` only |
+| `instance` | instance only | none | none |
+| `all` | type + instance | none | none |
+
+`scope: "type"` is the same scan as the legacy `all: true` (still accepted, unchanged, for existing
+callers — `scope` takes priority when both are passed). Neither `heuristic` nor `type` can see an instance
+-level parameter with a non-classification-looking name; use `scope: "instance"` or `scope: "all"` for a
+model whose classification value is set per instance rather than per type.
+
+Unscoped (`category` omitted), the sample is spread across the categories present in the document rather
+than taken in raw document order, so a small `sample` still covers categories beyond whichever ones happen
+to sort first.
 
 ---
 
@@ -345,6 +382,7 @@ code`, `classification`), or `all: true` to list every text-valued **type** para
 | `unique_id` | **Primary** join key — stable across sessions. |
 | `id` (numeric) | Volatile, but **required** by `get_door_rooms`. |
 | `ifc_guid` | Fallback join key. |
+| `category_id` | BuiltInCategory enum name for a row's category, when built-in — feed it back as a `category` request arg on any tool that accepts one, alongside or instead of the `category` display name. |
 
 ## Scope (today)
 

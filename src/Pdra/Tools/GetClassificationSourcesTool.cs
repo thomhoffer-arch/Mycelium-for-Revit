@@ -23,15 +23,19 @@ namespace PDRA.Services.Ai.Tools.Queries
         public string Description =>
             "Discover which parameter actually carries classification (NL-SfB, Uniclass, or an office's own " +
             "scheme) in THIS model, before guessing a name for classification_params on the other tools. " +
-            "Samples elements (optionally scoped to category) and reports candidate parameters. By default: " +
-            "text-valued type/instance parameters whose name looks classification-like (matches sfb, " +
-            "uniclass, omniclass, uniformat, 'assembly code', or classification). Pass parameter_names[] to " +
-            "check only those exact names instead. Pass all=true to instead list EVERY text-valued type " +
-            "parameter regardless of name (instance parameters are skipped in this mode — too noisy at " +
-            "instance scope). Each candidate carries level (type/instance), storage, populated (count out of " +
-            "the sample with a real value), sample_values (up to 3, as evidence), and builtin (the matching " +
-            "BuiltInParameter name, when it is one). This tool reports candidates — it does not decide which " +
-            "one is authoritative; that judgment belongs to the caller.";
+            "Samples elements (optionally scoped to category — omit it to sample across the whole document) " +
+            "and reports candidate parameters. scope controls what gets scanned: 'heuristic' (default) — " +
+            "type+instance parameters whose name looks classification-like (matches sfb, uniclass, omniclass, " +
+            "uniformat, 'assembly code', or classification); 'type' — every text-valued TYPE parameter, name " +
+            "-agnostic (this is also what legacy all=true means, unchanged); 'instance' — every INSTANCE " +
+            "parameter, name- and storage-agnostic (an office's classification parameter is often set per " +
+            "instance, not per type — 'type'/'heuristic' cannot see it); 'all' — both levels, name- and " +
+            "storage-agnostic. Pass parameter_names[] to check only those exact names instead of any scope. " +
+            "Each candidate carries level (type/instance), storage (String/Integer/ElementId/…, reported as " +
+            "evidence — 'instance'/'all' do not filter on it), populated (count out of the sample with a real " +
+            "value), sample_values (up to 3, as evidence), and builtin (the matching BuiltInParameter name, " +
+            "when it is one). This tool reports candidates — it does not decide which one is authoritative; " +
+            "that judgment belongs to the caller.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -44,7 +48,10 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["category"] = new JsonObject
                 {
                     ["type"]        = "string",
-                    ["description"] = "BuiltInCategory to sample, e.g. OST_Walls. Omit to sample across the whole document.",
+                    ["description"] = "Category to sample — the BuiltInCategory enum name (e.g. OST_Walls) or the " +
+                                       "document's display name (e.g. Walls), enum name tried first. Omit to sample " +
+                                       "across the whole document (spread across categories, not just the first " +
+                                       "ones in document order).",
                 },
                 ["sample"] = new JsonObject
                 {
@@ -55,12 +62,25 @@ namespace PDRA.Services.Ai.Tools.Queries
                 {
                     ["type"]        = "array",
                     ["items"]       = new JsonObject { ["type"] = "string" },
-                    ["description"] = "Check only these exact parameter names instead of the name-pattern heuristic.",
+                    ["description"] = "Check only these exact parameter names instead of scope's name-pattern heuristic.",
+                },
+                ["scope"] = new JsonObject
+                {
+                    ["type"]        = "string",
+                    ["enum"]        = new JsonArray { "heuristic", "type", "instance", "all" },
+                    ["description"] = "'heuristic' (default): current name-pattern behavior, type+instance. " +
+                                       "'type': every text-valued TYPE parameter, name-agnostic (same as legacy " +
+                                       "all=true). 'instance': every INSTANCE parameter, name- and storage-agnostic " +
+                                       "— use this when the classification value is set per instance rather than " +
+                                       "per type. 'all': both levels, name- and storage-agnostic. Ignored when " +
+                                       "parameter_names is set.",
                 },
                 ["all"] = new JsonObject
                 {
                     ["type"]        = "boolean",
-                    ["description"] = "Report every text-valued TYPE parameter, not just name-pattern matches. Default false.",
+                    ["description"] = "Deprecated — use scope: \"type\" instead. Equivalent to scope: \"type\": " +
+                                       "every text-valued TYPE parameter, not just name-pattern matches. Ignored " +
+                                       "when scope is set. Default false.",
                 },
             },
             ["additionalProperties"] = false,
@@ -70,7 +90,7 @@ namespace PDRA.Services.Ai.Tools.Queries
         private static readonly string[] NamePatterns =
             { "sfb", "uniclass", "omniclass", "uniformat", "assembly code", "assembly_code", "classification" };
 
-        private enum ScanMode { Heuristic, Exact, AllTypeOnly }
+        private enum ScanMode { Heuristic, Exact, TypeOnly, InstanceOnly, All }
 
         public ToolResult Run(ToolContext ctx, JsonElement args)
         {
@@ -81,24 +101,45 @@ namespace PDRA.Services.Ai.Tools.Queries
             if (args.TryGetInt("sample", out var s)) sample = JsonHelpers.Clamp(s, 1, 5000);
 
             var exactNames = args.GetStringArray("parameter_names");
-            bool all = args.ValueKind == JsonValueKind.Object
-                && args.TryGetProperty("all", out var allEl) && allEl.ValueKind == JsonValueKind.True;
 
-            IEnumerable<Element> query;
-            if (args.TryGetString("category", out var catName))
+            ScanMode mode;
+            if (exactNames is not null)
             {
-                if (!Enum.TryParse<BuiltInCategory>(catName, out var bic))
-                    return ToolResult.Error($"Unknown BuiltInCategory '{catName}'.");
-                query = new FilteredElementCollector(doc).OfCategory(bic).WhereElementIsNotElementType().Cast<Element>();
+                mode = ScanMode.Exact;
+            }
+            else if (args.TryGetString("scope", out var scopeArg))
+            {
+                switch (scopeArg.ToLowerInvariant())
+                {
+                    case "heuristic": mode = ScanMode.Heuristic;    break;
+                    case "type":      mode = ScanMode.TypeOnly;     break;
+                    case "instance":  mode = ScanMode.InstanceOnly; break;
+                    case "all":       mode = ScanMode.All;          break;
+                    default: return ToolResult.Error($"Unknown scope '{scopeArg}'. Use heuristic, type, instance, or all.");
+                }
             }
             else
             {
-                query = new FilteredElementCollector(doc).WhereElementIsNotElementType().Cast<Element>();
+                // Legacy arg, kept working exactly as before: every text-valued type parameter,
+                // no name filter, type level only. This is now expressible as scope: "type" — the
+                // two are intentionally the same code path so old callers see no behavior change.
+                bool legacyAll = args.ValueKind == JsonValueKind.Object
+                    && args.TryGetProperty("all", out var allEl) && allEl.ValueKind == JsonValueKind.True;
+                mode = legacyAll ? ScanMode.TypeOnly : ScanMode.Heuristic;
             }
 
-            var elements = query.Take(sample).ToList();
-
-            var mode = exactNames is not null ? ScanMode.Exact : (all ? ScanMode.AllTypeOnly : ScanMode.Heuristic);
+            List<Element> elements;
+            if (args.TryGetString("category", out var catName))
+            {
+                if (!CategoryResolver.TryResolve(doc, catName, out var bic, out var catErr))
+                    return ToolResult.Error(catErr!);
+                elements = new FilteredElementCollector(doc).OfCategory(bic)
+                    .WhereElementIsNotElementType().Cast<Element>().Take(sample).ToList();
+            }
+            else
+            {
+                elements = DistributedSample(doc, sample);
+            }
 
             var agg = new Dictionary<(string Level, string Name), Candidate>();
             foreach (var el in elements)
@@ -106,8 +147,10 @@ namespace PDRA.Services.Ai.Tools.Queries
                 var typeId   = el.GetTypeId();
                 var typeElem = typeId != ElementId.InvalidElementId ? doc.GetElement(typeId) : null;
 
-                if (typeElem is not null) ScanParams(typeElem, "type", mode, exactNames, agg);
-                if (mode != ScanMode.AllTypeOnly) ScanParams(el, "instance", mode, exactNames, agg);
+                if (typeElem is not null && mode != ScanMode.InstanceOnly)
+                    ScanParams(typeElem, "type", mode, exactNames, agg);
+                if (mode != ScanMode.TypeOnly)
+                    ScanParams(el, "instance", mode, exactNames, agg);
             }
 
             var sources = new JsonArray();
@@ -131,6 +174,52 @@ namespace PDRA.Services.Ai.Tools.Queries
             }));
         }
 
+        /// <summary>
+        /// Unscoped sampling used to be a plain <c>Take(sample)</c> over the document-order
+        /// collector, which biased every unscoped discovery call toward whichever categories
+        /// happen to sort first (typically walls/floors) and could hide a classification
+        /// parameter that only lives on, say, doors or MEP equipment further down the model.
+        /// This instead buckets elements by category while walking the collector (bounded by
+        /// <see cref="MaxScanForSampling"/> so the walk stays lazy-bounded on very large
+        /// documents) and then round-robins across the buckets, so the returned sample spreads
+        /// across the categories actually present instead of favoring document order.
+        /// </summary>
+        private static List<Element> DistributedSample(Document doc, int sample)
+        {
+            var buckets = new Dictionary<string, List<Element>>();
+            var scanned = 0;
+            foreach (var el in new FilteredElementCollector(doc).WhereElementIsNotElementType().Cast<Element>())
+            {
+                var catKey = el.Category?.Name ?? "";
+                if (!buckets.TryGetValue(catKey, out var bucket)) buckets[catKey] = bucket = new List<Element>();
+                bucket.Add(el);
+                if (++scanned >= MaxScanForSampling) break;
+            }
+
+            var bucketList = buckets.Values.Where(b => b.Count > 0).ToList();
+            var result = new List<Element>(Math.Min(sample, scanned));
+            var idx = 0;
+            while (result.Count < sample)
+            {
+                bool any = false;
+                foreach (var bucket in bucketList)
+                {
+                    if (idx >= bucket.Count) continue;
+                    result.Add(bucket[idx]);
+                    any = true;
+                    if (result.Count >= sample) break;
+                }
+                if (!any) break;
+                idx++;
+            }
+            return result;
+        }
+
+        // Upper bound on how many elements the unscoped collector walks while building category
+        // buckets for DistributedSample, so a very large document still returns promptly instead
+        // of materializing every element just to sample a few hundred of them.
+        private const int MaxScanForSampling = 50_000;
+
         private static void ScanParams(
             Element el, string level, ScanMode mode, List<string>? exactNames,
             Dictionary<(string, string), Candidate> agg)
@@ -148,8 +237,16 @@ namespace PDRA.Services.Ai.Tools.Queries
                     case ScanMode.Heuristic:
                         if (!NamePatterns.Any(pat => name.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
                         break;
-                    case ScanMode.AllTypeOnly:
+                    case ScanMode.TypeOnly:
+                        // Legacy all=true behavior: type-level, no name filter, string-only —
+                        // preserved exactly so existing callers see no change.
                         if (p.StorageType != StorageType.String) continue;
+                        break;
+                    case ScanMode.InstanceOnly:
+                    case ScanMode.All:
+                        // Name- and storage-agnostic by design — the whole point of these modes
+                        // is to surface a classification parameter regardless of its name or how
+                        // Revit stores it (String, Integer, ElementId, …).
                         break;
                 }
 

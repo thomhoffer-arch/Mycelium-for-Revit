@@ -65,6 +65,21 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
       `get_element_by_uniqueid` but never carried `level`/`classification` — now it does; and
       `filter_elements_by_scope_box` was writing `"level": null` / `"design_option": null` instead of
       omitting them, the same blanking bug the entry above fixed for `unique_id`/`ifc_guid` on this tool.
+- [x] **`get_classification_sources` couldn't discover an instance-level classification parameter, and
+      `category` round-tripped nowhere** — a second round of the same Loam/NLRS feedback: with `all: true`,
+      discovery only ever reported type-level string parameters (instance parameters skipped outright), so
+      an office classification value set per instance (common for NLRS) was invisible no matter what
+      argument was passed. Separately, every element-returning tool's `category` field was the Revit
+      display name ("Walls"), while every tool's `category` *argument* parsed the BuiltInCategory enum name
+      ("OST_Walls") via `Enum.TryParse` — so a category value read off one tool's row and fed back into
+      another tool's `category` arg always failed with "Unknown BuiltInCategory". Fixed with a `scope`
+      argument (`heuristic` default / `type` / `instance` / `all` — `type` is the legacy `all: true`,
+      unchanged; `instance` and `all` scan name- and storage-agnostically, including instance parameters),
+      a `category_id` field alongside `category` on every row, and category-argument resolution that tries
+      the enum name first and falls back to the document's own category display names — so a caller never
+      needs a Revit-specific category table. Also while in there: unscoped discovery's sample is now spread
+      across the categories present rather than taken in raw document order, which previously biased every
+      unscoped call toward whichever categories happen to sort first.
 
 ## Robustness
 

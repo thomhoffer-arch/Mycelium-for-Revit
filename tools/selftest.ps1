@@ -18,7 +18,11 @@
   In particular this proves Loam's ask directly: that list_elements (bulk) and
   get_element_by_uniqueid / get_element_by_ifcguid (by-ID) return the SAME
   classification for the SAME element — not just that each individually returns
-  something.
+  something. Also covers the second round of that feedback: get_classification_sources'
+  scope="all" must surface instance-level candidates name-agnostically (not just
+  type-level, string-only, name-matched ones), legacy all=true must keep behaving
+  exactly like scope="type", and a row's category_id must round-trip as another
+  tool's category argument.
 
   Environment overrides (optional, same as install.ps1):
     $env:MYCELIUM_REVIT_URL     MCP server URL   (default http://127.0.0.1:47100/mcp)
@@ -234,6 +238,71 @@ if ($boxes.elements.Count -eq 0) {
         Write-Pass "filter_elements_by_scope_box never blanks level/design_option/classification ($($filtered.elements.Count) rows checked)"
     } else {
         Write-Fail "filter_elements_by_scope_box blanked these fields instead of omitting them: $($blanked | Select-Object -Unique -join ', ')"
+    }
+}
+
+# ── 5) get_classification_sources scope: "all" is instance-capable and name-agnostic —
+#      the actual gap the second round of Loam/NLRS feedback reported: with the legacy
+#      all=true / scope="type", an instance-level parameter with a non-classification
+#      -looking name is invisible no matter what argument is passed. scope="all" (both
+#      levels, no name/storage filter) must surface it, unscoped, spread across the
+#      document's categories rather than the first `sample` in document order.
+
+Write-Host ""
+Write-Host "-- get_classification_sources scope --" -ForegroundColor Cyan
+
+$sourcesAll = Invoke-PdraTool -Name 'get_classification_sources' -Arguments @{ scope = 'all'; sample = 300 }
+foreach ($f in @('sampled', 'sources')) {
+    if (Test-HasProperty $sourcesAll $f) { Write-Pass "get_classification_sources(scope=all) has '$f'" }
+    else { Write-Fail "get_classification_sources(scope=all) is missing '$f' (docs/CONTRACT.md)" }
+}
+
+$instanceCandidates = $sourcesAll.sources | Where-Object { $_.level -eq 'instance' }
+if ($instanceCandidates.Count -eq 0) {
+    Write-Host "  [SKIP] scope=all returned no instance-level candidates — either the open model has none," -ForegroundColor Yellow
+    Write-Host "         or the 300-element sample missed them; re-run with a larger 'sample'." -ForegroundColor Yellow
+} else {
+    Write-Pass "get_classification_sources(scope=all) reports $($instanceCandidates.Count) instance-level candidate(s), e.g. '$($instanceCandidates[0].parameter)' (populated $($instanceCandidates[0].populated)/$($sourcesAll.sampled))"
+}
+
+# Legacy all=true must still behave exactly like scope="type" (type-level, String-only,
+# no name filter) — the explicit backward-compatibility requirement.
+$legacyAll = Invoke-PdraTool -Name 'get_classification_sources' -Arguments @{ all = $true; category = $Category; sample = 100 }
+$scopeType = Invoke-PdraTool -Name 'get_classification_sources' -Arguments @{ scope = 'type'; category = $Category; sample = 100 }
+$legacyNames = ($legacyAll.sources | Sort-Object level, parameter | ForEach-Object { "$($_.level):$($_.parameter)" }) -join ','
+$typeNames   = ($scopeType.sources | Sort-Object level, parameter | ForEach-Object { "$($_.level):$($_.parameter)" }) -join ','
+if ($legacyNames -eq $typeNames) {
+    Write-Pass "legacy all=true matches scope='type' ($($legacyAll.sources.Count) candidates) — no behavior change for existing callers"
+} else {
+    Write-Fail "legacy all=true diverges from scope='type' — all=true: [$legacyNames] vs scope=type: [$typeNames]"
+}
+
+# ── 6) Category round-trip: category_id read off a list_elements row must resolve
+#      when fed back as another tool's `category` argument — previously always failed
+#      with "Unknown BuiltInCategory" because list_elements emitted the display name
+#      ("Walls") while every tool's `category` arg only parsed the enum name.
+
+Write-Host ""
+Write-Host "-- category round-trip --" -ForegroundColor Cyan
+
+if ($list.elements.Count -eq 0 -or -not (Test-HasProperty $list.elements[0] 'category_id')) {
+    Write-Host "  [SKIP] No list_elements row with 'category_id' to round-trip (category '$Category' may not be a built-in category)." -ForegroundColor Yellow
+} else {
+    $roundTripId = $list.elements[0].category_id
+    Write-Pass "list_elements row carries category_id '$roundTripId' alongside category '$($list.elements[0].category)'"
+
+    $byEnumName = Invoke-PdraTool -Name 'list_elements' -Arguments @{ category = $roundTripId; limit = 1 }
+    if ($byEnumName.elements.Count -gt 0) {
+        Write-Pass "category_id '$roundTripId' round-trips as a category arg (enum-name path)"
+    } else {
+        Write-Fail "category_id '$roundTripId' fed back as category returned 0 elements"
+    }
+
+    $byDisplayName = Invoke-PdraTool -Name 'list_elements' -Arguments @{ category = $list.elements[0].category; limit = 1 }
+    if ($byDisplayName.elements.Count -gt 0) {
+        Write-Pass "display name '$($list.elements[0].category)' also round-trips as a category arg (display-name fallback)"
+    } else {
+        Write-Fail "display name '$($list.elements[0].category)' fed back as category returned 0 elements"
     }
 }
 

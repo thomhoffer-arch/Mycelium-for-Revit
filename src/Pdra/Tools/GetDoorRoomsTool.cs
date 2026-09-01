@@ -38,7 +38,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             ["properties"] = new JsonObject
             {
                 ["element_ids"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "integer" }, ["description"] = "Door element ids. Omit with category to use the current selection." },
-                ["category"]    = new JsonObject { ["type"] = "string", ["description"] = "BuiltInCategory of the openings to resolve. Default OST_Doors." },
+                ["category"]    = new JsonObject { ["type"] = "string", ["description"] = "Category of the openings to resolve — the BuiltInCategory enum name (e.g. OST_Doors) or the document's display name (e.g. Doors), enum name tried first. Default OST_Doors." },
                 ["view_id"]     = new JsonObject { ["type"] = "integer", ["description"] = "Limit a category query to this view." },
                 ["door_params"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Parameter names to read flat onto each door. Default ['NLRS_C_breedte_01']." },
                 ["room_params"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" }, ["description"] = "Parameter names to read onto each room's params{}. Default ['NLRS_C_ruimtefunctie','gebruiksfunctie']." },
@@ -231,7 +231,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             if (args.TryGetString("category", out var catName))
             {
-                if (!Enum.TryParse<BuiltInCategory>(catName, out var bic)) { err = $"Unknown BuiltInCategory '{catName}'."; return Enumerable.Empty<Element>(); }
+                if (!CategoryResolver.TryResolve(doc, catName, out var bic, out err)) return Enumerable.Empty<Element>();
                 return Collect(doc, bic, scopeView);
             }
 

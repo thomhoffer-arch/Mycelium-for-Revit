@@ -126,6 +126,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["type_id"]   = typeId != ElementId.InvalidElementId ? (JsonNode?)typeId.Value : null,
                 ["type_name"] = typeElem?.Name,
             };
+            if (CategoryResolver.CategoryId(el.Category) is { } catId) row["category_id"] = catId;
 
             var ifc = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
             if (!string.IsNullOrEmpty(ifc)) row["ifc_guid"] = ifc;
