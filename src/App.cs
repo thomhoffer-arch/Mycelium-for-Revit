@@ -156,7 +156,7 @@ namespace Loam.Revit.Connector
             _events?.SendChanged(facts, changedIds);
         }
 
-        private void Emit(string kind, Document doc, string cause = null)
+        private void Emit(string kind, Document doc, string? cause = null)
         {
             if (doc is null) return;
             var facts = ModelFacts.From(doc);

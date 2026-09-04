@@ -99,7 +99,7 @@ join on those, never on `title`/`path`, when correlating events from more than o
 - **`worksharing`** — always present, exactly one of:
   | Value | Meaning |
   |---|---|
-  | `cloud` | Cloud-worked (BIM 360 / ACC, "C4R"). `cloud_project_guid`/`cloud_model_guid` are the identity anchor; `cloud_region` names the account region. |
+  | `cloud` | The model lives in the cloud (BIM 360 / ACC, "C4R"). Read from `Document.IsModelInCloud`, so it reports *where the model lives*, **not** that it is workshared — a single-user cloud model reports `cloud` too, and `is_workshared` is what tells those apart. `cloud_project_guid`/`cloud_model_guid` are the identity anchor; `cloud_region` names the account region. |
   | `not_workshared` | A plain, non-workshared local file. No central model exists. |
   | `file_based_central` | This document IS the file-based central model itself (rare — usually only true when opened directly, not detached/local). |
   | `file_based_local` | A local copy of a file-based workshared central model. `central_model_path` names the central. |

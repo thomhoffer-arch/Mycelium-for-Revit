@@ -79,7 +79,7 @@ namespace Loam.Revit.Connector.RevitBridge
         /// <paramref name="cause"/> (optional) — only meaningful on <c>kind: "saved"</c>, where it
         /// tells apart a Ctrl+S ("save") from a Sync to Central ("sync"); omitted from the payload
         /// otherwise. <c>kind</c> itself never changes so older orchestrator builds keep working.</summary>
-        public void Send(string kind, ModelFacts facts, string cause = null)
+        public void Send(string kind, ModelFacts facts, string? cause = null)
             => Post(kind, facts, cause);
 
         /// <summary>
@@ -89,7 +89,7 @@ namespace Loam.Revit.Connector.RevitBridge
         /// modified elements only; a deleted element has no UniqueId left to report). Unioned into the
         /// pending set across the whole debounce window.
         /// </summary>
-        public void SendChanged(ModelFacts facts, IEnumerable<string> changedIds = null)
+        public void SendChanged(ModelFacts facts, IEnumerable<string>? changedIds = null)
         {
             lock (_gate)
             {
@@ -162,7 +162,7 @@ namespace Loam.Revit.Connector.RevitBridge
             Post("changed", facts, null, ids);
         }
 
-        private void Post(string kind, ModelFacts facts, string cause, IReadOnlyList<string> changedIds = null)
+        private void Post(string kind, ModelFacts facts, string? cause, IReadOnlyList<string>? changedIds = null)
         {
             _ = Task.Run(async () =>
             {
