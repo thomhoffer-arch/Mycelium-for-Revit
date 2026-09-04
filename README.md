@@ -12,7 +12,7 @@ All tools are read-only. No writes, no transactions, no side effects.
 
 | Tool | What it returns |
 |---|---|
-| `get_model_revision` | Freshness stamp: `version_guid`, `number_of_saves`, `has_unsaved_changes`, document title and path |
+| `get_model_revision` | Freshness stamp: `version_guid`, `number_of_saves`, `has_unsaved_changes`, document title and path, plus `worksharing` and the central-model / cloud (C4R) identity fields that stay the same across every user of a shared model |
 | `get_project_info` | Project identity from `Document.ProjectInformation`: name, number, client, address, building |
 | `list_elements` | The general identity primitive — no scope box, no id, no category required. Omit `category` to walk the whole document (bounded by `limit`); each row carries `unique_id`, `ifc_guid`, `category` (display name), `category_id` (BuiltInCategory enum name), level, classification |
 | `get_rooms` | All rooms with number, name, level, area (ft² and display units), `unique_id` |
@@ -51,10 +51,28 @@ Besides answering MCP calls, the connector **pushes** Revit document events to t
 
 ```
 POST http://127.0.0.1:47600/api/model-event      (override port with LOAM_HTTP_PORT)
-{ "kind": "opened", "model": "Bomenhof.rvt", "project": "2233 IKC Poeldijk", "revision": "<version guid>" }
+{
+  "kind": "saved",
+  "model": "Bomenhof.rvt",
+  "project": "2233 IKC Poeldijk",
+  "revision": "<version guid>",
+  "worksharing": "file_based_local",
+  "central_model_path": "S:\\Central\\Bomenhof_central.rvt",
+  "cause": "sync"
+}
 ```
 
 `kind` is one of `opened` | `saved` | `changed` | `closed`. `DocumentChanged` is throttled to at most one POST per ~45s (it fires per transaction); the others send immediately. Loopback only, short timeout, all errors swallowed — if the orchestrator isn't running it's a silent no-op and Revit never blocks. An optional `X-Loam-Token` header is sent when `LOAM_MODEL_EVENT_TOKEN` is set.
+
+`worksharing` (always present — `cloud` | `not_workshared` | `file_based_central` | `file_based_local` |
+`file_based_unknown`) and, when known, `central_model_path` / `cloud_project_guid` / `cloud_model_guid` /
+`cloud_region` are the cross-user model identity: `model`/`revision` above name *this user's local copy*
+of a workshared model, which differs per user even for the same shared model — see `docs/CONTRACT.md`'s
+`get_model_revision` section for the full field-by-field rundown (the same fields, same values, both places).
+
+On `kind: "saved"` only, `cause` distinguishes a plain Ctrl+S (`"save"`) from a Sync to Central
+(`"sync"`) — both still report `kind: "saved"` so older orchestrator builds keep working; `cause` is
+omitted on every other `kind`.
 
 ---
 

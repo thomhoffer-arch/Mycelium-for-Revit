@@ -111,6 +111,28 @@ foreach ($f in @('version_guid', 'number_of_saves', 'has_unsaved_changes', 'titl
     else { Write-Fail "get_model_revision is missing '$f' (docs/CONTRACT.md)" }
 }
 
+# worksharing/central-model identity fields (docs/CONTRACT.md "Cross-user model identity") — the
+# fields that let two users' events about the SAME shared model be recognised as such, since
+# title/path above are each user's own local copy and differ per user.
+$allowedWorksharing = @('cloud', 'not_workshared', 'file_based_central', 'file_based_local', 'file_based_unknown')
+if (-not (Test-HasProperty $rev 'worksharing')) {
+    Write-Fail "get_model_revision is missing 'worksharing' (docs/CONTRACT.md)"
+} elseif ($allowedWorksharing -notcontains $rev.worksharing) {
+    Write-Fail "get_model_revision.worksharing = '$($rev.worksharing)' is not one of: $($allowedWorksharing -join ', ')"
+} else {
+    Write-Pass "get_model_revision.worksharing = '$($rev.worksharing)'"
+
+    if ($rev.worksharing -in @('file_based_local', 'file_based_central')) {
+        if (Test-HasProperty $rev 'central_model_path') { Write-Pass "get_model_revision has 'central_model_path' for worksharing='$($rev.worksharing)'" }
+        else { Write-Fail "get_model_revision is missing 'central_model_path' for worksharing='$($rev.worksharing)'" }
+    } elseif ($rev.worksharing -eq 'cloud') {
+        foreach ($f in @('cloud_project_guid', 'cloud_model_guid', 'cloud_region')) {
+            if (Test-HasProperty $rev $f) { Write-Pass "get_model_revision has '$f' for worksharing='cloud'" }
+            else { Write-Fail "get_model_revision is missing '$f' for worksharing='cloud'" }
+        }
+    }
+}
+
 $list = Invoke-PdraTool -Name 'list_elements' -Arguments @{ category = $Category; limit = 50 }
 foreach ($f in @('count', 'truncated', 'elements', 'classification_sources')) {
     if (Test-HasProperty $list $f) { Write-Pass "list_elements has '$f'" }
