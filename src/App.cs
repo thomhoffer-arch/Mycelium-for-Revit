@@ -92,11 +92,15 @@ namespace Loam.Revit.Connector
             _events?.TryFlushIfIdle();
         }
 
+        // A Ctrl+S and a Sync to Central both fire "saved" downstream — older orchestrator
+        // builds key off `kind` alone and must keep working — but they are very different
+        // events for a workshared model, so `cause` rides along as an additive discriminator
+        // ("save" | "sync") without ever changing `kind`.
         private void OnDocumentSaved(object sender, DocumentSavedEventArgs e)
-            => Emit("saved", e.Document);
+            => Emit("saved", e.Document, "save");
 
         private void OnDocumentSynced(object sender, DocumentSynchronizedWithCentralEventArgs e)
-            => Emit("saved", e.Document);
+            => Emit("saved", e.Document, "sync");
 
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)
             => Emit("closed", e.Document);
@@ -115,7 +119,7 @@ namespace Loam.Revit.Connector
         {
             var doc = e.GetDocument();
             if (doc is null) return;
-            var (model, project, revision) = Describe(doc);
+            var facts = ModelFacts.From(doc);
 
             // ENERGY EFFICIENCY (live request: "Loam should always only ask for new/changed things") —
             // hand Loam the ACTUAL touched UniqueIds for THIS transaction, not just "something changed",
@@ -149,39 +153,14 @@ namespace Loam.Revit.Connector
                 catch { /* enumeration failure — fall back to "something changed", no ids */ }
             }
 
-            _events?.SendChanged(model, project, revision, changedIds);
+            _events?.SendChanged(facts, changedIds);
         }
 
-        private void Emit(string kind, Document doc)
+        private void Emit(string kind, Document doc, string cause = null)
         {
             if (doc is null) return;
-            var (model, project, revision) = Describe(doc);
-            _events?.Send(kind, model, project, revision);
-        }
-
-        private static (string model, string project, string revision) Describe(Document doc)
-        {
-            string model = null, project = null, revision = null;
-            try { model = doc.Title; } catch { }
-
-            try
-            {
-                var pi = doc.ProjectInformation;
-                var number = pi?.Number ?? "";
-                var name   = pi?.Name   ?? "";
-                project = $"{number} {name}".Trim();
-                if (project.Length == 0) project = null;
-            }
-            catch { }
-
-            try
-            {
-                var v = Document.GetDocumentVersion(doc);
-                revision = v?.VersionGUID.ToString();
-            }
-            catch { }
-
-            return (model, project, revision);
+            var facts = ModelFacts.From(doc);
+            _events?.Send(kind, facts, cause);
         }
     }
 }

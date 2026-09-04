@@ -63,7 +63,7 @@ namespace Loam.Revit.Connector.RevitBridge
         private DateTime _lastChangedSentUtc = DateTime.MinValue;
         private Timer _changedTimer;
         private bool _hasPending;
-        private (string model, string project, string revision) _pending;
+        private ModelFacts _pending;
 
         public LoamEventClient()
         {
@@ -75,9 +75,12 @@ namespace Loam.Revit.Connector.RevitBridge
             _token = Environment.GetEnvironmentVariable("LOAM_MODEL_EVENT_TOKEN");
         }
 
-        /// <summary>Send an event now (opened / saved / closed / selection). Never throws.</summary>
-        public void Send(string kind, string model, string project, string revision)
-            => Post(kind, model, project, revision);
+        /// <summary>Send an event now (opened / saved / closed / selection). Never throws.
+        /// <paramref name="cause"/> (optional) — only meaningful on <c>kind: "saved"</c>, where it
+        /// tells apart a Ctrl+S ("save") from a Sync to Central ("sync"); omitted from the payload
+        /// otherwise. <c>kind</c> itself never changes so older orchestrator builds keep working.</summary>
+        public void Send(string kind, ModelFacts facts, string cause = null)
+            => Post(kind, facts, cause);
 
         /// <summary>
         /// Record a DocumentChanged and emit at most one "changed" POST per window:
@@ -86,11 +89,11 @@ namespace Loam.Revit.Connector.RevitBridge
         /// modified elements only; a deleted element has no UniqueId left to report). Unioned into the
         /// pending set across the whole debounce window.
         /// </summary>
-        public void SendChanged(string model, string project, string revision, IEnumerable<string> changedIds = null)
+        public void SendChanged(ModelFacts facts, IEnumerable<string> changedIds = null)
         {
             lock (_gate)
             {
-                _pending = (model, project, revision);
+                _pending = facts;
                 _hasPending = true;
                 if (changedIds is not null)
                 {
@@ -150,25 +153,39 @@ namespace Loam.Revit.Connector.RevitBridge
         {
             _lastChangedSentUtc = DateTime.UtcNow;
             _hasPending = false;
-            var (model, project, revision) = _pending;
+            var facts = _pending;
             // Overflowed (a huge transaction) -> send NO ids, never a silently-truncated partial list; Loam
             // then falls back to its own bounded full sweep, exactly today's behaviour.
             var ids = (!_pendingIdsOverflowed && _pendingChangedIds.Count > 0) ? new List<string>(_pendingChangedIds) : null;
             _pendingChangedIds.Clear();
             _pendingIdsOverflowed = false;
-            Post("changed", model, project, revision, ids);
+            Post("changed", facts, null, ids);
         }
 
-        private void Post(string kind, string model, string project, string revision, IReadOnlyList<string> changedIds = null)
+        private void Post(string kind, ModelFacts facts, string cause, IReadOnlyList<string> changedIds = null)
         {
             _ = Task.Run(async () =>
             {
                 try
                 {
                     var body = new JsonObject { ["kind"] = kind };
-                    if (!string.IsNullOrEmpty(model))    body["model"]    = model;
-                    if (!string.IsNullOrEmpty(project))  body["project"]  = project;
-                    if (!string.IsNullOrEmpty(revision)) body["revision"] = revision;
+                    if (!string.IsNullOrEmpty(facts?.Model))    body["model"]    = facts.Model;
+                    if (!string.IsNullOrEmpty(facts?.Project))  body["project"]  = facts.Project;
+                    if (!string.IsNullOrEmpty(facts?.Revision)) body["revision"] = facts.Revision;
+
+                    // worksharing is always present — it's the field that lets Loam tell apart
+                    // two users' local copies of the SAME model from two genuinely different
+                    // models; see ModelFacts' own doc comment.
+                    body["worksharing"] = facts?.Worksharing ?? "file_based_unknown";
+                    if (!string.IsNullOrEmpty(facts?.CentralModelPath)) body["central_model_path"] = facts.CentralModelPath;
+                    if (!string.IsNullOrEmpty(facts?.CloudProjectGuid)) body["cloud_project_guid"] = facts.CloudProjectGuid;
+                    if (!string.IsNullOrEmpty(facts?.CloudModelGuid))   body["cloud_model_guid"]   = facts.CloudModelGuid;
+                    if (!string.IsNullOrEmpty(facts?.CloudRegion))      body["cloud_region"]       = facts.CloudRegion;
+
+                    // cause only makes sense alongside kind: "saved" (save vs. sync) — omit it
+                    // everywhere else rather than sending a meaningless field.
+                    if (kind == "saved" && !string.IsNullOrEmpty(cause)) body["cause"] = cause;
+
                     if (changedIds is { Count: > 0 })
                     {
                         var arr = new JsonArray();

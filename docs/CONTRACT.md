@@ -73,10 +73,40 @@ across the categories present, not just the first ones in document order.
 Request: `{}`
 
 ```json
-{ "version_guid": "string", "number_of_saves": 42, "has_unsaved_changes": false, "title": "string", "path": "string" }
+{
+  "version_guid": "string",
+  "number_of_saves": 42,
+  "has_unsaved_changes": false,
+  "title": "string",
+  "path": "string",
+  "worksharing": "cloud",
+  "central_model_path": "string",
+  "cloud_project_guid": "string",
+  "cloud_model_guid": "string",
+  "cloud_region": "string"
+}
 ```
 
 Freshness stamp. `has_unsaved_changes: true` warns that the cloud copy may not reflect the model.
+
+**Cross-user model identity.** `title` and `path` identify *this user's local copy* of a workshared
+model — for a file-based workshared model, two people editing the same central model each report a
+different `title` (`SFW_PDR_BWK_R24_thom.hoffer` vs. `SFW_PDR_BWK_R24_jane.doe`) and a different
+`path` (each user's own local `Documents` folder). `worksharing` and `central_model_path` /
+`cloud_project_guid`+`cloud_model_guid` are the fact that IS identical across every user of a model —
+join on those, never on `title`/`path`, when correlating events from more than one user.
+
+- **`worksharing`** — always present, exactly one of:
+  | Value | Meaning |
+  |---|---|
+  | `cloud` | Cloud-worked (BIM 360 / ACC, "C4R"). `cloud_project_guid`/`cloud_model_guid` are the identity anchor; `cloud_region` names the account region. |
+  | `not_workshared` | A plain, non-workshared local file. No central model exists. |
+  | `file_based_central` | This document IS the file-based central model itself (rare — usually only true when opened directly, not detached/local). |
+  | `file_based_local` | A local copy of a file-based workshared central model. `central_model_path` names the central. |
+  | `file_based_unknown` | Workshared, but the central model path could not be resolved (e.g. a detached model) — never guessed; `central_model_path` stays absent. |
+- **`central_model_path`**, **`cloud_project_guid`**, **`cloud_model_guid`**, **`cloud_region`** — present
+  only when known (omit, never blank — same rule as everywhere else in this contract); absent for
+  `not_workshared` and `file_based_unknown`.
 
 ---
 
