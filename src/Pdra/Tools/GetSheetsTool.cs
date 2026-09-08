@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -21,8 +22,12 @@ namespace PDRA.Services.Ai.Tools.Queries
         public string Description =>
             "Enumerate drawing sheets (ViewSheets) with the views placed on each. Returns " +
             "sheet_number (matches PDF export filename stem, e.g. \"A101\"), sheet_name, " +
-            "unique_id, and for each placed view: name, view_type, unique_id. Set " +
-            "include_elements=true to also return the unique_id, ifc_guid (when present), and " +
+            "unique_id, and for each placed view: name, view_type, unique_id. The response also " +
+            "carries model_instance_id (when resolvable) — the document-instance guard: a Revit " +
+            "unique_id/ifc_guid is unique only WITHIN one document, so elements from two different " +
+            "reads only prove the same real element when model_instance_id also matches. Set " +
+            "include_elements=true to also return the unique_id, ifc_guid (when present), " +
+            "model_instance_id, and " +
             "classification of every model element visible in one view — requires sheet_number " +
             "(fetching a view's visible-element set is what makes Revit regenerate that view's " +
             "graphics, shown in its status bar as \"Generating graphics for ...\"; scoping to one " +
@@ -69,6 +74,11 @@ namespace PDRA.Services.Ai.Tools.Queries
         {
             var doc = ctx.UiApp.ActiveUIDocument?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
+
+            // Every sheet/view/element this call returns lives in the ONE host document, so this is
+            // computed once and reused, not re-derived per row — see ModelFacts.ModelInstanceId's own
+            // comment for why a caller needs this to safely join unique_id/ifc_guid across calls.
+            var modelInstanceId = ModelFacts.From(doc).ModelInstanceId;
 
             args.TryGetString("sheet_number", out var filterNum);
 
@@ -164,6 +174,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                                 var ifc = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                                 if (!string.IsNullOrEmpty(ifc)) eRow["ifc_guid"] = ifc;
+                                if (!string.IsNullOrEmpty(modelInstanceId)) eRow["model_instance_id"] = modelInstanceId;
 
                                 var cls = ElementContextReader.ResolveClassification(el, clsParams);
                                 clsEnvelope.Record(cls);
@@ -185,14 +196,16 @@ namespace PDRA.Services.Ai.Tools.Queries
                 rows.Add(JsonHelpers.Project(row, fields));
             }
 
-            return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
+            var result = new JsonObject
             {
                 ["total"]                  = all.Count,
                 ["count"]                  = rows.Count,
                 ["truncated"]               = rows.Count < all.Count,
                 ["sheets"]                  = rows,
                 ["classification_sources"]  = clsEnvelope.Build(),
-            }));
+            };
+            if (!string.IsNullOrEmpty(modelInstanceId)) result["model_instance_id"] = modelInstanceId;
+            return ToolResult.Ok(JsonHelpers.Serialize(result));
         }
     }
 }

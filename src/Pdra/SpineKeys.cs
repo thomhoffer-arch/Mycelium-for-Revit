@@ -14,6 +14,7 @@ namespace PDRA.Services.Ai.Tools.Queries
     ///   • sourceLocalId   — the element's UniqueId (stable within the session)
     ///   • projectKey      — a stable id for the document, unique per project so
     ///                       records from two open models never collide
+    ///   • modelInstanceId — the document-instance GUARD (optional — see Add's own note)
     /// (ifcGuid is already carried by the existing ifc_guid field/alias.)
     ///
     /// Rules honoured here: emit a key only with a real value (omit, never blank);
@@ -25,8 +26,16 @@ namespace PDRA.Services.Ai.Tools.Queries
 
         /// <summary>Stamp the spine keys onto one element's output object.
         /// <paramref name="projectKey"/> is computed once per call via
-        /// <see cref="ProjectKey"/> and passed in to avoid re-hashing per element.</summary>
-        public static void Add(JsonObject row, Element el, string projectKey)
+        /// <see cref="ProjectKey"/> and passed in to avoid re-hashing per element.
+        /// <paramref name="modelInstanceId"/> — <see cref="Loam.Revit.Connector.RevitBridge.ModelFacts.ModelInstanceId"/>
+        /// for the element's OWN document (host or, for a linked element, the LINK's document —
+        /// never the host's, so a linked element is namespaced by the model it actually lives in).
+        /// Omitted when null/empty (a standalone, non-workshared, non-cloud document has none): a
+        /// Revit UniqueId / IFC GUID is unique only WITHIN one document instance, never globally, so
+        /// a caller must never treat two elements as the same real-world thing just because their
+        /// unique_id/ifc_guid match — modelInstanceId must ALSO match (or the caller accepts the
+        /// risk when it's absent on both sides).</summary>
+        public static void Add(JsonObject row, Element el, string projectKey, string? modelInstanceId = null)
         {
             row["source"] = Source;
 
@@ -39,6 +48,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             }
 
             if (!string.IsNullOrEmpty(projectKey)) row["projectKey"] = projectKey;
+            if (!string.IsNullOrEmpty(modelInstanceId)) row["modelInstanceId"] = modelInstanceId;
         }
 
         /// <summary>A stable id for the document, unique per project and unchanged

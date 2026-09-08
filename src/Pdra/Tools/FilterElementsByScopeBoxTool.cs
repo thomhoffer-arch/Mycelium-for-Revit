@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -24,7 +25,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             "design_option{name,is_primary} (omitted when none), level (omitted when unresolvable), " +
             "classification (omitted when unpopulated), from_link, project} so a zone resolver filters on " +
             "real data (primary-option / arch-levels / project), plus a summary {count_in, count_out}; set " +
-            "inside_only=true to return only the members. Accepts classification_params; the response " +
+            "inside_only=true to return only the members. The response also carries model_instance_id " +
+            "(when resolvable) — the document-instance guard: unique_id/ifc_guid are unique only WITHIN " +
+            "one document, so elements from two different reads only prove the same real element when " +
+            "model_instance_id also matches. Accepts classification_params; the response " +
             "carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
@@ -68,6 +72,20 @@ namespace PDRA.Services.Ai.Tools.Queries
             var box = sb.get_BoundingBox(null);
             if (box is null) return ToolResult.Error($"Scope box {sb.Id.Value} has no bounding box.");
 
+            // ResolveElements below is host-scoped (element_ids/category/selection never resolve into
+            // a link), but this tool already reads each element's OWN el.Document (from_link/project
+            // below) rather than assuming `doc` — so this stays memoized per-document too, matching
+            // that same caution instead of relying on today's ResolveElements never returning a linked
+            // element. ModelFacts.From(d) does several Revit API calls; memoized so a whole-document
+            // scan (unscoped category, or a big selection) computes it once per distinct document, not
+            // once per element.
+            var factsCache = new Dictionary<Document, ModelFacts>();
+            string? ModelInstanceIdFor(Document d)
+            {
+                if (!factsCache.TryGetValue(d, out var f)) { f = ModelFacts.From(d); factsCache[d] = f; }
+                return f.ModelInstanceId;
+            }
+
             bool intersects = args.TryGetString("mode", out var mode) &&
                               string.Equals(mode, "intersects", StringComparison.OrdinalIgnoreCase);
             bool insideOnly = args.TryGetProperty("inside_only", out var ioEl) && ioEl.ValueKind == JsonValueKind.True;
@@ -110,6 +128,8 @@ namespace PDRA.Services.Ai.Tools.Queries
                 // correctly. Same pattern as GetSheetsTool's include_elements rows.
                 var ifcGuid = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                 if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
+                var modelInstanceId = ModelInstanceIdFor(el.Document);
+                if (!string.IsNullOrEmpty(modelInstanceId)) row["model_instance_id"] = modelInstanceId;
 
                 // Provenance / scoping fields so a zone resolver filters on real model
                 // data (primary-option / arch-levels / project) instead of heuristics.
@@ -130,7 +150,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 rows.Add(row);
             }
 
-            return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
+            var result = new JsonObject
             {
                 ["scope_box"]               = new JsonObject { ["id"] = sb.Id.Value, ["name"] = sb.Name },
                 ["mode"]                    = intersects ? "intersects" : "centroid",
@@ -138,7 +158,13 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["count_out"]               = tested - inCount,
                 ["elements"]                = rows,
                 ["classification_sources"]  = clsEnvelope.Build(),
-            }));
+            };
+            // Top-level identity is the HOST document's own (the document this call was made
+            // against); per-element model_instance_id above already covers the case of a linked
+            // element carrying a different one.
+            var hostModelInstanceId = ModelInstanceIdFor(doc);
+            if (!string.IsNullOrEmpty(hostModelInstanceId)) result["model_instance_id"] = hostModelInstanceId;
+            return ToolResult.Ok(JsonHelpers.Serialize(result));
         }
 
         /// <summary>The element's design option as {id, name, is_primary}, or null when it

@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -27,7 +28,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             "gebruiksfunctie). type_name carries the door type token (e.g. dm###). Each door also carries " +
             "classification (assembly/OmniClass codes, plus classification_params when passed, when " +
             "populated) — the response carries classification_sources. Each row has from_room/" +
-            "to_room {id, name, number, level_name, params} and resolution = from_to_room | geometric | none.";
+            "to_room {id, name, number, level_name, params} and resolution = from_to_room | geometric | none. " +
+            "The response also carries model_instance_id (when resolvable) — the document-instance " +
+            "guard: unique_id/ifc_guid are unique only WITHIN one document, so elements from two " +
+            "different reads only prove the same real element when model_instance_id also matches.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -64,6 +68,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             var phase = ResolvePhase(doc, uidoc, args, out var phaseErr);
             if (phaseErr is not null) return ToolResult.Error(phaseErr);
 
+            // Doors resolve against the ONE host document (element_ids/category/selection are all
+            // host-scoped), so this is computed once.
+            var modelInstanceId = ModelFacts.From(doc).ModelInstanceId;
+
             int limit = 200;
             if (args.TryGetProperty("limit", out var limEl) && limEl.ValueKind == JsonValueKind.Number)
                 limit = JsonHelpers.Clamp(limEl.GetInt32(), 1, 2000);
@@ -94,6 +102,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 // joining a door back onto the connective spine got nothing to key on.
                 var ifcGuid = fi.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                 if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
+                if (!string.IsNullOrEmpty(modelInstanceId)) row["model_instance_id"] = modelInstanceId;
 
                 foreach (var pn in doorParams)
                 {
@@ -123,13 +132,15 @@ namespace PDRA.Services.Ai.Tools.Queries
                 count++;
             }
 
-            return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
+            var result = new JsonObject
             {
                 ["count"]                  = count,
                 ["phase"]                  = phase?.Name,
                 ["elements"]               = rows,
                 ["classification_sources"] = clsEnvelope.Build(),
-            }));
+            };
+            if (!string.IsNullOrEmpty(modelInstanceId)) result["model_instance_id"] = modelInstanceId;
+            return ToolResult.Ok(JsonHelpers.Serialize(result));
         }
 
         // ── Room resolution ──────────────────────────────────────────────────────

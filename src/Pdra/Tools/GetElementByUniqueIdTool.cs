@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -23,8 +24,13 @@ namespace PDRA.Services.Ai.Tools.Queries
             "loaded Revit link; a link hit carries from_link, link_instance_id, link_title and the link's " +
             "own projectKey. Each result also returns level and classification (assembly/omniclass) — the " +
             "way to read the storey/Assembly code of elements INSIDE linked models, which the host-only " +
-            "param tools cannot reach. Plus spine keys (source, sourceLocalId, projectKey) and ifc_guid " +
-            "when present; found=false for ids with no match. Accepts classification_params to also probe " +
+            "param tools cannot reach. Plus spine keys (source, sourceLocalId, projectKey, " +
+            "modelInstanceId when resolvable) and ifc_guid when present; found=false for ids with no " +
+            "match. modelInstanceId is the document-instance guard: unique_id/ifc_guid are unique only " +
+            "WITHIN one document (a copied/Save-As/split RVT can carry duplicates across genuinely " +
+            "different projects), so two results only prove the same element when their " +
+            "modelInstanceId also matches — a linked element is namespaced by the LINK's own model " +
+            "identity, not the host's. Accepts classification_params to also probe " +
             "an office's own classification parameter; the response carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
@@ -67,12 +73,23 @@ namespace PDRA.Services.Ai.Tools.Queries
             // Loaded Revit links, resolved lazily and only once (host miss is the common path).
             List<RevitLinkInstance>? links = null;
 
+            // ModelFacts.From(d) does several Revit API calls per document; memoize per DISTINCT
+            // document (host, or a link's document once actually hit) instead of recomputing it for
+            // every requested id — most calls resolve mostly to the host, and several ids can share
+            // the same link.
+            var factsCache = new Dictionary<Document, ModelFacts>();
+            string? ModelInstanceIdFor(Document d)
+            {
+                if (!factsCache.TryGetValue(d, out var f)) { f = ModelFacts.From(d); factsCache[d] = f; }
+                return f.ModelInstanceId;
+            }
+
             var results = new JsonArray();
             foreach (var uid in wanted)
             {
                 // 1) Host document.
                 var host = SafeGet(doc, uid);
-                if (host is not null) { results.Add(BuildFound(uid, host, link: null, clsParams, clsEnvelope)); continue; }
+                if (host is not null) { results.Add(BuildFound(uid, host, link: null, clsParams, clsEnvelope, ModelInstanceIdFor(doc))); continue; }
 
                 // 2) Each loaded link's document.
                 links ??= new FilteredElementCollector(doc)
@@ -88,7 +105,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                 }
 
                 results.Add(linked is not null
-                    ? BuildFound(uid, linked, foundLink, clsParams, clsEnvelope)
+                    ? BuildFound(uid, linked, foundLink, clsParams, clsEnvelope, ModelInstanceIdFor(linked.Document))
                     : new JsonObject { ["unique_id"] = uid, ["found"] = false });
             }
 
@@ -107,10 +124,14 @@ namespace PDRA.Services.Ai.Tools.Queries
 
         /// <summary>Build the row for a resolved element. Spine keys come from the
         /// element's OWN document (host or link), so a linked element gets the link's
-        /// projectKey. <paramref name="link"/> is the host-side instance when found in a link.</summary>
+        /// projectKey and modelInstanceId. <paramref name="link"/> is the host-side instance
+        /// when found in a link. <paramref name="modelInstanceId"/> is the element's own
+        /// document's <see cref="ModelFacts.ModelInstanceId"/>, precomputed (and memoized) by
+        /// the caller.</summary>
         private static JsonObject BuildFound(
             string uid, Element el, RevitLinkInstance? link,
-            List<string>? clsParams, ElementContextReader.ClassificationEnvelope clsEnvelope)
+            List<string>? clsParams, ElementContextReader.ClassificationEnvelope clsEnvelope,
+            string? modelInstanceId)
         {
             var d        = el.Document;
             var typeId   = el.GetTypeId();
@@ -131,7 +152,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             var ifc = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
             if (!string.IsNullOrEmpty(ifc)) row["ifc_guid"] = ifc;
 
-            SpineKeys.Add(row, el, SpineKeys.ProjectKey(d));
+            SpineKeys.Add(row, el, SpineKeys.ProjectKey(d), modelInstanceId);
 
             // Storey + classification from the element's OWN document — works for linked
             // elements too (host param tools can't reach inside links).

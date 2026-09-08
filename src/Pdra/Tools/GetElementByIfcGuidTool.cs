@@ -2,6 +2,7 @@ using Autodesk.Revit.DB;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -18,9 +19,11 @@ namespace PDRA.Services.Ai.Tools.Queries
             "ifc_guid or an array ifc_guids[]. Matches each element's stored IFC_GUID parameter " +
             "(populated after an IFC export/round-trip). Returns [{ifc_guid, id, unique_id, name, " +
             "category, category_id (BuiltInCategory enum name, when built-in), type_id, type_name, level, classification, found, source, sourceLocalId, " +
-            "projectKey}] — the same element shape as pdra_get_element_by_uniqueid; found=false for " +
-            "GUIDs with no match. Use to turn a ClashControl clash's globalIdA/globalIdB into the " +
-            "corresponding Revit element. Accepts classification_params (see " +
+            "projectKey, modelInstanceId (when resolvable)}] — the same element shape as " +
+            "pdra_get_element_by_uniqueid; found=false for GUIDs with no match. modelInstanceId is the " +
+            "document-instance guard — see pdra_get_element_by_uniqueid's description for why a shared " +
+            "ifc_guid alone never proves the same element. Use to turn a ClashControl clash's " +
+            "globalIdA/globalIdB into the corresponding Revit element. Accepts classification_params (see " +
             "pdra_get_element_by_uniqueid); the response carries classification_sources.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
@@ -71,6 +74,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             }
 
             var projectKey = SpineKeys.ProjectKey(doc);
+            // No link traversal here (host doc only, unlike get_element_by_uniqueid), so every result
+            // shares one document's identity — compute once, not per guid.
+            var modelInstanceId = ModelFacts.From(doc).ModelInstanceId;
 
             var results = new JsonArray();
             foreach (var guid in wanted)
@@ -91,7 +97,7 @@ namespace PDRA.Services.Ai.Tools.Queries
                         ["type_name"] = typeElem?.Name,
                     };
                     if (CategoryResolver.CategoryId(el.Category) is { } catId) row["category_id"] = catId;
-                    SpineKeys.Add(row, el, projectKey);
+                    SpineKeys.Add(row, el, projectKey, modelInstanceId);
 
                     var level = ElementContextReader.ResolveLevel(el);
                     if (level is not null) row["level"] = level;
