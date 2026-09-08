@@ -33,6 +33,33 @@ namespace Loam.Revit.Connector.RevitBridge
         public string? CloudModelGuid { get; }
         public string? CloudRegion { get; }
 
+        /// <summary>
+        /// ONE canonical per-document-instance identity anchor, derived from the cross-user facts
+        /// above: the cloud project+model GUID pair when both are known (identical for every C4R
+        /// user of a model), else the file-based central model path (also identical for every user
+        /// of a workshared model), else null.
+        ///
+        /// WHY THIS EXISTS: a Revit UniqueId / IFC GUID is unique only WITHIN one document instance,
+        /// never globally — Autodesk's own docs concede this for whole-file clones ("Understanding
+        /// the Use of the UniqueId and Element Identifiers in RVT, IFC, NW and Forge"), and the
+        /// Revit-IFC team documents copying+exporting an RVT trivially producing duplicate IFC
+        /// GlobalIds (autodesk/revit-ifc#378 — "expected for copied or split models", no built-in
+        /// "reset document GUIDs"). A downstream consumer that joins two documents' elements on a
+        /// shared UniqueId/IfcGuid alone can silently conflate two genuinely different projects that
+        /// merely share lineage (one was Save-As/copied/split from the other). ModelInstanceId is the
+        /// GUARD: two elements only really identify the same real-world thing when their UniqueId/
+        /// IfcGuid match AND their ModelInstanceId matches too.
+        ///
+        /// NULL is an honest "unknown", not "same as every other unknown" — a genuinely standalone,
+        /// non-workshared, non-cloud RVT (including a fresh Save As/copy of one) has no cross-copy
+        /// identity the Revit API exposes here. Callers MUST treat null as "cannot rule out a
+        /// collision", never as a value elements can be safely joined on.
+        /// </summary>
+        public string? ModelInstanceId =>
+            (!string.IsNullOrEmpty(CloudProjectGuid) && !string.IsNullOrEmpty(CloudModelGuid))
+                ? $"cloud:{CloudProjectGuid}:{CloudModelGuid}"
+                : (!string.IsNullOrEmpty(CentralModelPath) ? $"central:{CentralModelPath}" : null);
+
         public ModelFacts(
             string? model,
             string? project,

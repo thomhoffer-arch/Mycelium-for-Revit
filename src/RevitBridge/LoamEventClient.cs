@@ -181,6 +181,10 @@ namespace Loam.Revit.Connector.RevitBridge
                     if (!string.IsNullOrEmpty(facts?.CloudProjectGuid)) body["cloud_project_guid"] = facts.CloudProjectGuid;
                     if (!string.IsNullOrEmpty(facts?.CloudModelGuid))   body["cloud_model_guid"]   = facts.CloudModelGuid;
                     if (!string.IsNullOrEmpty(facts?.CloudRegion))      body["cloud_region"]       = facts.CloudRegion;
+                    // The single combined identity anchor (see ModelFacts.ModelInstanceId's own doc
+                    // comment) — sent alongside the raw facts it's derived from so an older Loam that
+                    // doesn't recognise this field yet still gets everything it already understood.
+                    if (!string.IsNullOrEmpty(facts?.ModelInstanceId)) body["model_instance_id"] = facts.ModelInstanceId;
 
                     // cause only makes sense alongside kind: "saved" (save vs. sync) — omit it
                     // everywhere else rather than sending a meaningless field.

@@ -27,7 +27,12 @@ namespace PDRA.Services.Ai.Tools.Queries
             "worksharing (cloud / not_workshared / file_based_central / file_based_local / " +
             "file_based_unknown) plus central_model_path and, for a cloud (C4R) model, " +
             "cloud_project_guid/cloud_model_guid/cloud_region — the cross-user identity anchor, since " +
-            "title/path alone identify only THIS user's local copy of a workshared model.";
+            "title/path alone identify only THIS user's local copy of a workshared model. Also returns " +
+            "model_instance_id, the single combined form of that anchor (cloud pair, else central path, " +
+            "else absent) — the value to use as the document-instance guard when joining elements' " +
+            "unique_id/ifc_guid across two reads: those are unique only WITHIN one document instance, " +
+            "never globally, so a shared unique_id/ifc_guid only proves the same element when " +
+            "model_instance_id also matches (or both are absent and the caller accepts the risk).";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -59,6 +64,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             if (facts.CloudProjectGuid is not null) result["cloud_project_guid"] = facts.CloudProjectGuid;
             if (facts.CloudModelGuid   is not null) result["cloud_model_guid"]   = facts.CloudModelGuid;
             if (facts.CloudRegion      is not null) result["cloud_region"]       = facts.CloudRegion;
+            if (facts.ModelInstanceId  is not null) result["model_instance_id"]  = facts.ModelInstanceId;
 
             return ToolResult.Ok(JsonHelpers.Serialize(result));
         }

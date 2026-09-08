@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Loam.Revit.Connector.RevitBridge;
 
 namespace PDRA.Services.Ai.Tools.Queries
 {
@@ -27,6 +28,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             "means no natural sort, results come in document order). Each row carries unique_id (primary join " +
             "key), id, category (display name), category_id (BuiltInCategory enum name, when the category is " +
             "a built-in one — feed this back as the category arg), name, ifc_guid (when present), " +
+            "model_instance_id (when resolvable — the document-instance guard: unique_id/ifc_guid are " +
+            "unique only WITHIN one document, so elements from two different reads only prove the same " +
+            "real element when model_instance_id also matches), " +
             "level (when resolvable), and classification (assembly/OmniClass codes, plus classification_params " +
             "when passed, when populated). Supports limit, fields, view_id (scope a category query to one " +
             "view), and classification_params. The response also carries classification_sources — see that " +
@@ -53,6 +57,11 @@ namespace PDRA.Services.Ai.Tools.Queries
         {
             var doc = ctx.UiApp.ActiveUIDocument?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
+
+            // Every row this call returns lives in the ONE host document (no link traversal here), so
+            // this is computed once and reused — see ModelFacts.ModelInstanceId's own comment for why
+            // a caller needs this to safely join unique_id/ifc_guid across calls.
+            var modelInstanceId = ModelFacts.From(doc).ModelInstanceId;
 
             var limit  = args.GetLimit(def: 200, max: 2000);
             var fields = args.GetFields();
@@ -100,6 +109,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
                 var ifcGuid = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                 if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
+                if (!string.IsNullOrEmpty(modelInstanceId)) row["model_instance_id"] = modelInstanceId;
 
                 var level = ElementContextReader.ResolveLevel(el);
                 if (level is not null) row["level"] = level;
@@ -111,13 +121,15 @@ namespace PDRA.Services.Ai.Tools.Queries
                 rows.Add(JsonHelpers.Project(row, fields));
             }
 
-            return ToolResult.Ok(JsonHelpers.Serialize(new JsonObject
+            var result = new JsonObject
             {
                 ["count"]                 = rows.Count,
                 ["truncated"]             = truncated,
                 ["elements"]              = rows,
                 ["classification_sources"] = clsEnvelope.Build(),
-            }));
+            };
+            if (!string.IsNullOrEmpty(modelInstanceId)) result["model_instance_id"] = modelInstanceId;
+            return ToolResult.Ok(JsonHelpers.Serialize(result));
         }
     }
 }

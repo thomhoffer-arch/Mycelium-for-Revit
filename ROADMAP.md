@@ -43,6 +43,30 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 
 ## Fixed
 
+- [x] **`unique_id`/`ifc_guid` carried no document-instance guard — a copied/Save-As/split RVT could
+      produce a false "same project" merge downstream** — an external analysis (Loam) found two
+      genuinely different projects (numbered 2033 and 2322) whose Revit UniqueIds and IFC GUIDs
+      overlapped ~84-93%, because one model had been copied/Save-As'd/split from the other. Both
+      Autodesk's own docs (UniqueId is unique "within the document") and the Revit-IFC team
+      ([autodesk/revit-ifc#378](https://github.com/Autodesk/revit-ifc/issues/378) — copying+exporting
+      an RVT trivially produces duplicate IFC GlobalIds, "expected for copied or split models", no
+      built-in "reset document GUIDs") confirm this is expected Revit behaviour, not a connector bug —
+      but every element-returning tool here (`get_sheets`, `list_elements`,
+      `get_element_by_uniqueid`, `get_element_by_ifcguid`, `filter_elements_by_scope_box`,
+      `get_door_rooms`) returned `unique_id`/`ifc_guid` with nothing to tell two document instances
+      apart, so a caller joining on those alone had no way to know a match might just mean "shares
+      lineage", not "is the same project". Fixed with `model_instance_id` (camelCase
+      `modelInstanceId` alongside the existing `source`/`sourceLocalId`/`projectKey` spine keys on
+      `get_element_by_uniqueid`/`get_element_by_ifcguid`; snake_case `model_instance_id` elsewhere,
+      matching each tool's own existing field-naming convention) — one new `ModelFacts.ModelInstanceId`
+      property (the cloud project+model GUID pair when known, else the central model path, else
+      null) stamped onto every element row and every relevant response envelope, and a linked
+      element gets the LINK's own identity, never the host's. Deliberately does **not** fabricate an
+      identity for a genuinely standalone, non-workshared, non-cloud document (including a fresh
+      Save As/copy) — Revit's API exposes no cross-copy identity for that case, so `model_instance_id`
+      stays absent there and callers are told, in the field's own contract, to treat absence as
+      "cannot rule out a collision", never as a value safe to join on. See `docs/CONTRACT.md`'s
+      "Identity rules" section for the full contract.
 - [x] **`filter_elements_by_scope_box` and `get_door_rooms` were silently non-joinable** — `docs/CONTRACT.md`
       always documented `unique_id`/`ifc_guid` on both tools' rows (the connective-spine identity keys), but
       neither tool ever actually set them — a doc/implementation drift that meant the ONE tool that enumerates

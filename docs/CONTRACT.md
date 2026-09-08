@@ -83,7 +83,8 @@ Request: `{}`
   "central_model_path": "string",
   "cloud_project_guid": "string",
   "cloud_model_guid": "string",
-  "cloud_region": "string"
+  "cloud_region": "string",
+  "model_instance_id": "string"
 }
 ```
 
@@ -107,6 +108,13 @@ join on those, never on `title`/`path`, when correlating events from more than o
 - **`central_model_path`**, **`cloud_project_guid`**, **`cloud_model_guid`**, **`cloud_region`** — present
   only when known (omit, never blank — same rule as everywhere else in this contract); absent for
   `not_workshared` and `file_based_unknown`.
+- **`model_instance_id`** — the single combined form of the anchor above: `cloud_project_guid`+
+  `cloud_model_guid` when both are known, else `central_model_path`, else absent. This is the
+  **document-instance guard** every element-returning tool also stamps on its rows (see "Identity
+  rules" below) — use it, not `unique_id`/`ifc_guid` alone, when deciding whether two reads (or two
+  users' events) describe the same real element. Absent for `not_workshared`/`file_based_unknown`
+  (a genuinely standalone RVT, including a fresh Save As/copy of one, has no cross-copy identity the
+  Revit API exposes) — treat absence as "cannot rule out a collision", never as "matches".
 
 ---
 
@@ -184,11 +192,13 @@ Request: `{ "include_elements": false }` — with `include_elements: true`, also
 {
   "sheets": [
     { "unique_id": "…", "id": 123, "sheet_number": "A101", "name": "Floor Plan", "views": [ { "unique_id": "…", "name": "…" } ] }
-  ]
+  ],
+  "model_instance_id": "string"
 }
 ```
 
-`include_elements: true` adds visible element data per view, and **requires `sheet_number`**.
+`model_instance_id` (top-level, present when resolvable) is the document-instance guard — see
+`get_model_revision`'s entry above. `include_elements: true` adds visible element data per view, and **requires `sheet_number`**; each element row also carries `model_instance_id` (same value as the top-level one — this call reads a single host document).
 Fetching a view's elements this way makes Revit regenerate that view's graphics if it isn't
 already cached (the "Generating graphics for ..." status-bar message); requiring `sheet_number`
 keeps that to the handful of views placed on one sheet instead of every view in the document. A
@@ -228,15 +238,18 @@ Request: `{ "category": "OST_Walls", "view_id": 123, "limit": 200, "classificati
       "category_id": "OST_Walls",
       "name": "Basic Wall: Exterior",
       "ifc_guid": "0X3$tP9…",
+      "model_instance_id": "string",
       "level": { "id": 456, "name": "01 begane grond", "elevation_ft": 0.0, "elevation_user_units": "0.00 m" },
       "classification": { "assembly_code": "22.20", "assembly_description": "…", "NL-SfB": "21.21" }
     }
   ],
-  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] }
+  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] },
+  "model_instance_id": "string"
 }
 ```
 
-The general identity primitive — no scope box, no id, no category all required. `filter_elements_by_scope_box`
+`model_instance_id` (per-row and top-level, present when resolvable) is the document-instance guard —
+see `get_model_revision`'s entry above. The general identity primitive — no scope box, no id, no category all required. `filter_elements_by_scope_box`
 needs a scope box; `get_element_by_uniqueid`/`get_element_by_ifcguid` need an id you already have; the typed
 getters (`get_rooms`/`get_levels`/`get_views`/`get_sheets`/`get_links`) each cover one narrow category. This
 is how a caller with no prior identity discovers what's in the model. Unscoped (`category` omitted) it walks
@@ -270,6 +283,7 @@ Request: `{ "scope_box_id": 123, "category": "OST_Doors", "inside_only": true }`
       "category_id": "OST_Doors",
       "in_box": true,
       "ifc_guid": "0X3$tP9…",
+      "model_instance_id": "string",
       "design_option": { "id": 111, "name": "Option 1", "is_primary": true },
       "level": { "id": 456, "name": "05 vijfde verdieping", "elevation_ft": 12.0, "elevation_user_units": "3.66 m" },
       "classification": { "assembly_code": "22.20", "assembly_description": "…" },
@@ -277,12 +291,16 @@ Request: `{ "scope_box_id": 123, "category": "OST_Doors", "inside_only": true }`
       "project": "2233 IKC Poeldijk"
     }
   ],
-  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] }
+  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] },
+  "model_instance_id": "string"
 }
 ```
 
 - **`unique_id`** — primary identity (stable across sessions).
 - **`id`** — numeric Revit ElementId. Required by `get_door_rooms`.
+- **`model_instance_id`** (per-row, from the element's OWN document — a linked element's differs from
+  the host's; and top-level, the host document's own) — the document-instance guard, present when
+  resolvable. See `get_model_revision`'s entry above.
 - `ifc_guid`, `design_option`, `level`, and `classification` are omitted (not blanked) when the element
   carries none — a prior version of this tool set `level`/`design_option` to `null` instead of omitting
   them; that has been fixed to match every other tool's convention.
@@ -311,6 +329,7 @@ Request: `{ "unique_ids": ["…", "…"], "classification_params": ["NL-SfB"] }`
       "source": "pdra",
       "sourceLocalId": "…",
       "projectKey": "revit:…",
+      "modelInstanceId": "string",
       "level": { "id": 456, "name": "01 begane grond", "elevation_ft": 0.0, "elevation_user_units": "0.00 m" },
       "classification": { "assembly_code": "22.20", "assembly_description": "…", "NL-SfB": "21.21" }
     }
@@ -320,14 +339,18 @@ Request: `{ "unique_ids": ["…", "…"], "classification_params": ["NL-SfB"] }`
 ```
 
 Resolves across host document and loaded Revit links. `found: false` when not resolvable. A link hit also
-carries `from_link: true`, `link_instance_id`, `link_title`.
+carries `from_link: true`, `link_instance_id`, `link_title` — and its `modelInstanceId` (present when
+resolvable) is the LINK's own, not the host's: two elements only prove the same real element when their
+`unique_id`/`ifc_guid` AND `modelInstanceId` both match (see `get_model_revision`'s entry above — a
+Revit UniqueId is unique only within one document instance, never globally).
 
 ---
 
 ### `get_element_by_ifcguid`
 Request: `{ "ifc_guids": ["…"], "classification_params": ["NL-SfB"] }` → the same element shape as
 `get_element_by_uniqueid` (keyed on `ifc_guid` instead of `unique_id`; no link-search, since IFC_GUID isn't
-searched inside links today), including `level`, `classification`, and the `classification_sources` envelope.
+searched inside links today, so `modelInstanceId` is always the host document's own), including `level`,
+`classification`, and the `classification_sources` envelope.
 
 Fallback identity path — use `unique_id` as primary.
 
@@ -347,6 +370,7 @@ Request: `{ "element_ids": [1234567, …], "scope_box_id": 123, "limit": 500, "c
       "unique_id": "…",
       "id": 1234567,
       "ifc_guid": "…",
+      "model_instance_id": "string",
       "type_name": "…dm09…",
       "NLRS_C_breedte_01": 850,
       "classification": { "NL-SfB": "23.21" },
@@ -355,7 +379,8 @@ Request: `{ "element_ids": [1234567, …], "scope_box_id": 123, "limit": 500, "c
       "resolution": "from_to_room"
     }
   ],
-  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] }
+  "classification_sources": { "supported": true, "probed": [ "…see Classification section above…" ] },
+  "model_instance_id": "string"
 }
 ```
 
@@ -412,6 +437,7 @@ to sort first.
 | `unique_id` | **Primary** join key — stable across sessions. |
 | `id` (numeric) | Volatile, but **required** by `get_door_rooms`. |
 | `ifc_guid` | Fallback join key. |
+| `model_instance_id` / `modelInstanceId` | Document-instance **guard**, not itself a join key — present when resolvable (absent for a standalone, non-workshared, non-cloud document). A Revit UniqueId / IFC GlobalId is unique only WITHIN one document instance, never globally: copying, Save-As-ing, or splitting an RVT can produce two genuinely different documents that share thousands of identical `unique_id`/`ifc_guid` values (Autodesk's own docs concede this for whole-file clones; the Revit-IFC team documents the IFC-export case directly — [autodesk/revit-ifc#378](https://github.com/Autodesk/revit-ifc/issues/378), no built-in "reset document GUIDs"). **Two elements only prove the same real-world thing when their join key (`unique_id` or `ifc_guid`) matches AND `model_instance_id` also matches** — never on the join key alone, and never treat two `null`/absent `model_instance_id`s as matching each other. Snake_case (`model_instance_id`) on model-level/bulk-envelope responses (`get_model_revision`, `get_sheets`, `list_elements`, `filter_elements_by_scope_box`, `get_door_rooms`); camelCase (`modelInstanceId`) alongside the other spine MUST-keys (`source`/`sourceLocalId`/`projectKey`) on `get_element_by_uniqueid`/`get_element_by_ifcguid`. A linked element carries the **link's own** identity, not the host's. |
 | `category_id` | BuiltInCategory enum name for a row's category, when built-in — feed it back as a `category` request arg on any tool that accepts one, alongside or instead of the `category` display name. |
 
 ## Scope (today)
