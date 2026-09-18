@@ -54,6 +54,22 @@ namespace Loam.Revit.Connector.RevitBridge
         // thousands of elements) still overflow into "something changed, re-sync yourself".
         private const int MaxChangedIds = 2000;
         private readonly HashSet<string> _pendingChangedIds = new HashSet<string>();
+        // Added/modified are also tracked SEPARATELY from the union above (added-vs-modified is real
+        // signal Revit already hands over via GetAddedElementIds()/GetModifiedElementIds() — merging
+        // them lost it). Same overflow gate as the union: bounded by _pendingChangedIds' own count, so
+        // one giant transaction drops ALL three id lists together, never a partial one.
+        private readonly HashSet<string> _pendingAddedIds = new HashSet<string>();
+        private readonly HashSet<string> _pendingModifiedIds = new HashSet<string>();
+        // Deletions: e.GetDeletedElementIds() still yields numeric ids even though they no longer
+        // resolve to an Element/UniqueId (the element is gone) — collected separately since there is
+        // no doc.GetElement() cost to gate them behind (no UniqueId to resolve), only the same
+        // "never send a misleadingly-partial list" cap.
+        private readonly HashSet<long> _pendingDeletedIds = new HashSet<long>();
+        // Revit's own name(s) for the operation(s) in this window ("Move Walls", "Change Type",
+        // "Delete") — accumulated across the whole debounce window like the id sets, deduped, in
+        // first-seen order (a List, not a HashSet, so that order survives).
+        private readonly List<string> _pendingTransactionNames = new List<string>();
+        private string? _pendingLastChangedBy;
         private bool _pendingIdsOverflowed;
 
         private readonly string _endpoint;
@@ -85,25 +101,48 @@ namespace Loam.Revit.Connector.RevitBridge
         /// <summary>
         /// Record a DocumentChanged and emit at most one "changed" POST per window:
         /// leading-edge send when idle, plus a trailing send for continuous edits.
-        /// <paramref name="changedIds"/> (optional) — the UniqueIds this transaction touched (added or
-        /// modified elements only; a deleted element has no UniqueId left to report). Unioned into the
-        /// pending set across the whole debounce window.
+        /// <paramref name="addedIds"/>/<paramref name="modifiedIds"/> (optional) — the UniqueIds this
+        /// transaction added/modified, kept SEPARATE (Revit already hands the two apart via
+        /// GetAddedElementIds()/GetModifiedElementIds()) as well as unioned into the existing
+        /// changedElementIds field for back-compat with older orchestrator builds.
+        /// <paramref name="deletedElementIds"/> (optional) — numeric ElementIds this transaction
+        /// deleted (no UniqueId survives a deletion, so these ride separately, never merged into the
+        /// UniqueId sets above). <paramref name="transactionNames"/> (optional) — Revit's own name(s)
+        /// for the operation(s) in this window. <paramref name="lastChangedBy"/> (optional) — who
+        /// touched a representative element in this window, on a workshared model only. All are
+        /// accumulated across the WHOLE debounce window, not just the latest transaction.
         /// </summary>
-        public void SendChanged(ModelFacts facts, IEnumerable<string>? changedIds = null)
+        public void SendChanged(
+            ModelFacts facts,
+            IEnumerable<string>? addedIds = null,
+            IEnumerable<string>? modifiedIds = null,
+            IEnumerable<long>? deletedElementIds = null,
+            IEnumerable<string>? transactionNames = null,
+            string? lastChangedBy = null)
         {
             lock (_gate)
             {
                 _pending = facts;
                 _hasPending = true;
-                if (changedIds is not null)
-                {
-                    foreach (var id in changedIds)
+
+                AddCappedLocked(addedIds, _pendingAddedIds);
+                AddCappedLocked(modifiedIds, _pendingModifiedIds);
+
+                if (deletedElementIds is not null)
+                    foreach (var id in deletedElementIds)
                     {
-                        if (string.IsNullOrEmpty(id)) continue;
-                        if (_pendingChangedIds.Count >= MaxChangedIds) { _pendingIdsOverflowed = true; break; }
-                        _pendingChangedIds.Add(id);
+                        if (_pendingDeletedIds.Count >= MaxChangedIds) { _pendingIdsOverflowed = true; break; }
+                        _pendingDeletedIds.Add(id);
                     }
-                }
+
+                if (transactionNames is not null)
+                    foreach (var tn in transactionNames)
+                        if (!string.IsNullOrEmpty(tn) && !_pendingTransactionNames.Contains(tn))
+                            _pendingTransactionNames.Add(tn);
+
+                // Last write wins for the window — good enough for "who's been editing", and avoids
+                // carrying a list of names for what is, in practice, almost always one person's session.
+                if (!string.IsNullOrEmpty(lastChangedBy)) _pendingLastChangedBy = lastChangedBy;
 
                 var elapsed = DateTime.UtcNow - _lastChangedSentUtc;
                 if (elapsed >= ChangedWindow)
@@ -115,6 +154,23 @@ namespace Loam.Revit.Connector.RevitBridge
                     var due = ChangedWindow - elapsed;
                     _changedTimer = new Timer(_ => OnChangedTimer(), null, due, Timeout.InfiniteTimeSpan);
                 }
+            }
+        }
+
+        /// <summary>Adds <paramref name="ids"/> into BOTH <paramref name="set"/> (the specific
+        /// added/modified list) and the existing union set <see cref="_pendingChangedIds"/> (the
+        /// back-compat changedElementIds field), gated by the union's own count so added, modified,
+        /// and changedElementIds all overflow together — never a partial pair. Caller holds
+        /// <see cref="_gate"/>.</summary>
+        private void AddCappedLocked(IEnumerable<string>? ids, HashSet<string> set)
+        {
+            if (ids is null) return;
+            foreach (var id in ids)
+            {
+                if (string.IsNullOrEmpty(id)) continue;
+                if (_pendingChangedIds.Count >= MaxChangedIds) { _pendingIdsOverflowed = true; break; }
+                set.Add(id);
+                _pendingChangedIds.Add(id);
             }
         }
 
@@ -155,14 +211,36 @@ namespace Loam.Revit.Connector.RevitBridge
             _hasPending = false;
             var facts = _pending;
             // Overflowed (a huge transaction) -> send NO ids, never a silently-truncated partial list; Loam
-            // then falls back to its own bounded full sweep, exactly today's behaviour.
-            var ids = (!_pendingIdsOverflowed && _pendingChangedIds.Count > 0) ? new List<string>(_pendingChangedIds) : null;
+            // then falls back to its own bounded full sweep, exactly today's behaviour. transactionNames/
+            // lastChangedBy aren't id lists, so they still ride along even on an overflowed window — they
+            // describe the OPERATION, not the touched-element set, and cost nothing extra downstream.
+            var overflowed = _pendingIdsOverflowed;
+            var ids            = (!overflowed && _pendingChangedIds.Count   > 0) ? new List<string>(_pendingChangedIds)   : null;
+            var addedIds       = (!overflowed && _pendingAddedIds.Count     > 0) ? new List<string>(_pendingAddedIds)     : null;
+            var modifiedIds    = (!overflowed && _pendingModifiedIds.Count  > 0) ? new List<string>(_pendingModifiedIds)  : null;
+            var deletedIds     = (!overflowed && _pendingDeletedIds.Count   > 0) ? new List<long>(_pendingDeletedIds)     : null;
+            var transactionNames = _pendingTransactionNames.Count > 0 ? new List<string>(_pendingTransactionNames) : null;
+            var lastChangedBy  = _pendingLastChangedBy;
+
             _pendingChangedIds.Clear();
+            _pendingAddedIds.Clear();
+            _pendingModifiedIds.Clear();
+            _pendingDeletedIds.Clear();
+            _pendingTransactionNames.Clear();
+            _pendingLastChangedBy = null;
             _pendingIdsOverflowed = false;
-            Post("changed", facts, null, ids);
+
+            Post("changed", facts, null, ids, addedIds, modifiedIds, deletedIds, transactionNames, lastChangedBy);
         }
 
-        private void Post(string kind, ModelFacts facts, string? cause, IReadOnlyList<string>? changedIds = null)
+        private void Post(
+            string kind, ModelFacts facts, string? cause,
+            IReadOnlyList<string>? changedIds = null,
+            IReadOnlyList<string>? addedIds = null,
+            IReadOnlyList<string>? modifiedIds = null,
+            IReadOnlyList<long>? deletedIds = null,
+            IReadOnlyList<string>? transactionNames = null,
+            string? lastChangedBy = null)
         {
             _ = Task.Run(async () =>
             {
@@ -196,6 +274,41 @@ namespace Loam.Revit.Connector.RevitBridge
                         foreach (var id in changedIds) arr.Add(id);
                         body["changedElementIds"] = arr;
                     }
+                    // Added-vs-modified, split (additive alongside the merged changedElementIds above,
+                    // which stays for older orchestrator builds keyed off it) — Revit already hands
+                    // these apart via GetAddedElementIds()/GetModifiedElementIds(); App.cs no longer
+                    // merges them before they get here.
+                    if (addedIds is { Count: > 0 })
+                    {
+                        var arr = new JsonArray();
+                        foreach (var id in addedIds) arr.Add(id);
+                        body["addedElementIds"] = arr;
+                    }
+                    if (modifiedIds is { Count: > 0 })
+                    {
+                        var arr = new JsonArray();
+                        foreach (var id in modifiedIds) arr.Add(id);
+                        body["modifiedElementIds"] = arr;
+                    }
+                    // Deletions: numeric ids only (no UniqueId survives a deletion) — Loam's ingest
+                    // already has a consumer for this exact shape waiting.
+                    if (deletedIds is { Count: > 0 })
+                    {
+                        var arr = new JsonArray();
+                        foreach (var id in deletedIds) arr.Add(id);
+                        body["deletedIds"] = arr;
+                    }
+                    // Revit's own name(s) for the operation(s) in this window ("Move Walls",
+                    // "Change Type", "Delete") — literally why the change happened.
+                    if (transactionNames is { Count: > 0 })
+                    {
+                        var arr = new JsonArray();
+                        foreach (var tn in transactionNames) arr.Add(tn);
+                        body["transactionNames"] = arr;
+                    }
+                    // Who touched it — workshared models only; omitted (never fabricated) on a
+                    // non-workshared document, same "omit, don't guess" rule as ModelInstanceId.
+                    if (!string.IsNullOrEmpty(lastChangedBy)) body["lastChangedBy"] = lastChangedBy;
 
                     using var req = new HttpRequestMessage(HttpMethod.Post, _endpoint)
                     {
