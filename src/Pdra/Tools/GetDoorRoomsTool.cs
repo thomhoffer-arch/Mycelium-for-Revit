@@ -98,6 +98,10 @@ namespace PDRA.Services.Ai.Tools.Queries
                     ["mark"]      = fi.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)?.AsString(),
                     ["host_id"]   = fi.Host?.Id.Value,
                 };
+                // type_id alongside the type_name already here — B1 consistency pass: every
+                // element-returning tool now carries the same type_id/type_name pair (see
+                // ElementContextReader.ResolveType), not just get_element_by_uniqueid/ifcguid.
+                if (typeId != ElementId.InvalidElementId) row["type_id"] = typeId.Value;
                 // CONTRACT.md documents unique_id + ifc_guid on this row; neither was ever set — a caller
                 // joining a door back onto the connective spine got nothing to key on.
                 var ifcGuid = fi.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();

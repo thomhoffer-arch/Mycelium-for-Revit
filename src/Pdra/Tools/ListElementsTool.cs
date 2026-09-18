@@ -27,7 +27,13 @@ namespace PDRA.Services.Ai.Tools.Queries
             "to scope to one category; omit it to walk the whole document (bounded by limit — no category " +
             "means no natural sort, results come in document order). Each row carries unique_id (primary join " +
             "key), id, category (display name), category_id (BuiltInCategory enum name, when the category is " +
-            "a built-in one — feed this back as the category arg), name, ifc_guid (when present), " +
+            "a built-in one — feed this back as the category arg), name, type_id, type_name (the element's " +
+            "own type, when it has a distinct one), mark (ALL_MODEL_MARK — the human-facing tag, e.g. \"D-104\", " +
+            "on drawings and in emails), design_option (id/name/is_primary — omitted when the element lives in " +
+            "the main model), from_link (always present — this tool only walks the host document, so it is " +
+            "always false here; see get_element_by_uniqueid for elements resolved inside a link), room " +
+            "(id/name/number/level_name — the room enclosing the element's location, geometrically resolved; " +
+            "omitted when unresolvable), ifc_guid (when present), " +
             "model_instance_id (when resolvable — the document-instance guard: unique_id/ifc_guid are " +
             "unique only WITHIN one document, so elements from two different reads only prove the same " +
             "real element when model_instance_id also matches), " +
@@ -62,6 +68,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             // this is computed once and reused — see ModelFacts.ModelInstanceId's own comment for why
             // a caller needs this to safely join unique_id/ifc_guid across calls.
             var modelInstanceId = ModelFacts.From(doc).ModelInstanceId;
+            var defaultPhase = ElementContextReader.DefaultPhase(doc, ctx.UiApp.ActiveUIDocument);
 
             var limit  = args.GetLimit(def: 200, max: 2000);
             var fields = args.GetFields();
@@ -106,6 +113,24 @@ namespace PDRA.Services.Ai.Tools.Queries
                 };
 
                 if (CategoryResolver.CategoryId(el.Category) is { } catId) row["category_id"] = catId;
+
+                var (typeId, typeName) = ElementContextReader.ResolveType(el);
+                if (typeId is not null) row["type_id"] = typeId.Value;
+                if (typeName is not null) row["type_name"] = typeName;
+
+                if (ElementContextReader.ResolveMark(el) is { Length: > 0 } mark) row["mark"] = mark;
+
+                // This tool only ever walks the host document (no link traversal, unlike
+                // get_element_by_uniqueid) — always false here, not omitted, matching
+                // filter_elements_by_scope_box's own convention of reporting from_link as a fact,
+                // never guessing it away.
+                row["from_link"] = false;
+
+                var designOption = ElementContextReader.ResolveDesignOption(el);
+                if (designOption is not null) row["design_option"] = designOption;
+
+                var room = ElementContextReader.ResolveRoom(el, defaultPhase);
+                if (room is not null) row["room"] = room;
 
                 var ifcGuid = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
                 if (!string.IsNullOrEmpty(ifcGuid)) row["ifc_guid"] = ifcGuid;
