@@ -42,8 +42,13 @@ namespace PDRA.Services.Ai.Tools.Queries
             "value/unit/display) under their own row[\"params\"][name] key — never merged into classification{} " +
             "— use pdra_get_element_parameters first to discover what a given element actually carries. " +
             "Supports limit, fields, view_id (scope a category query to one " +
-            "view), and classification_params. The response also carries classification_sources — see that " +
-            "arg's description for what it tells you.";
+            "view), and classification_params. Pass offset on EVERY call once paging through a large " +
+            "result (0 for the first page) for a stable ElementId-ascending page boundary across calls " +
+            "— omitting offset entirely uses the original fast, unordered document-order walk for a " +
+            "one-shot enumeration; the two orderings do not compose, so don't mix an offset-less call " +
+            "with an offset call for the same walk. next_offset (present when truncated and offset was " +
+            "passed) is the offset to pass for the following page. The response also carries " +
+            "classification_sources — see that arg's description for what it tells you.";
 
         public Reversibility Reversibility => Reversibility.Reversible;
         public Verifiability Verifiability => Verifiability.Auto;
@@ -56,6 +61,15 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["category"] = new JsonObject { ["type"] = "string", ["description"] = "Category to scope to — the BuiltInCategory enum name (e.g. OST_Walls, OST_Doors) or the document's display name (e.g. Walls), enum name tried first. Omit to enumerate the whole document." },
                 ["view_id"]  = new JsonObject { ["type"] = "integer", ["description"] = "Limit a category query to elements visible in this view." },
                 ["limit"]    = JsonHelpers.LimitSchemaProp(def: 200, max: 2000),
+                ["offset"]   = new JsonObject
+                {
+                    ["type"]        = "integer",
+                    ["description"] = "Skip this many elements before returning limit rows. Pass it (0 for " +
+                                       "the first page) on EVERY call once paging, for a stable ElementId-" +
+                                       "ascending ordering across calls; omitting it entirely uses the " +
+                                       "original fast, unordered document-order walk — the two orderings " +
+                                       "don't compose. Use the response's next_offset for the following page.",
+                },
                 ["fields"]   = JsonHelpers.FieldsSchemaProp(),
                 ["params"]   = new JsonObject
                 {
@@ -89,6 +103,11 @@ namespace PDRA.Services.Ai.Tools.Queries
             var clsParams = args.GetStringArray("classification_params");
             var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
+            // B4 — PAGING: offset is opt-in (see the tool's own inputSchema/description for why an
+            // offset-less call keeps the original fast path instead of always sorting).
+            var hasOffset = args.TryGetInt("offset", out var offsetRaw);
+            var offset = hasOffset ? Math.Max(0, offsetRaw) : 0;
+
             View? scopeView = null;
             if (args.TryGetLong("view_id", out var vid)) scopeView = doc.GetElement(new ElementId(vid)) as View;
 
@@ -110,10 +129,27 @@ namespace PDRA.Services.Ai.Tools.Queries
                 query = new FilteredElementCollector(doc).WhereElementIsNotElementType().Cast<Element>();
             }
 
-            // Fetch one extra to detect truncation without a separate (expensive) full count.
-            var page = query.Take(limit + 1).ToList();
-            var truncated = page.Count > limit;
-            if (truncated) page.RemoveAt(page.Count - 1);
+            List<Element> page;
+            bool truncated;
+            if (hasOffset)
+            {
+                // Paging path: materialize + sort by ElementId ascending for a stable, reproducible
+                // page boundary across calls — FilteredElementCollector's own enumeration order is
+                // otherwise unspecified (the tool's description already tells callers not to mix this
+                // with an offset-less call). Costs a full walk of `query` up front instead of the lazy
+                // Take() below; accepted only when the caller actually asked for offset paging.
+                var ordered = query.OrderBy(e => e.Id.Value).ToList();
+                page = ordered.Skip(offset).Take(limit + 1).ToList();
+                truncated = page.Count > limit;
+                if (truncated) page.RemoveAt(page.Count - 1);
+            }
+            else
+            {
+                // Fetch one extra to detect truncation without a separate (expensive) full count.
+                page = query.Take(limit + 1).ToList();
+                truncated = page.Count > limit;
+                if (truncated) page.RemoveAt(page.Count - 1);
+            }
 
             var rows = new JsonArray();
             foreach (var el in page)
@@ -180,6 +216,11 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["elements"]              = rows,
                 ["classification_sources"] = clsEnvelope.Build(),
             };
+            if (hasOffset)
+            {
+                result["offset"] = offset;
+                if (truncated) result["next_offset"] = offset + rows.Count;
+            }
             if (!string.IsNullOrEmpty(modelInstanceId)) result["model_instance_id"] = modelInstanceId;
             return ToolResult.Ok(JsonHelpers.Serialize(result));
         }
