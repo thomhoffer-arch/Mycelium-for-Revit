@@ -6,6 +6,20 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 > It does **not** build spine records, run a provenance ledger, or carry triage/compliance logic —
 > **Mycelium Studio** does all of that. Every item below keeps the connector a thin translator.
 
+## Status — done (v0.3)
+
+- [x] **Spatial-attribute pass (Workstream B, v0.3):** `type_id`/`mark`/`design_option`/`from_link`/`room`
+      promoted onto `list_elements` (and `type_id`/`mark`/`room` onto `filter_elements_by_scope_box`) from
+      the sibling tools that already proved them reachable; a generic `params[]` request arg plus the new
+      `get_element_parameters` discovery tool for any parameter, typed with unit metadata instead of a bare
+      display string; `offset`/`next_offset` paging on `list_elements` with a stable ElementId-ascending
+      order; the `DocumentChanged` push now splits added/modified, and sends deletions, transaction
+      name(s), and who last changed it (workshared models only). See `docs/CONTRACT.md`'s changelog for the
+      full field-by-field list, and this document's own "Fixed" section below for the doc-reconciliation
+      pass that came with it (six field-name drifts between this document and the actual code). The plan's
+      full lean-IFC-shaped spatial tree (relations/quantities beyond a single `room` attachment) is a
+      larger, separate effort, deliberately out of scope for this pass.
+
 ## Status — done (v0.2)
 
 - [x] `get_model_revision`
@@ -43,6 +57,19 @@ A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools 
 
 ## Fixed
 
+- [x] **`docs/CONTRACT.md` had drifted from the code in six places, plus an env-var name drift in
+      `README.md`** — a sibling repo's plan doc (Loam PR #669) found this document showed `get_rooms`
+      returning flat `level_name`/`area_sqft`/`area_display` (the code has always nested `level{}` and
+      used `area_sf`/`area_user_units`), `get_levels` showing `elevation`/`elevation_display` (code:
+      `elevation_ft`/`elevation_user_units`), `get_links` showing `is_loaded` (code: `loaded`), `get_sheets`
+      documenting a numeric `id` and a `name` field neither ever emitted (the real fields are
+      `unique_id`/`sheet_number`/`sheet_name`), and `get_door_rooms`' `door_params` values shown as an
+      unquoted number when `ElementContextReader.ReadParamValue` has always returned a string. Separately,
+      `README.md`'s Transport table (and this document's own Transport section) documented
+      `MYCELIUM_REVIT_LISTEN`/`MYCELIUM_REVIT_URL`/`MYCELIUM_REVIT_TOKEN`, while `src/App.cs` has always
+      read `LOAM_REVIT_LISTEN`/`LOAM_REVIT_TOKEN` — so setting the documented env vars silently left bearer
+      auth off. All six fixed directly in `docs/CONTRACT.md` (now v0.3) and `README.md`; no code changed
+      for this item — the code was already correct, the document was wrong.
 - [x] **`unique_id`/`ifc_guid` carried no document-instance guard — a copied/Save-As/split RVT could
       produce a false "same project" merge downstream** — an external analysis (Loam) found two
       genuinely different projects (numbered 2033 and 2322) whose Revit UniqueIds and IFC GUIDs
