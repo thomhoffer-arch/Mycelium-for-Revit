@@ -1,4 +1,5 @@
 using Autodesk.Revit.DB;
+using Autodesk.Revit.DB.Architecture;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -100,6 +101,99 @@ namespace PDRA.Services.Ai.Tools.Queries
             return cls;
         }
 
+        /// <summary>Element's type_id/type_name pair — the same GetTypeId()+doc.GetElement() lookup
+        /// already duplicated across get_element_by_uniqueid, get_element_by_ifcguid and
+        /// get_door_rooms, centralized so list_elements and filter_elements_by_scope_box can carry
+        /// it too without a fourth copy. Returns (null, null) when the element has no distinct type
+        /// (GetTypeId() invalid) — omit, don't blank.</summary>
+        public static (long? TypeId, string? TypeName) ResolveType(Element el)
+        {
+            var typeId = el.GetTypeId();
+            if (typeId == ElementId.InvalidElementId) return (null, null);
+            var typeElem = el.Document.GetElement(typeId);
+            return (typeId.Value, typeElem?.Name);
+        }
+
+        /// <summary>The ALL_MODEL_MARK built-in parameter — the human-facing tag ("D-104") that
+        /// appears on drawings and in emails, already read this way in GetDoorRoomsTool. Null when
+        /// unset (omit, don't blank).</summary>
+        public static string? ResolveMark(Element el) =>
+            el.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)?.AsString();
+
+        /// <summary>The element's design option as {id, name, is_primary}, or null when it lives in
+        /// the main model (no design option) — was FilterElementsByScopeBoxTool-private; moved here
+        /// so any element-returning tool can attach the same field instead of a second copy.</summary>
+        public static JsonObject? ResolveDesignOption(Element el)
+        {
+            DesignOption? opt;
+            try { opt = el.DesignOption; } catch { return null; }
+            if (opt is null) return null;
+            bool isPrimary = false;
+            try { isPrimary = opt.IsPrimary; } catch { }
+            return new JsonObject
+            {
+                ["id"]         = opt.Id.Value,
+                ["name"]       = opt.Name,
+                ["is_primary"] = isPrimary,
+            };
+        }
+
+        /// <summary>Resolves the room enclosing an element's location point (or bbox-centroid
+        /// fallback for a curve-based/no-location element) via Document.GetRoomAtPoint — the same
+        /// geometric fallback GetDoorRoomsTool already uses for doors when From/To Room isn't set.
+        /// Doors additionally have get_FromRoom/get_ToRoom (two rooms, door-specific semantics) —
+        /// GetDoorRoomsTool keeps that logic itself; this is the general single-room case any OTHER
+        /// element-returning tool (list_elements, filter_elements_by_scope_box) can use for "which
+        /// room is this element in". Returns null when unresolvable (no phase, no enclosing room, or
+        /// the API throws) — omit, don't blank.</summary>
+        public static JsonObject? ResolveRoom(Element el, Phase? phase)
+        {
+            if (phase is null) return null;
+            var doc = el.Document;
+
+            var pt = (el.Location as LocationPoint)?.Point;
+            if (pt is null)
+            {
+                BoundingBoxXYZ? bb;
+                try { bb = el.get_BoundingBox(null); } catch { bb = null; }
+                if (bb is null) return null;
+                pt = (bb.Min + bb.Max).Multiply(0.5);
+            }
+
+            Room? room;
+            try { room = doc.GetRoomAtPoint(pt, phase) as Room; } catch { return null; }
+            if (room is null) return null;
+
+            return new JsonObject
+            {
+                ["id"]         = room.Id.Value,
+                ["name"]       = room.Name,
+                ["number"]     = room.Number,
+                ["level_name"] = (doc.GetElement(room.LevelId) as Level)?.Name,
+            };
+        }
+
+        /// <summary>Best-effort default Phase for room resolution when the caller has none of its
+        /// own — the active view's phase, else the document's last phase, else null. Mirrors
+        /// GetDoorRoomsTool.ResolvePhase's own default-selection fallback so a second caller doesn't
+        /// duplicate that logic to get "a reasonable phase".</summary>
+        public static Phase? DefaultPhase(Document doc, Autodesk.Revit.UI.UIDocument? uidoc)
+        {
+            try
+            {
+                var vp = uidoc?.ActiveView?.get_Parameter(BuiltInParameter.VIEW_PHASE)?.AsElementId();
+                if (vp is { } id && id != ElementId.InvalidElementId && doc.GetElement(id) is Phase vph) return vph;
+            }
+            catch { }
+            try
+            {
+                var phases = doc.Phases;
+                return phases.Size > 0 ? phases.get_Item(phases.Size - 1) : null;
+            }
+            catch { }
+            return null;
+        }
+
         /// <summary>Reads a named parameter's display value off an element — <see
         /// cref="Parameter.AsValueString"/> first (honours the parameter's own units/
         /// formatting), falling back to a StorageType-appropriate raw read. Shared by
@@ -126,6 +220,84 @@ namespace PDRA.Services.Ai.Tools.Queries
                 StorageType.ElementId => p.AsElementId().Value.ToString(),
                 _                     => null,
             };
+        }
+
+        /// <summary>Reads a named parameter into a typed, machine-usable shape instead of a bare
+        /// <see cref="Parameter.AsValueString"/> string nothing downstream can safely parse (e.g.
+        /// "3.2 m" — is that meters, is it even a number). Returns null when the element carries no
+        /// such parameter (omit, don't blank). See <see cref="ReadParamTyped(Parameter)"/> for the
+        /// shape.</summary>
+        public static JsonObject? ReadParamTyped(Element? el, string name)
+        {
+            var p = el?.LookupParameter(name);
+            return p is null ? null : ReadParamTyped(p);
+        }
+
+        /// <summary>Same read as <see cref="ReadParamTyped(Element?, string)"/>, for a <see
+        /// cref="Parameter"/> already in hand (avoids a second by-name lookup — used by
+        /// pdra_get_element_parameters while it walks Element.Parameters). Shape: storage_type
+        /// (String/Integer/Double/ElementId/None), has_value, value (StorageType-typed — a real
+        /// number for Double/Integer, the raw ElementId for ElementId, never a formatted string for
+        /// those), unit (present only for Double storage with a recognised unit — Revit's own
+        /// INTERNAL unit, e.g. feet for length, radians for angle, unconverted from AsDouble() — so a
+        /// caller converts deterministically instead of parsing AsValueString's locale-formatted
+        /// text), and display (AsValueString(), the human formatting, when non-empty).</summary>
+        public static JsonObject ReadParamTyped(Parameter p)
+        {
+            var node = new JsonObject
+            {
+                ["storage_type"] = p.StorageType.ToString(),
+                ["has_value"]    = p.HasValue,
+            };
+
+            switch (p.StorageType)
+            {
+                case StorageType.String:
+                    node["value"] = p.AsString();
+                    break;
+                case StorageType.Integer:
+                    node["value"] = p.AsInteger();
+                    break;
+                case StorageType.Double:
+                    node["value"] = p.AsDouble();
+                    var unit = InternalUnitLabel(p);
+                    if (unit is not null) node["unit"] = unit;
+                    break;
+                case StorageType.ElementId:
+                    var id = p.AsElementId();
+                    node["value"] = id != ElementId.InvalidElementId ? id.Value : null;
+                    break;
+                default:
+                    node["value"] = null;
+                    break;
+            }
+
+            var display = p.AsValueString();
+            if (!string.IsNullOrEmpty(display)) node["display"] = display;
+
+            return node;
+        }
+
+        /// <summary>Best-effort Revit-internal-unit label for a Double-storage parameter's raw
+        /// AsDouble() value, via the unit-aware GetUnitTypeId() API (Revit 2021+ — present on both
+        /// this connector's targets, net48/Revit 2024 and net8.0-windows/Revit 2025-26). Only the
+        /// common specs are named (Revit's own documented internal units: feet for length, radians
+        /// for angle, …); anything else — or any throw (a unitless Double parameter has no spec at
+        /// all) — returns null rather than guessing.</summary>
+        private static string? InternalUnitLabel(Parameter p)
+        {
+            try
+            {
+                var specId = p.GetUnitTypeId();
+                if (specId is null || specId.Empty()) return null;
+                if (specId == SpecTypeId.Length) return "ft";
+                if (specId == SpecTypeId.Area) return "ft2";
+                if (specId == SpecTypeId.Volume) return "ft3";
+                if (specId == SpecTypeId.Angle) return "rad";
+                if (specId == SpecTypeId.HvacTemperature) return "F";
+                return null;
+            }
+            catch { return null; }
         }
 
         private static BuiltInParameter[] ResolveBips(params string[] names)

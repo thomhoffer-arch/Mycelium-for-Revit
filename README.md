@@ -38,8 +38,12 @@ PDRA tool names (`pdra_get_model_revision` etc.) are also accepted; the server a
 
 | env var | default |
 |---|---|
-| `MYCELIUM_REVIT_LISTEN` | `http://127.0.0.1:47100/mcp` |
-| `MYCELIUM_REVIT_TOKEN`  | _unset = no auth_ |
+| `LOAM_REVIT_LISTEN` | `http://127.0.0.1:47100/mcp` |
+| `LOAM_REVIT_TOKEN`  | _unset = no auth_ |
+
+(`src/App.cs` reads `LOAM_REVIT_LISTEN`/`LOAM_REVIT_TOKEN` — this table previously named
+`MYCELIUM_REVIT_LISTEN`/`MYCELIUM_REVIT_TOKEN`, which the code never read, so setting the documented
+vars silently left bearer auth off. See `docs/CONTRACT.md`'s changelog.)
 
 If multiple Revit instances are open, only the first one serves MCP requests — subsequent instances load silently (port already owned).
 

@@ -124,11 +124,11 @@ namespace Loam.Revit.Connector
             // ENERGY EFFICIENCY (live request: "Loam should always only ask for new/changed things") —
             // hand Loam the ACTUAL touched UniqueIds for THIS transaction, not just "something changed",
             // so it can resolve only those elements (pdra_get_element_by_uniqueid) instead of re-walking
-            // the whole model on its next read. Added + Modified only: a DELETED element's ElementId no
-            // longer resolves to anything (the element is gone), so there is no UniqueId left to report —
-            // Loam's next full sweep naturally drops a deleted element from its index anyway (this is the
-            // SAME lag today's design already has for deletes, not a regression). Best-effort: a failure
-            // enumerating ids must never block or throw out of a Revit document-changed callback.
+            // the whole model on its next read. Added and Modified are kept SEPARATE (see B3 below) —
+            // a DELETED element's ElementId no longer resolves to anything (the element is gone), so
+            // there is no UniqueId left to report for it; its numeric id is sent on its own instead (see
+            // deletedIds below). Best-effort: a failure enumerating ids must never block or throw out of
+            // a Revit document-changed callback.
             //
             // REGRESSION FIX (live report: "even Revit file opening was slow and impossible" with this
             // connector installed + Loam pulse running): opening a document fires DocumentChanged ONCE
@@ -140,20 +140,73 @@ namespace Loam.Revit.Connector
             // be sent — Loam falls back to its own bounded full sweep, same as any other unresolvable case.
             var added = e.GetAddedElementIds();
             var modified = e.GetModifiedElementIds();
-            var changedIds = new List<string>();
+            var deleted = e.GetDeletedElementIds();
+
+            var addedIds = new List<string>();
+            var modifiedIds = new List<string>();
             if (added.Count + modified.Count <= MaxChangedIdsToResolve)
             {
                 try
                 {
                     foreach (var id in added)
-                    { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                    { var el = doc.GetElement(id); if (el is not null) addedIds.Add(el.UniqueId); }
                     foreach (var id in modified)
-                    { var el = doc.GetElement(id); if (el is not null) changedIds.Add(el.UniqueId); }
+                    { var el = doc.GetElement(id); if (el is not null) modifiedIds.Add(el.UniqueId); }
                 }
                 catch { /* enumeration failure — fall back to "something changed", no ids */ }
             }
 
-            _events?.SendChanged(facts, changedIds);
+            // B3 — DELETIONS: e.GetDeletedElementIds() still yields numeric ids even though they no
+            // longer resolve to an Element/UniqueId (the element is gone) — no doc.GetElement() call
+            // needed, so this isn't gated by MaxChangedIdsToResolve the way added/modified are. Loam's
+            // ingest already has a consumer for this shape (deletedIds) waiting.
+            List<long> deletedIds = new List<long>();
+            foreach (var id in deleted) deletedIds.Add(id.Value);
+
+            // B3 — TRANSACTION NAME(S): Revit's own name for the operation ("Move Walls", "Change
+            // Type", "Delete") — literally why the change happened, computed by Revit already and,
+            // until now, never sent. Best-effort: must never throw out of this callback.
+            List<string> transactionNames = new List<string>();
+            try
+            {
+                var names = e.GetTransactionNames();
+                if (names is not null) foreach (var n in names) transactionNames.Add(n);
+            }
+            catch { /* unavailable on this Revit version/event shape — omit, don't guess */ }
+
+            // B3 — WHO CHANGED IT: WorksharingUtils.GetWorksharingTooltipInfo is a per-ELEMENT call and
+            // throws on a non-workshared document, so this reads exactly ONE representative touched
+            // element (the first added, else first modified) rather than one API call per element in
+            // the transaction — a single transaction's added/modified elements are, in practice, all
+            // just touched by the same user in the same edit, so one read is enough without doubling
+            // the per-element cost the id-resolution loop above already pays. Degrades to omitting the
+            // field on a non-workshared model or any failure — never fabricated.
+            string? lastChangedBy = null;
+            try
+            {
+                if (doc.IsWorkshared)
+                {
+                    var sample = ElementId.InvalidElementId;
+                    foreach (var id in added) { sample = id; break; }
+                    if (sample == ElementId.InvalidElementId)
+                        foreach (var id in modified) { sample = id; break; }
+
+                    if (sample != ElementId.InvalidElementId)
+                    {
+                        var info = WorksharingUtils.GetWorksharingTooltipInfo(doc, sample);
+                        if (!string.IsNullOrEmpty(info?.LastChangedBy)) lastChangedBy = info.LastChangedBy;
+                    }
+                }
+            }
+            catch { /* non-workshared, or this element carries no worksharing info — omit, don't guess */ }
+
+            _events?.SendChanged(
+                facts,
+                addedIds.Count > 0 ? addedIds : null,
+                modifiedIds.Count > 0 ? modifiedIds : null,
+                deletedIds.Count > 0 ? deletedIds : null,
+                transactionNames.Count > 0 ? transactionNames : null,
+                lastChangedBy);
         }
 
         private void Emit(string kind, Document doc, string? cause = null)

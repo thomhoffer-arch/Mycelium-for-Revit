@@ -21,11 +21,16 @@ namespace PDRA.Services.Ai.Tools.Queries
             "Test which elements fall inside a scope box — the zone-membership primitive (e.g. 'Zone B = " +
             "everything in scope box X'). Identify the box by scope_box_id or scope_box_name. mode: 'centroid' " +
             "(default — location/centroid inside the box) or 'intersects' (element bbox overlaps the box). The " +
-            "box's own rotation is respected. Each row carries {id, name, category, in_box, " +
+            "box's own rotation is respected. Each row carries {id, name, category, in_box, type_id, " +
+            "type_name, mark (ALL_MODEL_MARK — the human-facing tag, e.g. 'D-104'), " +
             "design_option{name,is_primary} (omitted when none), level (omitted when unresolvable), " +
+            "room{id,name,number,level_name} (the room enclosing the element's location, geometrically " +
+            "resolved — omitted when unresolvable), " +
             "classification (omitted when unpopulated), from_link, project} so a zone resolver filters on " +
             "real data (primary-option / arch-levels / project), plus a summary {count_in, count_out}; set " +
-            "inside_only=true to return only the members. The response also carries model_instance_id " +
+            "inside_only=true to return only the members. Pass params[] to also read named parameters, typed, " +
+            "under their own row[\"params\"][name] key — see pdra_get_element_parameters to discover names. " +
+            "The response also carries model_instance_id " +
             "(when resolvable) — the document-instance guard: unique_id/ifc_guid are unique only WITHIN " +
             "one document, so elements from two different reads only prove the same real element when " +
             "model_instance_id also matches. Accepts classification_params; the response " +
@@ -47,6 +52,14 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["mode"]           = new JsonObject { ["type"] = "string", ["description"] = "'centroid' (default) or 'intersects'." },
                 ["inside_only"]    = new JsonObject { ["type"] = "boolean", ["description"] = "Return only elements inside the box. Default false (all, each with in_box)." },
                 ["limit"]          = new JsonObject { ["type"] = "integer", ["description"] = "Max elements to test. Default 1000." },
+                ["params"]         = new JsonObject
+                {
+                    ["type"]        = "array",
+                    ["items"]       = new JsonObject { ["type"] = "string" },
+                    ["description"] = "Extra parameter names to read per element, typed (storage_type/value/unit/" +
+                                       "display — see pdra_get_element_parameters) under their own row[\"params\"]" +
+                                       "[name] key, never merged into classification{}.",
+                },
                 ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
@@ -97,6 +110,8 @@ namespace PDRA.Services.Ai.Tools.Queries
             var elements = ResolveElements(uidoc, doc, args, out var targErr);
             if (targErr is not null) return ToolResult.Error(targErr);
 
+            var defaultPhase = ElementContextReader.DefaultPhase(doc, uidoc);
+            var paramNames = args.GetStringArray("params");
             var clsParams = args.GetStringArray("classification_params");
             var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
@@ -131,21 +146,41 @@ namespace PDRA.Services.Ai.Tools.Queries
                 var modelInstanceId = ModelInstanceIdFor(el.Document);
                 if (!string.IsNullOrEmpty(modelInstanceId)) row["model_instance_id"] = modelInstanceId;
 
+                var (typeId, typeName) = ElementContextReader.ResolveType(el);
+                if (typeId is not null) row["type_id"] = typeId.Value;
+                if (typeName is not null) row["type_name"] = typeName;
+                if (ElementContextReader.ResolveMark(el) is { Length: > 0 } mark) row["mark"] = mark;
+
                 // Provenance / scoping fields so a zone resolver filters on real model
                 // data (primary-option / arch-levels / project) instead of heuristics.
                 // design_option and level are omitted (not blanked) when unresolvable —
                 // previously assigned unconditionally, which serialized as an explicit
                 // "level": null / "design_option": null against the connector's own
                 // omit-never-blank rule (SpineKeys.cs).
-                var designOption = DesignOptionNode(el);
+                var designOption = ElementContextReader.ResolveDesignOption(el);
                 if (designOption is not null) row["design_option"] = designOption;
                 var level = ElementContextReader.ResolveLevel(el);
                 if (level is not null) row["level"] = level;
+                var room = ElementContextReader.ResolveRoom(el, defaultPhase);
+                if (room is not null) row["room"] = room;
                 var cls = ElementContextReader.ResolveClassification(el, clsParams);
                 clsEnvelope.Record(cls);
                 if (cls is not null) row["classification"] = cls;
                 row["from_link"] = el.Document.IsLinked;
                 row["project"]   = el.Document.Title;
+
+                if (paramNames is not null)
+                {
+                    JsonObject? pobj = null;
+                    foreach (var pn in paramNames)
+                    {
+                        var v = ElementContextReader.ReadParamTyped(el, pn);
+                        if (v is null) continue;
+                        pobj ??= new JsonObject();
+                        pobj[pn] = v;
+                    }
+                    if (pobj is not null) row["params"] = pobj;
+                }
 
                 rows.Add(row);
             }
@@ -165,24 +200,6 @@ namespace PDRA.Services.Ai.Tools.Queries
             var hostModelInstanceId = ModelInstanceIdFor(doc);
             if (!string.IsNullOrEmpty(hostModelInstanceId)) result["model_instance_id"] = hostModelInstanceId;
             return ToolResult.Ok(JsonHelpers.Serialize(result));
-        }
-
-        /// <summary>The element's design option as {id, name, is_primary}, or null when it
-        /// lives in the main model — lets the caller keep only main-model + primary-option
-        /// elements without guessing from names.</summary>
-        private static JsonNode? DesignOptionNode(Element el)
-        {
-            DesignOption? opt;
-            try { opt = el.DesignOption; } catch { return null; }
-            if (opt is null) return null;
-            bool isPrimary = false;
-            try { isPrimary = opt.IsPrimary; } catch { }
-            return new JsonObject
-            {
-                ["id"]         = opt.Id.Value,
-                ["name"]       = opt.Name,
-                ["is_primary"] = isPrimary,
-            };
         }
 
         private static XYZ ToLocal(XYZ p, Transform? inv) => inv is not null ? inv.OfPoint(p) : p;
