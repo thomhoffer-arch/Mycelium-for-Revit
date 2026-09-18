@@ -54,6 +54,7 @@ namespace Loam.Revit.Connector.Mcp
                 new GetElementByIfcGuidTool(),
                 new GetDoorRoomsTool(),
                 new GetClassificationSourcesTool(),
+                new GetElementParametersTool(),
                 new GetSheetsTool(),
                 new GetLevelsTool(),
                 new GetRoomsTool(),

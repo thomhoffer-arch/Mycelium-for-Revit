@@ -222,6 +222,84 @@ namespace PDRA.Services.Ai.Tools.Queries
             };
         }
 
+        /// <summary>Reads a named parameter into a typed, machine-usable shape instead of a bare
+        /// <see cref="Parameter.AsValueString"/> string nothing downstream can safely parse (e.g.
+        /// "3.2 m" — is that meters, is it even a number). Returns null when the element carries no
+        /// such parameter (omit, don't blank). See <see cref="ReadParamTyped(Parameter)"/> for the
+        /// shape.</summary>
+        public static JsonObject? ReadParamTyped(Element? el, string name)
+        {
+            var p = el?.LookupParameter(name);
+            return p is null ? null : ReadParamTyped(p);
+        }
+
+        /// <summary>Same read as <see cref="ReadParamTyped(Element?, string)"/>, for a <see
+        /// cref="Parameter"/> already in hand (avoids a second by-name lookup — used by
+        /// pdra_get_element_parameters while it walks Element.Parameters). Shape: storage_type
+        /// (String/Integer/Double/ElementId/None), has_value, value (StorageType-typed — a real
+        /// number for Double/Integer, the raw ElementId for ElementId, never a formatted string for
+        /// those), unit (present only for Double storage with a recognised unit — Revit's own
+        /// INTERNAL unit, e.g. feet for length, radians for angle, unconverted from AsDouble() — so a
+        /// caller converts deterministically instead of parsing AsValueString's locale-formatted
+        /// text), and display (AsValueString(), the human formatting, when non-empty).</summary>
+        public static JsonObject ReadParamTyped(Parameter p)
+        {
+            var node = new JsonObject
+            {
+                ["storage_type"] = p.StorageType.ToString(),
+                ["has_value"]    = p.HasValue,
+            };
+
+            switch (p.StorageType)
+            {
+                case StorageType.String:
+                    node["value"] = p.AsString();
+                    break;
+                case StorageType.Integer:
+                    node["value"] = p.AsInteger();
+                    break;
+                case StorageType.Double:
+                    node["value"] = p.AsDouble();
+                    var unit = InternalUnitLabel(p);
+                    if (unit is not null) node["unit"] = unit;
+                    break;
+                case StorageType.ElementId:
+                    var id = p.AsElementId();
+                    node["value"] = id != ElementId.InvalidElementId ? id.Value : null;
+                    break;
+                default:
+                    node["value"] = null;
+                    break;
+            }
+
+            var display = p.AsValueString();
+            if (!string.IsNullOrEmpty(display)) node["display"] = display;
+
+            return node;
+        }
+
+        /// <summary>Best-effort Revit-internal-unit label for a Double-storage parameter's raw
+        /// AsDouble() value, via the unit-aware GetUnitTypeId() API (Revit 2021+ — present on both
+        /// this connector's targets, net48/Revit 2024 and net8.0-windows/Revit 2025-26). Only the
+        /// common specs are named (Revit's own documented internal units: feet for length, radians
+        /// for angle, …); anything else — or any throw (a unitless Double parameter has no spec at
+        /// all) — returns null rather than guessing.</summary>
+        private static string? InternalUnitLabel(Parameter p)
+        {
+            try
+            {
+                var specId = p.GetUnitTypeId();
+                if (specId is null || specId.Empty()) return null;
+                if (specId == SpecTypeId.Length) return "ft";
+                if (specId == SpecTypeId.Area) return "ft2";
+                if (specId == SpecTypeId.Volume) return "ft3";
+                if (specId == SpecTypeId.Angle) return "rad";
+                if (specId == SpecTypeId.HvacTemperature) return "F";
+                return null;
+            }
+            catch { return null; }
+        }
+
         private static BuiltInParameter[] ResolveBips(params string[] names)
             => names.Select(n => Enum.TryParse<BuiltInParameter>(n, out var b) ? b : BuiltInParameter.INVALID)
                     .Where(b => b != BuiltInParameter.INVALID).ToArray();

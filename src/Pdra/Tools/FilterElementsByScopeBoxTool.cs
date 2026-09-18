@@ -28,7 +28,9 @@ namespace PDRA.Services.Ai.Tools.Queries
             "resolved — omitted when unresolvable), " +
             "classification (omitted when unpopulated), from_link, project} so a zone resolver filters on " +
             "real data (primary-option / arch-levels / project), plus a summary {count_in, count_out}; set " +
-            "inside_only=true to return only the members. The response also carries model_instance_id " +
+            "inside_only=true to return only the members. Pass params[] to also read named parameters, typed, " +
+            "under their own row[\"params\"][name] key — see pdra_get_element_parameters to discover names. " +
+            "The response also carries model_instance_id " +
             "(when resolvable) — the document-instance guard: unique_id/ifc_guid are unique only WITHIN " +
             "one document, so elements from two different reads only prove the same real element when " +
             "model_instance_id also matches. Accepts classification_params; the response " +
@@ -50,6 +52,14 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["mode"]           = new JsonObject { ["type"] = "string", ["description"] = "'centroid' (default) or 'intersects'." },
                 ["inside_only"]    = new JsonObject { ["type"] = "boolean", ["description"] = "Return only elements inside the box. Default false (all, each with in_box)." },
                 ["limit"]          = new JsonObject { ["type"] = "integer", ["description"] = "Max elements to test. Default 1000." },
+                ["params"]         = new JsonObject
+                {
+                    ["type"]        = "array",
+                    ["items"]       = new JsonObject { ["type"] = "string" },
+                    ["description"] = "Extra parameter names to read per element, typed (storage_type/value/unit/" +
+                                       "display — see pdra_get_element_parameters) under their own row[\"params\"]" +
+                                       "[name] key, never merged into classification{}.",
+                },
                 ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
@@ -101,6 +111,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             if (targErr is not null) return ToolResult.Error(targErr);
 
             var defaultPhase = ElementContextReader.DefaultPhase(doc, uidoc);
+            var paramNames = args.GetStringArray("params");
             var clsParams = args.GetStringArray("classification_params");
             var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
@@ -157,6 +168,19 @@ namespace PDRA.Services.Ai.Tools.Queries
                 if (cls is not null) row["classification"] = cls;
                 row["from_link"] = el.Document.IsLinked;
                 row["project"]   = el.Document.Title;
+
+                if (paramNames is not null)
+                {
+                    JsonObject? pobj = null;
+                    foreach (var pn in paramNames)
+                    {
+                        var v = ElementContextReader.ReadParamTyped(el, pn);
+                        if (v is null) continue;
+                        pobj ??= new JsonObject();
+                        pobj[pn] = v;
+                    }
+                    if (pobj is not null) row["params"] = pobj;
+                }
 
                 rows.Add(row);
             }

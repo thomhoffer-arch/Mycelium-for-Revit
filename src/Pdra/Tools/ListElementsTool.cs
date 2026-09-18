@@ -38,7 +38,10 @@ namespace PDRA.Services.Ai.Tools.Queries
             "unique only WITHIN one document, so elements from two different reads only prove the same " +
             "real element when model_instance_id also matches), " +
             "level (when resolvable), and classification (assembly/OmniClass codes, plus classification_params " +
-            "when passed, when populated). Supports limit, fields, view_id (scope a category query to one " +
+            "when passed, when populated). Pass params[] to also read named parameters, typed (storage_type/" +
+            "value/unit/display) under their own row[\"params\"][name] key — never merged into classification{} " +
+            "— use pdra_get_element_parameters first to discover what a given element actually carries. " +
+            "Supports limit, fields, view_id (scope a category query to one " +
             "view), and classification_params. The response also carries classification_sources — see that " +
             "arg's description for what it tells you.";
 
@@ -54,6 +57,16 @@ namespace PDRA.Services.Ai.Tools.Queries
                 ["view_id"]  = new JsonObject { ["type"] = "integer", ["description"] = "Limit a category query to elements visible in this view." },
                 ["limit"]    = JsonHelpers.LimitSchemaProp(def: 200, max: 2000),
                 ["fields"]   = JsonHelpers.FieldsSchemaProp(),
+                ["params"]   = new JsonObject
+                {
+                    ["type"]        = "array",
+                    ["items"]       = new JsonObject { ["type"] = "string" },
+                    ["description"] = "Extra parameter names to read per element, typed (storage_type/value/unit/" +
+                                       "display — see pdra_get_element_parameters) under their own row[\"params\"]" +
+                                       "[name] key, never merged into classification{}. unit is the parameter's " +
+                                       "Revit-internal unit (feet for length, radians for angle, …) when it has " +
+                                       "one; display is the human AsValueString() formatting.",
+                },
                 ["classification_params"] = JsonHelpers.ClassificationParamsSchemaProp(),
             },
             ["additionalProperties"] = false,
@@ -72,6 +85,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             var limit  = args.GetLimit(def: 200, max: 2000);
             var fields = args.GetFields();
+            var paramNames = args.GetStringArray("params");
             var clsParams = args.GetStringArray("classification_params");
             var clsEnvelope = ElementContextReader.NewClassificationEnvelope(clsParams);
 
@@ -142,6 +156,19 @@ namespace PDRA.Services.Ai.Tools.Queries
                 var cls = ElementContextReader.ResolveClassification(el, clsParams);
                 clsEnvelope.Record(cls);
                 if (cls is not null) row["classification"] = cls;
+
+                if (paramNames is not null)
+                {
+                    JsonObject? pobj = null;
+                    foreach (var pn in paramNames)
+                    {
+                        var v = ElementContextReader.ReadParamTyped(el, pn);
+                        if (v is null) continue;
+                        pobj ??= new JsonObject();
+                        pobj[pn] = v;
+                    }
+                    if (pobj is not null) row["params"] = pobj;
+                }
 
                 rows.Add(JsonHelpers.Project(row, fields));
             }
