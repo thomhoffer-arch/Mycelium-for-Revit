@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The append-only model-log writer, as its own Revit-free class library — the handoff plan's
+    own instruction ("put the record-building code — units conversion, hashing, parameter ids,
+    JSON shape — in a plain class library with unit tests"): everything here is plain data and
+    file I/O, testable without a live Revit session. src/ModelLogCapture/ (which DOES touch the
+    Revit API) turns Revit objects into the JsonObject field-groups this library hashes, writes
+    and rotates.
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net48;net8.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Loam.Revit.Connector.ModelLog</RootNamespace>
+    <AssemblyName>Loam.Revit.Connector.ModelLog</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- System.Text.Json is in-box on net8.0, packaged for net48. -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />
+  </ItemGroup>
+</Project>

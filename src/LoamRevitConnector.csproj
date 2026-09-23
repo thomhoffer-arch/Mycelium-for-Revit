@@ -11,6 +11,22 @@
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
+  <!--
+    ModelLog/ is its own Revit-free class library (src/ModelLog/ModelLog.csproj) so it can be
+    unit-tested without the Revit API — see tests/ModelLog.Tests/. Its directory sits inside
+    this project's own folder, so the SDK's default `**/*.cs` glob would otherwise compile its
+    files into BOTH projects; exclude it here and reference the library instead.
+    ModelLogCapture/ (Revit-dependent — turns live Revit objects into ModelLog's record shapes)
+    stays part of THIS project and needs no such exclusion.
+  -->
+  <ItemGroup>
+    <Compile Remove="ModelLog/**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="ModelLog/ModelLog.csproj" />
+  </ItemGroup>
+
   <ItemGroup>
     <!-- System.Text.Json is in-box on net8.0, packaged for net48. -->
     <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />

@@ -1,10 +1,47 @@
 # Mycelium Studio — Revit Connector Roadmap
 
-A Revit **model source** for Mycelium Studio. Exposes Revit data over MCP tools that satisfy the Revit model-source contract (`docs/CONTRACT.md`). It is interchangeable with PDRA — two implementations, one contract.
+A Revit **model source** for Mycelium Studio. Writes the model as an append-only change log
+(`docs/MODEL_LOG.md` — the current plan and primary spec) and serves a small on-demand/acting MCP
+tool set alongside it. The connector's original per-tool MCP read interface, below, is now
+**frozen** — see docs/MODEL_LOG.md and the "Model log rewrite" section just below.
 
-> **Role boundary (never crosses this line).** The connector exposes *raw Revit data via MCP tools*.
-> It does **not** build spine records, run a provenance ledger, or carry triage/compliance logic —
-> **Mycelium Studio** does all of that. Every item below keeps the connector a thin translator.
+> **Role boundary (never crosses this line).** The connector exposes *raw Revit data* (the log,
+> plus on-demand detail). It does **not** build spine records, run a provenance ledger, or carry
+> triage/compliance logic — **Mycelium Studio** does all of that.
+
+## Model log rewrite (in progress) — see docs/MODEL_LOG.md
+
+Stop answering read requests; write the model as an append-only, checkpointed JSON Lines change
+log instead. Loam reads the log; nobody calls anyone.
+
+- [x] **1. Security fix** — settings file (`src/RevitBridge/ConnectorSettings.cs`), auto-generated
+      token, server refuses to start without one. Replaces the `LOAM_REVIT_*`/`MYCELIUM_REVIT_*`
+      env-var mismatch that silently ran with no bearer auth.
+- [x] **2. Log writer** — `src/ModelLog/`: format, segments, gzip on rotate, `state.json`, writer
+      lock, crash safety. Its own Revit-free class library, unit-tested (`tests/ModelLog.Tests/`,
+      CI via `.github/workflows/modellog-tests.yml`).
+- [x] **3. Definitions + snapshot on open**, in ≤50ms idle slices (`ModelLogService.SnapshotJob`,
+      `IdleSliceRunner`).
+- [x] **4. Change capture** — `DocumentChanged` queue → idle processing, partial states, `chg`
+      records (`ModelLogService.ChangeCaptureJob`).
+- [x] **5. Reconcile** on open and after sync/reload — self-healing, catches other users' changes
+      (`ModelLogService.ReconcileJob`).
+- [x] **6. Full richness** — handles, grid refs, relations, materials with quantities, sheets,
+      revisions, all parameters (`ModelLogCapture/RecordBuilder.cs`). **Unverified** — several
+      heuristics (per-category quantity parameters, the grid-intersection label) are marked
+      `NEEDS LIVE-REVIT CHECK` in that file; no Revit available in the sandbox that wrote this.
+- [x] **7. Tools** — `get_element_detail`, `find_elements`, `show_element`, `isolate_elements`,
+      `open_sheet`; the read tools below are now frozen (kept for compatibility, no new capability,
+      removed once the log is in active use).
+
+**Not done — needs an actual Revit session (tracked, not forgotten):**
+- [ ] Record two real fixture logs (one workshared, one with MEP) and check them in as test data.
+- [ ] The six-item live-Revit verification checklist in docs/MODEL_LOG.md's "Order, verification
+      and done" section (idle-slice timing, lossless round-trip, gap/crash recovery, actual size
+      vs. the estimate table, `DocumentChanged`-after-sync behavior, the quantity/grid heuristics).
+- [ ] `dotnet build` of `LoamRevitConnector.csproj` for both `net48`/`net8.0-windows` — not run
+      locally (no .NET SDK in the sandbox that wrote this); only `tests/ModelLog.Tests/` (Revit-free)
+      has been build/test-verified, via CI.
 
 ## Status — done (v0.3)
 

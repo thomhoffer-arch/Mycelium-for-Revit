@@ -1,0 +1,32 @@
+name: Build
+
+# Compile-only verification of the Revit-dependent add-in project, on every push/PR — unlike
+# release.yml (windows-latest, but gated on a version tag), this is what actually catches a
+# broken Revit API reference (a renamed/nonexistent BuiltInParameter, event args member, etc.)
+# before it reaches main. Needs windows-latest (net8.0-windows) but NOT a real Revit install:
+# the csproj's default (non-RevitApiDir) path pulls the Revit API as NuGet packages
+# (Nice3point.Revit.Api.RevitAPI/RevitAPIUI, compile-time only) for exactly this reason.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore src/LoamRevitConnector.csproj
+
+      - name: Build Revit 2024 (net48)
+        run: dotnet build src/LoamRevitConnector.csproj -c Release -f net48 --no-restore
+
+      - name: Build Revit 2025-2026 (net8.0-windows)
+        run: dotnet build src/LoamRevitConnector.csproj -c Release -f net8.0-windows --no-restore
