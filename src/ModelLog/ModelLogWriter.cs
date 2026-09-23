@@ -238,9 +238,14 @@ namespace Loam.Revit.Connector.ModelLog
             return stale;
         }
 
-        public void WriteDelete(string uniqueId, long elementId)
+        /// <summary><paramref name="elementId"/> is omitted (never a fabricated 0) when the
+        /// caller doesn't have it any more — a reconcile detects a deletion purely from the
+        /// UniqueId disappearing from a fresh walk, with no numeric id available at all.</summary>
+        public void WriteDelete(string uniqueId, long? elementId = null)
         {
-            Append(RecordKinds.Del, new JsonObject { ["id"] = uniqueId, ["eid"] = elementId });
+            var fields = new JsonObject { ["id"] = uniqueId };
+            if (elementId is not null) fields["eid"] = elementId.Value;
+            Append(RecordKinds.Del, fields);
             _state.Cache.Remove(RecordKinds.El, uniqueId);
         }
 

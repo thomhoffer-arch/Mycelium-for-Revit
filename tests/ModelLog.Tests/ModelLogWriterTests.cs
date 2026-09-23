@@ -1,5 +1,6 @@
 using Loam.Revit.Connector.ModelLog;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
@@ -108,6 +109,43 @@ namespace ModelLog.Tests
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
             var unset = parsed["unset"]!.AsArray().Select(n => n!.GetValue<string>()).ToList();
             Assert.Contains("h", unset);
+        }
+
+        [Fact]
+        public void WriteDelete_WithoutElementId_OmitsEidField()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(20.997, 10.006, "W-12"));
+            w.WriteDelete("guid-1");
+
+            var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.Equal("del", parsed["k"]!.GetValue<string>());
+            Assert.Equal("guid-1", parsed["id"]!.GetValue<string>());
+            Assert.False(parsed.ContainsKey("eid"));
+        }
+
+        [Fact]
+        public void WriteDelete_WithElementId_IncludesEidField()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteDelete("guid-2", 303793);
+
+            var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.Equal(303793, parsed["eid"]!.GetValue<long>());
+        }
+
+        [Fact]
+        public void KnownElementIdsNotIn_ReportsMissingElement()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(20.997, 10.006, "W-12"));
+            w.WriteIfChanged(RecordKinds.El, "guid-2", El(5, 5, "W-13"));
+
+            var stale = w.KnownElementIdsNotIn(new HashSet<string> { "guid-1" });
+
+            Assert.Equal(new[] { "guid-2" }, stale);
         }
 
         [Fact]

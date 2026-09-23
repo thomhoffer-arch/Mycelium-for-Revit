@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Events;
 using Autodesk.Revit.ApplicationServices;
 using Autodesk.Revit.UI;
 using Loam.Revit.Connector.Mcp;
+using Loam.Revit.Connector.ModelLogCapture;
 using Loam.Revit.Connector.RevitBridge;
 
 namespace Loam.Revit.Connector
@@ -14,18 +16,41 @@ namespace Loam.Revit.Connector
         private McpServer _server;
         private RevitContext _ctx;
         private LoamEventClient _events;
+        private ModelLogService _modelLog;
         private ControlledApplication _ctrl;
 
         public Result OnStartup(UIControlledApplication application)
         {
             _ctx = new RevitContext(application);
 
-            var listen = Environment.GetEnvironmentVariable("LOAM_REVIT_LISTEN")
-                         ?? "http://127.0.0.1:47100/mcp";
-            var token  = Environment.GetEnvironmentVariable("LOAM_REVIT_TOKEN");
+            // SECURITY (the handoff plan's "fix first" item): listen URL/token/log-root come
+            // from the add-in's own settings file, never an environment variable — README.md
+            // used to document MYCELIUM_REVIT_LISTEN/_TOKEN while this file read
+            // LOAM_REVIT_LISTEN/_TOKEN, so following the README silently ran the MCP server with
+            // NO bearer auth. A missing settings file gets a fresh auto-generated token on first
+            // run; a settings file that explicitly carries a blank token is refused outright —
+            // see ConnectorSettings' own doc comment.
+            var settings = ConnectorSettings.LoadOrCreate(ConnectorSettings.DefaultPath());
+            if (settings.ExplicitlyNoAuth)
+            {
+                TaskDialog.Show(
+                    "Mycelium Studio Revit Connector",
+                    "The connector's settings file has no bearer token, so the MCP server was NOT " +
+                    "started (it never runs unauthenticated). Delete the token line from " +
+                    ConnectorSettings.DefaultPath() + " to have one generated automatically, or set " +
+                    "a token there yourself.");
+            }
+            else
+            {
+                _server = new McpServer(settings.Listen, settings.Token, _ctx);
+                _server.Start();
+            }
 
-            _server = new McpServer(listen, token, _ctx);
-            _server.Start();
+            var modelLogRoot = string.IsNullOrEmpty(settings.ModelLogRoot)
+                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Loam", "RevitConnector", "model-logs")
+                : settings.ModelLogRoot!;
+            _modelLog = new ModelLogService(modelLogRoot, "0.4.0");
 
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();
@@ -33,6 +58,7 @@ namespace Loam.Revit.Connector
             _ctrl.DocumentOpened                  += OnDocumentOpened;
             _ctrl.DocumentSaved                   += OnDocumentSaved;
             _ctrl.DocumentSynchronizedWithCentral += OnDocumentSynced;
+            _ctrl.DocumentReloadedLatest           += OnDocumentReloadedLatest;
             _ctrl.DocumentChanged                 += OnDocumentChanged;
             _ctrl.DocumentClosing                 += OnDocumentClosing;
             application.Idling                    += OnIdling;
@@ -47,6 +73,7 @@ namespace Loam.Revit.Connector
                 _ctrl.DocumentOpened                  -= OnDocumentOpened;
                 _ctrl.DocumentSaved                   -= OnDocumentSaved;
                 _ctrl.DocumentSynchronizedWithCentral -= OnDocumentSynced;
+                _ctrl.DocumentReloadedLatest           -= OnDocumentReloadedLatest;
                 _ctrl.DocumentChanged                 -= OnDocumentChanged;
                 _ctrl.DocumentClosing                 -= OnDocumentClosing;
             }
@@ -76,6 +103,12 @@ namespace Loam.Revit.Connector
         {
             _pendingOpenDoc = e.Document;
             _pendingOpenSignal = true;
+
+            // Snapshot-or-reconcile is queued right away (not deferred to the idle tick like the
+            // Loam "opened" push below) — it's ALL idle-time-sliced work internally anyway (see
+            // ModelLogService/IdleSliceRunner), so it starts settling in on the very next Idling
+            // tick rather than waiting for one extra tick first.
+            try { _modelLog?.OnDocumentOpened(e.Document); } catch { /* best-effort — never block open */ }
         }
 
         private void OnIdling(object sender, Autodesk.Revit.UI.Events.IdlingEventArgs e)
@@ -90,6 +123,8 @@ namespace Loam.Revit.Connector
             // BOTH WAYS (live request): idle is also the moment to flush any pending "changed" batch whose
             // debounce window has already elapsed — see LoamEventClient.TryFlushIfIdle for the full reasoning.
             _events?.TryFlushIfIdle();
+
+            try { _modelLog?.OnIdling(); } catch { /* best-effort — never throw out of Idling */ }
         }
 
         // A Ctrl+S and a Sync to Central both fire "saved" downstream — older orchestrator
@@ -100,10 +135,31 @@ namespace Loam.Revit.Connector
             => Emit("saved", e.Document, "save");
 
         private void OnDocumentSynced(object sender, DocumentSynchronizedWithCentralEventArgs e)
-            => Emit("saved", e.Document, "sync");
+        {
+            Emit("saved", e.Document, "sync");
+            // A sync picks up OTHER users' changes, which DocumentChanged on this session never
+            // reported — the model-log's reconcile pass is what catches those (docs/MODEL_LOG.md's
+            // "When the connector writes" table).
+            try { _modelLog?.OnDocumentSyncedOrReloaded(e.Document); } catch { }
+        }
+
+        // NEEDS LIVE-REVIT / COMPILE CHECK: DocumentReloadedLatestEventArgs.GetDocument() — this
+        // event's shape wasn't exercisable in this sandbox (no Revit, no local .NET SDK). If a
+        // future Revit API version renamed or removed this member, this handler is the first
+        // place a build would fail; see the handoff's own "DocumentChanged after sync/reload"
+        // verification item.
+        private void OnDocumentReloadedLatest(object sender, DocumentReloadedLatestEventArgs e)
+        {
+            var doc = e.GetDocument();
+            if (doc is null) return;
+            try { _modelLog?.OnDocumentSyncedOrReloaded(doc); } catch { }
+        }
 
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)
-            => Emit("closed", e.Document);
+        {
+            Emit("closed", e.Document);
+            try { _modelLog?.OnDocumentClosing(e.Document); } catch { /* best-effort — never block close */ }
+        }
 
         // Mirrors LoamEventClient.MaxChangedIds — past this, a batch lookup isn't worth it anyway, so
         // there is no point paying the per-id doc.GetElement() cost below just to have it discarded
@@ -207,6 +263,14 @@ namespace Loam.Revit.Connector
                 deletedIds.Count > 0 ? deletedIds : null,
                 transactionNames.Count > 0 ? transactionNames : null,
                 lastChangedBy);
+
+            // Model-log capture: NEVER touches a Parameter or builds a record here — only the
+            // raw ids/names are recorded; idle time drains them (the handoff's "never block the
+            // user" rule). Reuses the SAME added/modified/deleted/transactionNames/lastChangedBy
+            // this method already computed for the Loam push above, so there is exactly one
+            // enumeration of e.GetAddedElementIds() etc., not two.
+            try { _modelLog?.OnDocumentChanged(doc, added, modified, deletedIds, transactionNames, lastChangedBy); }
+            catch { /* best-effort — must never throw out of DocumentChanged */ }
         }
 
         private void Emit(string kind, Document doc, string? cause = null)

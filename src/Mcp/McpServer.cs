@@ -43,6 +43,15 @@ namespace Loam.Revit.Connector.Mcp
             // PDRA tool names ship prefixed (e.g. "pdra_get_model_revision").
             // Loam dials the unprefixed contract names — expose both, keyed by
             // contract name with the PDRA name as an alias.
+            //
+            // FROZEN (the model-log handoff plan): the tools below this comment answer read
+            // requests the way this connector always has. The plan's direction is to stop
+            // reading the model this way — Loam reads the append-only log instead (see
+            // docs/MODEL_LOG.md) — and to serve only two remaining jobs over MCP: on-demand
+            // heavy detail the log leaves out, and acting on Revit while the user watches (the
+            // five tools registered after them). "Frozen" means exactly what ROADMAP.md's plan
+            // says: add nothing new here, fix nothing beyond a genuine regression, and remove
+            // them once the log is in active use — never delete them ahead of that migration.
             _tools = new Dictionary<string, IPdraTool>(StringComparer.Ordinal);
             foreach (var t in new IPdraTool[]
             {
@@ -60,6 +69,14 @@ namespace Loam.Revit.Connector.Mcp
                 new GetRoomsTool(),
                 new GetViewsTool(),
                 new GetLinksTool(),
+
+                // On-demand detail / acting on Revit — see docs/MODEL_LOG.md's "Tools" section.
+                // Not frozen: this is the family the plan keeps.
+                new GetElementDetailTool(),
+                new FindElementsTool(),
+                new ShowElementTool(),
+                new IsolateElementsTool(),
+                new OpenSheetTool(),
             })
             {
                 _tools[t.Name] = t;                       // pdra_*

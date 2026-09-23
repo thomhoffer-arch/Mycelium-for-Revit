@@ -51,7 +51,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
         {
             public readonly HashSet<ElementId> Added = new();
             public readonly HashSet<ElementId> Modified = new();
-            public readonly List<(string UniqueId, long ElementId)> Deleted = new();
+            // Numeric ElementIds only — a deleted element's UniqueId is not resolvable any more
+            // (Element.UniqueId requires a live Element; doc.GetElement(id) is already null by
+            // the time DocumentChanged reports it). Kept for the chg record's own `deleted`
+            // count; the actual `del` records are written lazily by the next reconcile (on open
+            // or sync), which compares the hash cache's known UniqueIds against a fresh walk and
+            // needs no numeric id at all — see ModelLogWriter.KnownElementIdsNotIn.
+            public readonly List<long> Deleted = new();
             public readonly List<string> TransactionNames = new();
             public string? LastChangedBy;
 
@@ -116,7 +122,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             Document doc,
             IEnumerable<ElementId> added,
             IEnumerable<ElementId> modified,
-            IEnumerable<(string UniqueId, long ElementId)> deleted,
+            IEnumerable<long> deletedElementIds,
             IReadOnlyList<string> transactionNames,
             string? lastChangedBy)
         {
@@ -125,7 +131,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             if (!_pending.TryGetValue(doc, out var p)) _pending[doc] = p = new PendingChange();
             foreach (var id in added) p.Added.Add(id);
             foreach (var id in modified) p.Modified.Add(id);
-            p.Deleted.AddRange(deleted);
+            p.Deleted.AddRange(deletedElementIds);
             foreach (var tn in transactionNames)
                 if (!p.TransactionNames.Contains(tn)) p.TransactionNames.Add(tn);
             if (!string.IsNullOrEmpty(lastChangedBy)) p.LastChangedBy = lastChangedBy;
@@ -219,11 +225,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 yield return true;
             }
 
-            foreach (var (uid, eid) in change.Deleted)
-            {
-                writer.WriteDelete(uid, eid);
-                yield return true;
-            }
+            // Deletions themselves are NOT written here — a deleted element's UniqueId can't be
+            // resolved any more (see PendingChange.Deleted's own comment). The chg record above
+            // already carries the deleted COUNT; the next reconcile (on open or sync) writes the
+            // actual `del` records by comparing the hash cache's known ids against a fresh walk.
 
             onDone();
         }
@@ -310,10 +315,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
             {
                 foreach (var staleUid in writer.KnownElementIdsNotIn(currentIds))
                 {
-                    // The numeric ElementId no longer resolves (the element is gone) — the
-                    // handoff's del record only ever needs the UniqueId plus whatever numeric id
-                    // was last known; 0 when that wasn't tracked separately.
-                    writer.WriteDelete(staleUid, 0);
+                    // The numeric ElementId no longer resolves (the element is gone) and wasn't
+                    // tracked separately from its UniqueId — WriteDelete omits it rather than
+                    // fabricate one.
+                    writer.WriteDelete(staleUid);
                     yield return true;
                 }
             }
