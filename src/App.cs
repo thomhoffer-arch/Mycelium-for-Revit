@@ -143,16 +143,14 @@ namespace Loam.Revit.Connector
             try { _modelLog?.OnDocumentSyncedOrReloaded(e.Document); } catch { }
         }
 
-        // NEEDS LIVE-REVIT / COMPILE CHECK: DocumentReloadedLatestEventArgs.GetDocument() — this
-        // event's shape wasn't exercisable in this sandbox (no Revit, no local .NET SDK). If a
-        // future Revit API version renamed or removed this member, this handler is the first
-        // place a build would fail; see the handoff's own "DocumentChanged after sync/reload"
-        // verification item.
+        // CORRECTED by the windows-latest Build workflow's real compile check: this event args
+        // class exposes `Document` (a property, same shape as DocumentSynchronizedWithCentral-
+        // EventArgs above), not `GetDocument()` — the guess this comment used to flag turned out
+        // wrong, exactly the class of error that workflow exists to catch.
         private void OnDocumentReloadedLatest(object sender, DocumentReloadedLatestEventArgs e)
         {
-            var doc = e.GetDocument();
-            if (doc is null) return;
-            try { _modelLog?.OnDocumentSyncedOrReloaded(doc); } catch { }
+            if (e.Document is null) return;
+            try { _modelLog?.OnDocumentSyncedOrReloaded(e.Document); } catch { }
         }
 
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)

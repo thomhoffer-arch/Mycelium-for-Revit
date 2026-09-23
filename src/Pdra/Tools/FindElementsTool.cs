@@ -87,10 +87,16 @@ namespace PDRA.Services.Ai.Tools.Queries
             var doc = ctx.UiApp.ActiveUIDocument?.Document;
             if (doc is null) return ToolResult.Error("No active document.");
 
-            var hasBox = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("box", out var boxEl);
-            var hasNear = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("near", out var nearEl);
-            var hasIntersects = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("intersects", out var intersectsEl);
-            var hasParam = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("param", out var paramEl);
+            // Declared with an explicit initializer (not `out var` inline in the `&&`) — the
+            // compiler's definite-assignment analysis doesn't carry "assigned when hasBox is
+            // true" across into the unrelated `if (hasBox)` below (that narrowing only works
+            // when the pattern variable is used directly in the SAME condition), so an inline
+            // `out var` here left boxEl/nearEl/etc. "possibly unassigned" at their use sites.
+            JsonElement boxEl = default, nearEl = default, intersectsEl = default, paramEl = default;
+            var hasBox = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("box", out boxEl);
+            var hasNear = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("near", out nearEl);
+            var hasIntersects = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("intersects", out intersectsEl);
+            var hasParam = args.ValueKind == JsonValueKind.Object && args.TryGetProperty("param", out paramEl);
 
             var modeCount = (hasBox ? 1 : 0) + (hasNear ? 1 : 0) + (hasIntersects ? 1 : 0) + (hasParam ? 1 : 0);
             if (modeCount != 1)
@@ -150,7 +156,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             var outline = new Outline(min, max);
             var filter = new BoundingBoxIntersectsFilter(outline);
             var collector = category is { } bic
-                ? new FilteredElementCollector(doc).OfCategory(bic.Value)
+                ? new FilteredElementCollector(doc).OfCategory(bic)
                 : new FilteredElementCollector(doc);
             return collector.WherePasses(filter).WhereElementIsNotElementType().ToElementIds();
         }
@@ -168,7 +174,7 @@ namespace PDRA.Services.Ai.Tools.Queries
             var outline = new Outline(min, max);
             var filter = new BoundingBoxIntersectsFilter(outline);
             var collector = category is { } bic
-                ? new FilteredElementCollector(doc).OfCategory(bic.Value)
+                ? new FilteredElementCollector(doc).OfCategory(bic)
                 : new FilteredElementCollector(doc);
             return collector.WherePasses(filter).WhereElementIsNotElementType()
                 .Where(e => e.Id != refEl.Id).Select(e => e.Id);
@@ -181,7 +187,7 @@ namespace PDRA.Services.Ai.Tools.Queries
 
             var filter = new ElementIntersectsElementFilter(refEl);
             var collector = category is { } bic
-                ? new FilteredElementCollector(doc).OfCategory(bic.Value)
+                ? new FilteredElementCollector(doc).OfCategory(bic)
                 : new FilteredElementCollector(doc);
             return collector.WherePasses(filter).WhereElementIsNotElementType()
                 .Where(e => e.Id != refEl.Id).Select(e => e.Id);
