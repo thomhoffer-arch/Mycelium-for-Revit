@@ -7,12 +7,17 @@ namespace ModelLog.Tests
 {
     public class IdleSliceRunnerTests
     {
+        // IEnumerator<bool>.MoveNext()'s OWN return value (not the yielded bool payload) is what
+        // IdleSliceRunner reads as "is there more work" — same as any C# iterator, the caller
+        // can only discover "no more" by calling MoveNext() one extra time past the last real
+        // step and finding it exhausted. So these never yield a sentinel value; they just
+        // `yield return true` after each unit of work and let the for loop end normally.
         private static IEnumerator<bool> CountTo(int n, List<int> seen)
         {
             for (var i = 0; i < n; i++)
             {
                 seen.Add(i);
-                yield return i < n - 1;
+                yield return true;
             }
         }
 
@@ -21,7 +26,7 @@ namespace ModelLog.Tests
             for (var i = 0; i < steps; i++)
             {
                 Thread.Sleep(msPerStep);
-                yield return i < steps - 1;
+                yield return true;
             }
         }
 
@@ -38,7 +43,9 @@ namespace ModelLog.Tests
 
             Assert.Equal(new List<int> { 0, 1, 2, 3, 4 }, seen);
             Assert.Equal("job-1", finishedName);
-            Assert.Equal(5, finishedSteps);
+            // 5 real steps + 1 terminating MoveNext() call that discovers the enumerator is
+            // exhausted (returns false with no work done) — see the comment on CountTo above.
+            Assert.Equal(6, finishedSteps);
             Assert.False(runner.HasWork);
         }
 

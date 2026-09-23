@@ -49,7 +49,7 @@ namespace ModelLog.Tests
             w.WriteHeader(new JsonObject { ["title"] = "Test.rvt" });
 
             var lines = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl"));
-            Assert.Single(lines.Where(l => l.Contains("\"k\":\"header\"")));
+            Assert.Single(lines, l => l.Contains("\"k\":\"header\""));
         }
 
         [Fact]
