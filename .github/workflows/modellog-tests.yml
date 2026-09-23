@@ -1,0 +1,24 @@
+name: ModelLog tests
+
+# The model-log writer (src/ModelLog/) is deliberately a plain, Revit-free class library — the
+# handoff plan's own instruction: "put the record-building code in a plain class library with
+# unit tests" so it can be checked without a live Revit session. This runs on every push/PR,
+# unlike release.yml (which needs windows-latest + the Revit API packages and only runs on tags).
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Test
+        run: dotnet test tests/ModelLog.Tests/ModelLog.Tests.csproj -c Release
