@@ -55,13 +55,18 @@ namespace Loam.Revit.Connector
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();
             _ctrl = application.ControlledApplication;
-            _ctrl.DocumentOpened                  += OnDocumentOpened;
-            _ctrl.DocumentSaved                   += OnDocumentSaved;
-            _ctrl.DocumentSynchronizedWithCentral += OnDocumentSynced;
+            _ctrl.DocumentOpened                   += OnDocumentOpened;
+            _ctrl.DocumentSaving                   += OnDocumentSaving;
+            _ctrl.DocumentSaved                    += OnDocumentSaved;
+            _ctrl.DocumentSavingAs                 += OnDocumentSavingAs;
+            _ctrl.DocumentSavedAs                  += OnDocumentSavedAs;
+            _ctrl.DocumentSynchronizingWithCentral += OnDocumentSynchronizing;
+            _ctrl.DocumentSynchronizedWithCentral  += OnDocumentSynced;
+            _ctrl.DocumentReloadingLatest          += OnDocumentReloadingLatest;
             _ctrl.DocumentReloadedLatest           += OnDocumentReloadedLatest;
-            _ctrl.DocumentChanged                 += OnDocumentChanged;
-            _ctrl.DocumentClosing                 += OnDocumentClosing;
-            application.Idling                    += OnIdling;
+            _ctrl.DocumentChanged                  += OnDocumentChanged;
+            _ctrl.DocumentClosing                  += OnDocumentClosing;
+            application.Idling                     += OnIdling;
 
             return Result.Succeeded;
         }
@@ -70,12 +75,17 @@ namespace Loam.Revit.Connector
         {
             if (_ctrl is not null)
             {
-                _ctrl.DocumentOpened                  -= OnDocumentOpened;
-                _ctrl.DocumentSaved                   -= OnDocumentSaved;
-                _ctrl.DocumentSynchronizedWithCentral -= OnDocumentSynced;
+                _ctrl.DocumentOpened                   -= OnDocumentOpened;
+                _ctrl.DocumentSaving                   -= OnDocumentSaving;
+                _ctrl.DocumentSaved                    -= OnDocumentSaved;
+                _ctrl.DocumentSavingAs                 -= OnDocumentSavingAs;
+                _ctrl.DocumentSavedAs                  -= OnDocumentSavedAs;
+                _ctrl.DocumentSynchronizingWithCentral -= OnDocumentSynchronizing;
+                _ctrl.DocumentSynchronizedWithCentral  -= OnDocumentSynced;
+                _ctrl.DocumentReloadingLatest          -= OnDocumentReloadingLatest;
                 _ctrl.DocumentReloadedLatest           -= OnDocumentReloadedLatest;
-                _ctrl.DocumentChanged                 -= OnDocumentChanged;
-                _ctrl.DocumentClosing                 -= OnDocumentClosing;
+                _ctrl.DocumentChanged                  -= OnDocumentChanged;
+                _ctrl.DocumentClosing                  -= OnDocumentClosing;
             }
             application.Idling -= OnIdling;
             _events?.Dispose();
@@ -111,7 +121,17 @@ namespace Loam.Revit.Connector
             try { _modelLog?.OnDocumentOpened(e.Document); } catch { /* best-effort — never block open */ }
         }
 
+        // Point 3 of the crash fix: nothing the connector does may throw out of Idling. Note this
+        // cannot catch an AccessViolationException (.NET 8 never lets managed code catch one, and
+        // .NET Framework 4.8 doesn't by default) — the crash itself is prevented by never touching
+        // a document mid-sync and never keeping a live element iterator between ticks (see
+        // ModelLogService's _busy/_generation); this catch covers every ordinary exception.
         private void OnIdling(object sender, Autodesk.Revit.UI.Events.IdlingEventArgs e)
+        {
+            try { OnIdlingCore(e); } catch { }
+        }
+
+        private void OnIdlingCore(Autodesk.Revit.UI.Events.IdlingEventArgs e)
         {
             if (_pendingOpenSignal)
             {
@@ -150,15 +170,50 @@ namespace Loam.Revit.Connector
         // builds key off `kind` alone and must keep working — but they are very different
         // events for a workshared model, so `cause` rides along as an additive discriminator
         // ("save" | "sync") without ever changing `kind`.
+        // Pre-events pause all model-log work until the matching post-event (Idling keeps firing
+        // during Save to Central / Reload Latest / Save — the reported crash was a model walk
+        // resumed mid-sync). A sync/reload also abandons any walk in flight; a plain save only
+        // pauses, since it doesn't bring in other users' changes. Relies on Revit raising the
+        // post-event (with a failed/cancelled Status) even when the operation doesn't succeed —
+        // NEEDS LIVE-REVIT CHECK (docs/MODEL_LOG.md); if one were ever skipped, model logging
+        // stays paused (safe) until that document closes, rather than risking the crash.
+        private void OnDocumentSaving(object sender, DocumentSavingEventArgs e)
+        {
+            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: false); } catch { }
+        }
+
+        private void OnDocumentSavingAs(object sender, DocumentSavingAsEventArgs e)
+        {
+            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: false); } catch { }
+        }
+
+        private void OnDocumentSavedAs(object sender, DocumentSavedAsEventArgs e)
+        {
+            try { _modelLog?.EndDocumentBusy(e.Document); } catch { }
+        }
+
+        private void OnDocumentSynchronizing(object sender, DocumentSynchronizingWithCentralEventArgs e)
+        {
+            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: true); } catch { }
+        }
+
+        private void OnDocumentReloadingLatest(object sender, DocumentReloadingLatestEventArgs e)
+        {
+            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: true); } catch { }
+        }
+
         private void OnDocumentSaved(object sender, DocumentSavedEventArgs e)
-            => Emit("saved", e.Document, "save");
+        {
+            try { _modelLog?.EndDocumentBusy(e.Document); } catch { }
+            try { Emit("saved", e.Document, "save"); } catch { }
+        }
 
         private void OnDocumentSynced(object sender, DocumentSynchronizedWithCentralEventArgs e)
         {
-            Emit("saved", e.Document, "sync");
+            try { Emit("saved", e.Document, "sync"); } catch { }
             // A sync picks up OTHER users' changes, which DocumentChanged on this session never
             // reported — the model-log's reconcile pass is what catches those (docs/MODEL_LOG.md's
-            // "When the connector writes" table).
+            // "When the connector writes" table). Also ends the pause the pre-event started.
             try { _modelLog?.OnDocumentSyncedOrReloaded(e.Document); } catch { }
         }
 
@@ -175,7 +230,7 @@ namespace Loam.Revit.Connector
 
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)
         {
-            Emit("closed", e.Document);
+            try { Emit("closed", e.Document); } catch { }
             try { _modelLog?.OnDocumentClosing(e.Document); } catch { /* best-effort — never block close */ }
             _factsCache.Remove(e.Document);
         }

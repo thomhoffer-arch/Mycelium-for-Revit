@@ -58,7 +58,51 @@ namespace Loam.Revit.Connector.ModelLogCapture
         {
             _modelLogRoot = modelLogRoot;
             _producerVersion = producerVersion;
-            _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }));
+            _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }), onJobFailed: (_, __) => { });
+        }
+
+        // ── Sync/reload/save/close safety ──────────────────────────────────────
+        // CRASH FIX (live report: Revit closed with an AccessViolationException whose stack ran
+        // App.OnIdling → ModelLogService.OnIdling → IdleSliceRunner.RunSlice → ReconcileJob →
+        // WalkModel → FilteredElementIterator.MoveNext, during a Synchronize with Central's
+        // "Save to Central" step). Two things were wrong:
+        //  1. WalkModel kept live FilteredElementCollector iterators open across idle ticks (a
+        //     `foreach` over the collector with a `yield` inside it), so a paused walk held a
+        //     native cursor into the document while Revit rebuilt it.
+        //  2. Idling DOES fire while a sync is in progress, so the walk was resumed mid-sync.
+        // Fixed by: pausing ALL model-log work between a sync/reload/save's pre-event and its
+        // post-event (_busy); bumping a per-document generation on sync/reload/close so an
+        // in-flight walk abandons itself (a fresh reconcile is queued by the post-event); and
+        // walking element-id lists taken up front, looking each element up fresh.
+        // A nesting count, not a flag: if Revit raises DocumentSaving/Saved inside a Save to
+        // Central, the inner Saved must not end the pause while the sync is still running.
+        private readonly Dictionary<Document, int> _busy = new();
+        private readonly Dictionary<Document, int> _generation = new();
+
+        private int Generation(Document doc) => _generation.TryGetValue(doc, out var g) ? g : 0;
+        private void BumpGeneration(Document doc) => _generation[doc] = Generation(doc) + 1;
+
+        private static bool IsDocumentValid(Document doc)
+        {
+            try { return doc.IsValidObject; }
+            catch { return false; }
+        }
+
+        /// <summary>Call from a sync/reload/save PRE-event (DocumentSynchronizingWithCentral,
+        /// DocumentReloadingLatest, DocumentSaving): no model-log work runs for any document
+        /// until the matching post-event calls <see cref="EndDocumentBusy"/>. A sync/reload also
+        /// invalidates any walk already in flight for this document.</summary>
+        public void BeginDocumentBusy(Document doc, bool invalidatesWalks)
+        {
+            _busy[doc] = (_busy.TryGetValue(doc, out var n) ? n : 0) + 1;
+            if (invalidatesWalks) BumpGeneration(doc);
+        }
+
+        public void EndDocumentBusy(Document doc)
+        {
+            if (!_busy.TryGetValue(doc, out var n)) return;
+            if (n <= 1) _busy.Remove(doc);
+            else _busy[doc] = n - 1;
         }
 
         /// <summary>True while any document has a queued idle-slice job (a snapshot/reconcile
@@ -92,7 +136,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// longer monopolizes it for one long uninterrupted stretch.</summary>
         public bool ShouldRequestContinuousIdling()
         {
-            if (!HasPendingWork)
+            if (!HasPendingWork || _busy.Count > 0)
             {
                 _continuousBurst.Reset();
                 return false;
@@ -160,34 +204,72 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var versionChanged = !isFreshLog && writer.LastProducerVersion is not null
                 && writer.LastProducerVersion != _producerVersion;
 
-            writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
+            if (versionChanged) _fullStateOwed.Add(doc);
 
             if (isFreshLog)
-                _idle.Enqueue("snapshot", SnapshotJob(doc, writer));
+            {
+                // A brand-new log's first line must be its header, so the session record is
+                // written by SnapshotJob right after BeginSnapshot rather than here.
+                _snapshotOwed.Add(doc);
+                _walkOutstanding.Add(doc);
+                _idle.Enqueue("snapshot", SnapshotJob(doc, writer, Generation(doc)));
+            }
             else
             {
+                writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
                 writer.WriteGapIfNeeded("no closed checkpoint from the previous session");
-                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, forceFullState: versionChanged));
+                _walkOutstanding.Add(doc);
+                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, Generation(doc), forceFullState: versionChanged));
             }
         }
 
+        /// <summary>Call from the sync/reload POST-event. Ends the busy pause, abandons any walk
+        /// that was in flight before the sync (its element-id list predates other users' changes)
+        /// and queues a fresh reconcile that sees the post-sync model.</summary>
         public void OnDocumentSyncedOrReloaded(Document doc)
         {
+            EndDocumentBusy(doc);
+            BumpGeneration(doc);
             if (!_writers.TryGetValue(doc, out var writer)) return;
-            _idle.Enqueue("reconcile-on-sync", ReconcileJob(doc, writer));
+            _walkOutstanding.Add(doc);
+            // A first snapshot the sync interrupted is re-run as a snapshot (header, project,
+            // session, full state), not downgraded to a reconcile that would never write them.
+            if (_snapshotOwed.Contains(doc))
+                _idle.Enqueue("snapshot-after-sync", SnapshotJob(doc, writer, Generation(doc)));
+            else
+                _idle.Enqueue("reconcile-on-sync", ReconcileJob(doc, writer, Generation(doc)));
         }
 
         public void OnDocumentClosing(Document doc)
         {
+            // Any job still queued for this document abandons itself on its next step instead of
+            // touching a closed document or the disposed writer below.
+            BumpGeneration(doc);
+            _busy.Remove(doc);
             if (!_writers.TryGetValue(doc, out var writer)) return;
             var version = SafeVersionGuid(doc);
-            writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: null, closed: true);
+            // Only "complete" if the last snapshot/reconcile actually finished — closing mid-walk
+            // must not claim the log holds the whole model.
+            writer.WriteCheckpoint(complete: !_walkOutstanding.Contains(doc), modelVersion: version, elementCount: null, closed: true);
             writer.Dispose();
             _writers.Remove(doc);
             _pending.Remove(doc);
             _changeJobQueued.Remove(doc);
             _indexCache.Remove(doc);
+            _fullStateOwed.Remove(doc);
+            _snapshotOwed.Remove(doc);
+            _walkOutstanding.Remove(doc);
+            // _generation keeps its (bumped) entry: removing it would reset this document to
+            // generation 0 and make a job queued at generation 0 look current again.
         }
+
+        // An upgrade-triggered full-state reconcile that a sync interrupts must not be silently
+        // downgraded to an ordinary one by the replacement reconcile-on-sync — owed until a
+        // full-state pass actually completes.
+        private readonly HashSet<Document> _fullStateOwed = new();
+        private readonly HashSet<Document> _snapshotOwed = new();
+        // A snapshot/reconcile is queued or running and hasn't reached its checkpoint yet.
+        private readonly HashSet<Document> _walkOutstanding = new();
 
         /// <summary>Called from <c>DocumentChanged</c> — records ONLY the raw ids/names, never
         /// touches a Parameter or builds a record here (that all happens later, during idle
@@ -216,6 +298,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// <c>DocumentChanged</c> data that doesn't already have one queued.</summary>
         public void OnIdling()
         {
+            // Idling fires even while Save to Central / Reload Latest / Save is running — never
+            // touch any document then (see the crash note above _busy).
+            if (_busy.Count > 0) return;
+
             foreach (var kv in _pending)
             {
                 var doc = kv.Key;
@@ -226,7 +312,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 var change = kv.Value;
                 _pending[doc] = new PendingChange(); // fresh accumulator for what happens next
                 _changeJobQueued.Add(doc);
-                _idle.Enqueue("change-capture", ChangeCaptureJob(doc, writer, change, () => _changeJobQueued.Remove(doc)));
+                var gen = Generation(doc);
+                _idle.Enqueue("change-capture", ChangeCaptureJob(doc, writer, change,
+                    () => Generation(doc) != gen || !IsDocumentValid(doc),
+                    () => _changeJobQueued.Remove(doc)));
             }
 
             _idle.RunSlice();
@@ -234,15 +323,26 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
         // ── Jobs ─────────────────────────────────────────────────────────────────
 
-        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer)
+        /// <param name="gen">The document's generation when the job was QUEUED (not when it
+        /// first runs) — a job queued before a sync/reload/close is stale even if it hadn't
+        /// started yet.</param>
+        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer, int gen)
         {
+            bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
+            if (IsStale()) yield break;
             var facts = ModelFacts.From(doc);
             var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion);
             writer.BeginSnapshot(header);
+            writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
             writer.Append(RecordKinds.Project, RecordBuilder.BuildProject(doc));
             yield return true;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: false)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: false, IsStale)) yield return step;
+            // Interrupted by a sync/reload/close: never checkpoint a partial walk as complete.
+            // After a sync/reload the post-event has already queued this snapshot again.
+            if (IsStale()) yield break;
+            _snapshotOwed.Remove(doc);
+            _walkOutstanding.Remove(doc);
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
@@ -257,13 +357,19 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// detection (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) still always runs on a
         /// reconcile regardless of this flag — an ordinary reconcile's whole point is catching
         /// elements deleted while the connector wasn't watching.</param>
-        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, bool forceFullState = false)
+        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen, bool forceFullState = false)
         {
+            bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
+            if (IsStale()) yield break;
             var facts = ModelFacts.From(doc);
             var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion);
             writer.RotateIfNeeded(header);
+            var fullState = forceFullState || _fullStateOwed.Contains(doc);
 
-            foreach (var step in WalkModel(doc, writer, forceFullState, detectDeletions: true)) yield return step;
+            foreach (var step in WalkModel(doc, writer, fullState, detectDeletions: true, IsStale)) yield return step;
+            if (IsStale()) yield break; // see SnapshotJob
+            if (fullState) _fullStateOwed.Remove(doc);
+            _walkOutstanding.Remove(doc);
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
@@ -285,8 +391,15 @@ namespace Loam.Revit.Connector.ModelLogCapture
         }
 
         private IEnumerator<bool> ChangeCaptureJob(
-            Document doc, ModelLogWriter writer, PendingChange change, Action onDone)
+            Document doc, ModelLogWriter writer, PendingChange change, Func<bool> isStale, Action onDone)
         {
+            // onDone in a finally: an abandoned or throwing job must still clear the "queued" flag,
+            // or no later edit to this document would ever get a change-capture job again.
+            try
+            {
+            // Stale (closed, or a sync superseded it): the reconcile the sync's post-event
+            // queued covers these ids anyway.
+            if (isStale()) yield break;
             writer.Append(RecordKinds.Chg, RecordBuilder.BuildChangeHeader(
                 change.TransactionNames, change.LastChangedBy,
                 added: change.Added.Count, modified: change.Modified.Count, deleted: change.Deleted.Count));
@@ -327,6 +440,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
             foreach (var elId in change.AddedOrModified)
             {
+                if (isStale()) yield break;
                 var el = doc.GetElement(elId);
                 if (el is null) { yield return true; continue; }
 
@@ -377,8 +491,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // resolved any more (see PendingChange.Deleted's own comment). The chg record above
             // already carries the deleted COUNT; the next reconcile (on open or sync) writes the
             // actual `del` records by comparing the hash cache's known ids against a fresh walk.
-
-            onDone();
+            }
+            finally
+            {
+                onDone();
+            }
         }
 
         /// <summary>The full-model walk shared by snapshot and reconcile: definitions,
@@ -391,46 +508,70 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// BOTH — the handoff's "self-healing" property (catches edits made while the connector
         /// wasn't running, or by another user, regardless of whether DocumentChanged ever
         /// reported them) plus backfilling whatever the new version adds.</summary>
-        private IEnumerable<bool> WalkModel(Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions)
+        private IEnumerable<bool> WalkModel(
+            Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions, Func<bool> isStale)
         {
-            foreach (Category cat in doc.Settings.Categories)
+            // Every section below takes its list of ids (or, for categories, objects) in ONE step
+            // with no `yield` inside, then walks that plain list, looking each element up fresh and
+            // skipping any that no longer exist. A `foreach` over a live FilteredElementCollector
+            // with a `yield` inside it kept Revit's native element iterator open across idle ticks
+            // — the exact FilteredElementIterator.MoveNext the reported crash died in.
+            var categories = new List<Category>();
+            foreach (Category cat in doc.Settings.Categories) categories.Add(cat);
+            foreach (var cat in categories)
             {
+                if (isStale()) yield break;
                 writer.WriteIfUnseen(RecordKinds.Cat, RecordBuilder.CategoryId(cat), RecordBuilder.BuildCategory(cat));
                 yield return true;
             }
 
             var nodeIdByLevelOrSpace = new Dictionary<ElementId, string>();
-            foreach (var lvl in new FilteredElementCollector(doc).OfClass(typeof(Level)).Cast<Level>())
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Level))))
             {
-                var nid = RecordBuilder.NodeId(lvl.Id);
-                nodeIdByLevelOrSpace[lvl.Id] = nid;
-                writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildLevelNode(lvl), forceFullState);
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is Level lvl)
+                {
+                    var nid = RecordBuilder.NodeId(lvl.Id);
+                    nodeIdByLevelOrSpace[lvl.Id] = nid;
+                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildLevelNode(lvl), forceFullState);
+                }
                 yield return true;
             }
 
-            var spaces = new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Rooms).WhereElementIsNotElementType()
-                .Concat(new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType());
-            foreach (var r in spaces)
+            var spaceIds = Ids(new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Rooms).WhereElementIsNotElementType());
+            spaceIds.AddRange(Ids(new FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_MEPSpaces).WhereElementIsNotElementType()));
+            foreach (var id in spaceIds)
             {
-                ElementId? levelId = null;
-                try { levelId = r.LevelId; } catch { }
-                var nid = RecordBuilder.NodeId(r.Id);
-                nodeIdByLevelOrSpace[r.Id] = nid;
-                writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildSpaceNode(r, levelId), forceFullState);
+                if (isStale()) yield break;
+                var r = doc.GetElement(id);
+                if (r is not null)
+                {
+                    ElementId? levelId = null;
+                    try { levelId = r.LevelId; } catch { }
+                    var nid = RecordBuilder.NodeId(r.Id);
+                    nodeIdByLevelOrSpace[r.Id] = nid;
+                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildSpaceNode(r, levelId), forceFullState);
+                }
                 yield return true;
             }
 
             var gridLines = new List<(string, Line)>();
-            foreach (var g in new FilteredElementCollector(doc).OfClass(typeof(Grid)).Cast<Grid>())
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Grid))))
             {
-                writer.WriteIfChanged(RecordKinds.Grid, g.UniqueId, RecordBuilder.BuildGrid(g), forceFullState);
-                if (g.Curve is Line line) gridLines.Add((g.Name, line));
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is Grid g)
+                {
+                    writer.WriteIfChanged(RecordKinds.Grid, g.UniqueId, RecordBuilder.BuildGrid(g), forceFullState);
+                    if (g.Curve is Line line) gridLines.Add((g.Name, line));
+                }
                 yield return true;
             }
 
-            foreach (Material mat in new FilteredElementCollector(doc).OfClass(typeof(Material)))
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Material))))
             {
-                writer.WriteIfChanged(RecordKinds.Mat, RecordBuilder.MaterialId(mat.Id), RecordBuilder.BuildMaterial(mat), forceFullState);
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is Material mat)
+                    writer.WriteIfChanged(RecordKinds.Mat, RecordBuilder.MaterialId(mat.Id), RecordBuilder.BuildMaterial(mat), forceFullState);
                 yield return true;
             }
 
@@ -449,9 +590,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // actual building elements) — rooms/spaces/areas were already logged above, as
             // `node` records, not here.
             var currentIds = new HashSet<string>();
-            foreach (var el in new FilteredElementCollector(doc).WhereElementIsNotElementType())
+            foreach (var id in Ids(new FilteredElementCollector(doc).WhereElementIsNotElementType()))
             {
-                if (!RecordBuilder.IsLoggableModelElement(el)) { yield return true; continue; }
+                if (isStale()) yield break;
+                var el = doc.GetElement(id);
+                if (el is null || !RecordBuilder.IsLoggableModelElement(el)) { yield return true; continue; }
                 currentIds.Add(el.UniqueId);
 
                 var typeElId = el.GetTypeId();
@@ -471,6 +614,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             {
                 foreach (var staleUid in writer.KnownElementIdsNotIn(currentIds))
                 {
+                    if (isStale()) yield break;
                     // The numeric ElementId no longer resolves (the element is gone) and wasn't
                     // tracked separately from its UniqueId — WriteDelete omits it rather than
                     // fabricate one.
@@ -479,24 +623,37 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 }
             }
 
-            foreach (ViewSheet sheet in new FilteredElementCollector(doc).OfClass(typeof(ViewSheet)))
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(ViewSheet))))
             {
-                writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is ViewSheet sheet)
+                    writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
                 yield return true;
             }
-            foreach (Revision rev in new FilteredElementCollector(doc).OfClass(typeof(Revision)))
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Revision))))
             {
-                writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is Revision rev)
+                    writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
                 yield return true;
             }
-            foreach (RevitLinkInstance link in new FilteredElementCollector(doc).OfClass(typeof(RevitLinkInstance)))
+            foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(RevitLinkInstance))))
             {
-                ModelFacts? linkedFacts = null;
-                try { var linkDoc = link.GetLinkDocument(); if (linkDoc is not null) linkedFacts = ModelFacts.From(linkDoc); } catch { }
-                writer.WriteIfChanged(RecordKinds.Link, link.UniqueId, RecordBuilder.BuildLink(link, linkedFacts), forceFullState);
+                if (isStale()) yield break;
+                if (doc.GetElement(id) is RevitLinkInstance link)
+                {
+                    ModelFacts? linkedFacts = null;
+                    try { var linkDoc = link.GetLinkDocument(); if (linkDoc is not null) linkedFacts = ModelFacts.From(linkDoc); } catch { }
+                    writer.WriteIfChanged(RecordKinds.Link, link.UniqueId, RecordBuilder.BuildLink(link, linkedFacts), forceFullState);
+                }
                 yield return true;
             }
         }
+
+        /// <summary>Materializes a collector's matching ids into a plain list in one call, so no
+        /// native iterator outlives the current idle slice.</summary>
+        private static List<ElementId> Ids(FilteredElementCollector collector) =>
+            new List<ElementId>(collector.ToElementIds());
 
         /// <summary>Cheap, per-changed-id check (never a document walk) for whether this batch
         /// needs the tagged-sheet index rebuilt — true only when a tag or sheet itself was

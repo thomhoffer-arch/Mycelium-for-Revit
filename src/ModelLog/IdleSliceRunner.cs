@@ -26,6 +26,7 @@ namespace Loam.Revit.Connector.ModelLog
         private readonly Queue<Job> _jobs = new();
         private readonly Action<string, double, int> _onJobFinished;
         private readonly Action<string, double>? _onSliceOverBudget;
+        private readonly Action<string, Exception>? _onJobFailed;
 
         /// <param name="onJobFinished">Called once, when a job's last slice returns false —
         /// name, total milliseconds spent across all its slices, total steps run. The handoff's
@@ -36,12 +37,17 @@ namespace Loam.Revit.Connector.ModelLog
         /// "a slice that runs longer than the budget is a bug" (the same checklist). Not called
         /// for a slice that simply used its full budget and still has more work queued; that's
         /// normal — this fires only when ONE MoveNext() call itself overran.</param>
+        /// <param name="onJobFailed">Called when a job's MoveNext() throws. The job is dropped
+        /// (never retried, never rethrown) so one failing job can't take the host's idle handler
+        /// down or wedge the queue behind it.</param>
         public IdleSliceRunner(
             Action<string, double, int> onJobFinished,
-            Action<string, double>? onSliceOverBudget = null)
+            Action<string, double>? onSliceOverBudget = null,
+            Action<string, Exception>? onJobFailed = null)
         {
             _onJobFinished = onJobFinished;
             _onSliceOverBudget = onSliceOverBudget;
+            _onJobFailed = onJobFailed;
         }
 
         public bool HasWork => _jobs.Count > 0;
@@ -62,7 +68,17 @@ namespace Loam.Revit.Connector.ModelLog
             while (more && sw.Elapsed < SliceBudget)
             {
                 var stepStart = sw.Elapsed;
-                more = job.Work.MoveNext();
+                try
+                {
+                    more = job.Work.MoveNext();
+                }
+                catch (Exception ex)
+                {
+                    _jobs.Dequeue();
+                    try { job.Work.Dispose(); } catch { }
+                    try { _onJobFailed?.Invoke(job.Name, ex); } catch { }
+                    return;
+                }
                 steps++;
 
                 var stepElapsed = (sw.Elapsed - stepStart).TotalMilliseconds;

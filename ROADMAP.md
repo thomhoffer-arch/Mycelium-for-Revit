@@ -73,6 +73,14 @@ log instead. Loam reads the log; nobody calls anyone.
       what differs) while still running deletion detection, so an upgrade backfills new fields and
       cleans up dropped ones without a second snapshot or a new log file.
 
+- [x] **Round 5 — Revit crash during Save to Central** (docs/MODEL_LOG.md's "Round 5" section):
+      Windows' crash log showed an `AccessViolationException` in
+      `WalkModel → FilteredElementIterator.MoveNext`, called from `OnIdling` mid-sync. Walks now
+      take id lists up front and look each element up fresh. All model-log work pauses between
+      a sync/reload/save's pre- and post-event. Sync/reload/close abandon in-flight walks through
+      a per-document generation, and a fresh reconcile or snapshot is queued afterwards. Job
+      exceptions are caught and the job is dropped.
+
 **Not done — needs an actual Revit session (tracked, not forgotten):**
 - [ ] Verify the derived IFC GlobalId against a real IFC export (docs/MODEL_LOG.md's verification
       checklist, item 8).
