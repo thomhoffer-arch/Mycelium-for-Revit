@@ -19,4 +19,10 @@
     <!-- System.Text.Json is in-box on net8.0, packaged for net48. -->
     <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Lets the test project set ModelLogWriter.MinCompactionBytes (internal — a test-only knob,
+         not something a real caller should ever touch). -->
+    <InternalsVisibleTo Include="ModelLog.Tests" />
+  </ItemGroup>
 </Project>

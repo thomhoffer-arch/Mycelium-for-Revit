@@ -173,7 +173,8 @@ on the local machine.
 model-logs/<model id>/
   000001.jsonl      segment: header, snapshot, changes…
   000002.jsonl      next segment, starts with a header
-  state.json        hash cache + last seq + last checkpoint
+  state.json        hash cache + last seq + last checkpoint (base, rewritten only on compaction)
+  state.<gen>.jsonl changes to state.json since that base (append-only journal)
   writer.lock       held while a Revit session writes this model
 ```
 
@@ -197,8 +198,14 @@ against this table. Not done in this sandbox (no Revit available).
 **Crash safety:**
 
 1. Append one complete line, then flush. A reader ignores a torn last line.
-2. Update `state.json` only **after** the log line is flushed. If a crash lands in between, the
+2. Update the state only **after** the log line is flushed. If a crash lands in between, the
    next reconcile writes the same state again: a harmless duplicate, never a lost change.
+   **(this repo's choice)** The state is a base file plus an append-only journal. Each changed
+   hash is appended to `state.<gen>.jsonl`, flushed once per idle slice. `state.json` is only
+   rewritten (atomically, via `File.Replace`) at a checkpoint, rotation or close, and only when
+   the journal is larger than max(1 MiB, a quarter of the base). On open, `seq` and the active
+   segment are recovered from the log itself, so a state that lags the log never reuses a
+   `seq`.
 3. On startup, if the previous session left no `closed` checkpoint, write a `gap` record (from
    the last seq) and then reconcile. The gap is closed by that reconcile's checkpoint.
 4. **One writer per model:** take `writer.lock`. A second Revit session with the same model open
@@ -318,6 +325,30 @@ Found while re-checking this fix:
 - Closing the model while a snapshot or reconcile was unfinished wrote `complete: true`. It now writes `complete: false`.
 
 **Not yet verified:** checks 9 and 10 below.
+
+## Round 6: state file rewritten on every record (2026-09-24)
+
+`ModelLogWriter.Append` rewrote the whole `state.json` (the hash cache: about 26 MB for 33,600
+elements) after every record, and every edit batch wrote a `chg` record even when nothing that
+gets logged had changed. Disk writes grew with the square of the model size.
+
+Measured with `src/ModelLog` itself on synthetic elements shaped like real ones (13 field groups,
+40 parameters). Each scenario ran on a fresh copy of the same 33,600-element log:
+
+| Scenario | Before | After |
+|---|---|---|
+| Full snapshot | 1,994 s, 434,003 MB written | 6.4 s, 103 MB written |
+| Reconcile, nothing changed | 6.1 s, 51.7 MB | 4.3 s, 0.0 MB |
+| 100 edits touching nothing logged | 13.2 s, 2,583 MB | 0.6 s, 0.0 MB |
+| 100 edits changing one element each | 22.8 s, 5,166 MB | 0.7 s, 0.2 MB |
+
+Fixed at the root, not throttled. The state is now a base file plus an append-only journal (see
+crash-safety rule 2 above). A batch's `chg` record is held until the batch actually writes a
+record (`ModelLogWriter.BeginChange`/`EndChange`). `state.json` is written compactly. The timings
+above exclude Revit's own per-element work, so they isolate the connector's file I/O.
+
+**Not yet verified:** the same measurement on a copy of a real log folder, and Revit's
+responsiveness during a snapshot with this change.
 
 ## Order, verification and done
 

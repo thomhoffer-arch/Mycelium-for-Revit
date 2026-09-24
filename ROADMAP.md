@@ -81,6 +81,12 @@ log instead. Loam reads the log; nobody calls anyone.
       a per-document generation, and a fresh reconcile or snapshot is queued afterwards. Job
       exceptions are caught and the job is dropped.
 
+- [x] **Round 6 — state file rewritten on every record** (docs/MODEL_LOG.md's "Round 6"):
+      `state.json` (26 MB at 33,600 elements) was rewritten after every log line, so a snapshot
+      wrote 434 GB and took 33 minutes. It's now a base file plus an append-only journal,
+      compacted only when worth it. A no-change pass or a no-op edit writes nothing. The same
+      snapshot now takes 6.4 s and writes 103 MB.
+
 **Not done — needs an actual Revit session (tracked, not forgotten):**
 - [ ] Verify the derived IFC GlobalId against a real IFC export (docs/MODEL_LOG.md's verification
       checklist, item 8).
