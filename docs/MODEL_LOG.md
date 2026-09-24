@@ -95,17 +95,26 @@ a value.
 
 | Field | Role | Source in Revit |
 |---|---|---|
-| `id`, `eid` | identity | `UniqueId`; numeric `ElementId` (deletions only report that) |
+| `id`, `eid` | identity | `UniqueId`; numeric `ElementId` |
 | `cat`, `fam` | param | Category id (a `cat` record), family name |
 | `type` | type | `GetTypeId()` → a `type` record |
-| `h` | handle | Mark, Type Mark (via type), room/space number and name |
+| `h` | handle | Mark, Type Mark (via type) |
 | `loc` | location | Containing storey and space as tree node ids |
 | `grid` | handle | Nearest grid intersection ("C/4"), computed from the location point and the `grid` records |
-| `rel` | relation | Host; group; assembly; design option; workset; phase created/demolished |
+| `rel` | relation | Host; room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished |
 | `q` | quantity | Length, width, height, area, volume, perimeter (internal units) |
 | `bb`, `pt` | quantity | Bounding box; location point or curve ends (internal units) |
 | `mats` | relation | Each material id with its area and volume on this element |
+| `sheets` | sheet | Sheet numbers of every sheet a tag on this element is placed on |
 | `p` | param | Every instance parameter with a value: `[pdef id, value]` pairs. Element-id values are written as the referenced element's UniqueId. |
+
+`del` (deletion) records carry `id` (UniqueId) always, `eid` only when the caller still had the
+numeric ElementId at the time — a reconcile-detected deletion (an id that vanished from a fresh
+walk) never has one, since `Element.Id` isn't resolvable off a UniqueId that no longer exists.
+
+Rooms/spaces/areas are **never** `el` records — they're the spatial tree, logged as `node`
+records only (see `RecordBuilder.IsLoggableModelElement`); `h`'s own room/space number-and-name
+lives on the `node` record instead, not nested under a building element's `h`.
 
 One full element record (about 0.8 KB before compression):
 
@@ -223,6 +232,33 @@ bearer auth**. Fixed: both settings (plus the log root) now live in the add-in's
 file (`src/RevitBridge/ConnectorSettings.cs`), never an environment variable, and the MCP server
 **refuses to start** without a token — a missing settings file gets one auto-generated on first
 run; an explicitly blank one refuses rather than falling back to no auth.
+
+## Review of the first real log (2026-09-24)
+
+Against a real project ("Horizons"), the merged connector wrote a valid `model-log/1` log — the
+header, `cat`/`pdef`/`node`/`mat`/`type` dictionaries, ~890 bytes/element, no element written
+twice. The snapshot was inspected mid-run (no `cp` yet) at 4,039 elements / 3.4 MB. The format
+was right; the content needed these fixes, all now made:
+
+| # | Fix | Measured before | Addressed by |
+|---|---|---|---|
+| 1 | **Log model elements only.** Skip non-model/internal categories (area boundaries, `<Sketch>`, sun path, automatic dimensions, views, tags, legend components, work plane grids, lines). Rooms/spaces/areas belong in `node`, not `el`. | Most records were noise: 838 area boundaries, 410 sketches, 243 sun path, 198 auto-dimensions, 158 views vs. 121 walls | `RecordBuilder.IsLoggableModelElement` |
+| 2 | **Handles (`h`).** Mark/Type Mark, kept in `p` too. | `h` on 0% of elements in the (mostly-noise) sample | Already implemented; the 0% was very likely diluted by the noise fix 1 removes — sketches/sun-path/dimensions never carry Mark. Re-verify once fixtures are recorded. |
+| 3 | **Relations.** Host; room from/to for anything between two spaces; MEP system membership; connected elements. | `rel` had only workset/group/designOption/phaseCreated; host 0% | `roomFrom`/`roomTo` (`get_FromRoom`/`get_ToRoom`), `mepSystems`/`connected` (via `ConnectorManager`) added to `BuildRelations`. The measured 0% host also likely reflects an in-progress snapshot not yet reaching any doors/windows. |
+| 4 | **`eid`** (numeric ElementId) on every element. | 0% | Was a genuine bug — never set. Fixed. |
+| 5 | **Units per parameter.** Every numeric `pdef` carries its spec. | `pdef` had id/name/storage/scope/group, no spec | Spec-reading code already existed (matches `ElementContextReader`'s own proven pattern); likely diluted by noise the same way as fix 2 — most walked "parameters" were on non-dimensional noise elements. Re-verify once fixtures are recorded. |
+| 6 | **Type and location on building elements.** | `type` 27%, `loc` 38% overall; walls already 100%/100% | Direct consequence of fix 1 — once noise is excluded, the denominator is only building elements. |
+| 7 | **Sheets.** `sheet` records and `el.sheets` (which sheets show/tag the element). | Role declared, 0 records | `RecordBuilder.BuildTaggedSheetIndex` (a reverse index over every `IndependentTag`, built once per pass) feeds `el.sheets`; `sheet` records themselves were likely just not reached yet by the in-progress snapshot the report was taken from. |
+| 8 | **Materials with quantities (`mats`).** | 3% | No code change; expected to rise sharply once fix 1's noise (which rarely carries materials) is excluded. |
+
+**Kept as designed:** lean, searchable state (elements, types, parameters, locations, relations)
+plus changes, segments rotated and gzipped; heavy detail (geometry, room boundaries, spatial
+searches) stays behind the on-demand tools while the model is open.
+
+**Still to verify with a real model** (not only fixtures, and not from a run inspected
+mid-snapshot): after these fixes, the element count is building-elements-only; a known door
+shows mark, host wall, from/to room, storey and space; a small edit produces one `chg` plus a
+partial `el` of about 120 bytes; the snapshot reaches a `cp`.
 
 ## Order, verification and done
 

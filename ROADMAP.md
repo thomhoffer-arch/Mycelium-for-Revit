@@ -34,14 +34,22 @@ log instead. Loam reads the log; nobody calls anyone.
       `open_sheet`; the read tools below are now frozen (kept for compatibility, no new capability,
       removed once the log is in active use).
 
+- [x] **Round 2 — first real-model test fixes** (docs/MODEL_LOG.md's "Review of the first real
+      log" section): `RecordBuilder.IsLoggableModelElement` filters `el` to actual building/MEP
+      elements (a raw walk was 97% noise — area boundaries, sketches, sun path, dimensions,
+      views); `eid` (a genuine missing-field bug); room from/to, MEP system membership and
+      connected elements in `rel`; `el.sheets` via a tag reverse index
+      (`BuildTaggedSheetIndex`); a room/space/grid edit now updates its own `node`/`grid` record
+      live in `ChangeCaptureJob`, not just on the next reconcile.
+
 **Not done — needs an actual Revit session (tracked, not forgotten):**
 - [ ] Record two real fixture logs (one workshared, one with MEP) and check them in as test data.
+- [ ] Re-verify `h`/`pdef.spec`/host-relation population now that noise is filtered out — round 2
+      couldn't confirm whether those were genuine bugs or just diluted by the noise the round 1
+      test was run against (docs/MODEL_LOG.md's review section has the detail per item).
 - [ ] The six-item live-Revit verification checklist in docs/MODEL_LOG.md's "Order, verification
       and done" section (idle-slice timing, lossless round-trip, gap/crash recovery, actual size
       vs. the estimate table, `DocumentChanged`-after-sync behavior, the quantity/grid heuristics).
-- [ ] `dotnet build` of `LoamRevitConnector.csproj` for both `net48`/`net8.0-windows` — not run
-      locally (no .NET SDK in the sandbox that wrote this); only `tests/ModelLog.Tests/` (Revit-free)
-      has been build/test-verified, via CI.
 
 ## Status — done (v0.3)
 

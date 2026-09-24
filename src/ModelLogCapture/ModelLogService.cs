@@ -199,6 +199,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var nodeIdByLevelOrSpace = BuildNodeIndex(doc);
             var gridLines = BuildGridLines(doc);
             var defaultPhase = ElementContextReader.DefaultPhase(doc, null);
+            var taggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
             var typeIds = new HashSet<ElementId>();
             void OnParamDef(Parameter p, bool isType)
             {
@@ -210,7 +211,37 @@ namespace Loam.Revit.Connector.ModelLogCapture
             foreach (var elId in change.AddedOrModified)
             {
                 var el = doc.GetElement(elId);
-                if (el is null || el.Category is null) { yield return true; continue; }
+                if (el is null) { yield return true; continue; }
+
+                // Levels/spaces/grids are `node`/`grid` records, not `el` — an edit to one of
+                // these must update ITS OWN record live, not wait for the next reconcile.
+                if (el is Level lvl)
+                {
+                    var nid = RecordBuilder.NodeId(lvl.Id);
+                    nodeIdByLevelOrSpace[lvl.Id] = nid;
+                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildLevelNode(lvl));
+                    yield return true;
+                    continue;
+                }
+                if (el is SpatialElement space)
+                {
+                    ElementId? levelId = null;
+                    try { levelId = space.LevelId; } catch { }
+                    var nid = RecordBuilder.NodeId(space.Id);
+                    nodeIdByLevelOrSpace[space.Id] = nid;
+                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildSpaceNode(space, levelId));
+                    yield return true;
+                    continue;
+                }
+                if (el is Grid grid)
+                {
+                    writer.WriteIfChanged(RecordKinds.Grid, grid.UniqueId, RecordBuilder.BuildGrid(grid));
+                    if (grid.Curve is Line gridLine) gridLines.Add((grid.Name, gridLine));
+                    yield return true;
+                    continue;
+                }
+
+                if (!RecordBuilder.IsLoggableModelElement(el)) { yield return true; continue; }
 
                 var typeElId = el.GetTypeId();
                 if (typeElId != ElementId.InvalidElementId && typeIds.Add(typeElId) &&
@@ -220,7 +251,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                         RecordBuilder.BuildType(type, OnParamDef));
                 }
 
-                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef);
+                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef, taggedSheets);
                 writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields);
                 yield return true;
             }
@@ -284,6 +315,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
 
             var defaultPhase = ElementContextReader.DefaultPhase(doc, null);
+            var taggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
             var typeIds = new HashSet<ElementId>();
             void OnParamDef(Parameter p, bool isType)
             {
@@ -292,10 +324,14 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 writer.WriteIfUnseen(RecordKinds.Pdef, id, RecordBuilder.BuildParamDef(p, isType));
             }
 
+            // Model elements only (docs/MODEL_LOG.md's fix #1: a raw whole-document walk logs
+            // area boundaries, sketches, sun path, dimensions, views, … as noise alongside the
+            // actual building elements) — rooms/spaces/areas were already logged above, as
+            // `node` records, not here.
             var currentIds = new HashSet<string>();
             foreach (var el in new FilteredElementCollector(doc).WhereElementIsNotElementType())
             {
-                if (el.Category is null) { yield return true; continue; }
+                if (!RecordBuilder.IsLoggableModelElement(el)) { yield return true; continue; }
                 currentIds.Add(el.UniqueId);
 
                 var typeElId = el.GetTypeId();
@@ -306,7 +342,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                         RecordBuilder.BuildType(type, OnParamDef), forceFullState);
                 }
 
-                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef);
+                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef, taggedSheets);
                 writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields, forceFullState);
                 yield return true;
             }
