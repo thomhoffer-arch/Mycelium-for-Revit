@@ -319,6 +319,14 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
 
             _idle.RunSlice();
+            // Cheap: appends whatever's buffered to the small delta journal and flushes — never
+            // rewrites the (possibly tens-of-MB) state.json base except at a checkpoint, session
+            // record, segment rotation or Dispose, and only then if the journal itself has grown
+            // large enough to be worth folding back in (see ModelLogWriter.MaybeCompact).
+            foreach (var w in _writers.Values)
+            {
+                try { w.FlushState(); } catch { /* retried on the next tick */ }
+            }
         }
 
         // ── Jobs ─────────────────────────────────────────────────────────────────
@@ -400,9 +408,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // Stale (closed, or a sync superseded it): the reconcile the sync's post-event
             // queued covers these ids anyway.
             if (isStale()) yield break;
-            writer.Append(RecordKinds.Chg, RecordBuilder.BuildChangeHeader(
+            // Held until this batch writes a real record (see ModelLogWriter.BeginChange): most
+            // edit batches that only touch views/annotation now write nothing at all.
+            writer.BeginChange(RecordBuilder.BuildChangeHeader(
                 change.TransactionNames, change.LastChangedBy,
-                added: change.Added.Count, modified: change.Modified.Count, deleted: change.Deleted.Count));
+                added: change.Added.Count, modified: change.Modified.Count, deleted: change.Deleted.Count),
+                deleted: change.Deleted.Count);
             yield return true;
 
             // Reuse the whole-document indexes the last snapshot/reconcile built, instead of
@@ -494,6 +505,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             finally
             {
+                writer.EndChange();
                 onDone();
             }
         }

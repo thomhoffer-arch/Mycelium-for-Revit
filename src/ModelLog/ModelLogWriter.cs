@@ -8,7 +8,8 @@ namespace Loam.Revit.Connector.ModelLog
 {
     /// <summary>
     /// One instance per open model. Owns the on-disk log for that model: the active segment,
-    /// <c>state.json</c> (hash cache + lastSeq + last checkpoint), and the writer lock. Every
+    /// state (a state.json base plus a state.&lt;gen&gt;.jsonl delta journal — hash cache + lastSeq
+    /// + last checkpoint), and the writer lock. Every
     /// write path in the connector — snapshot, reconcile, live change capture — goes through
     /// this class so segment rotation, gzip, crash safety and the seq counter are handled in
     /// exactly one place. See docs/MODEL_LOG.md for the on-disk format this produces.
@@ -27,6 +28,25 @@ namespace Loam.Revit.Connector.ModelLog
         private readonly string _statePath;
         private readonly ModelLogState _state;
         private bool _headerWrittenThisSegment;
+
+        // state.json (the BASE) holds the whole hash cache (tens of MB on a large model), so it's
+        // rewritten only by a compaction, not after every record: doing that per record made a
+        // snapshot quadratic in disk writes (measured: 4,000 elements → 6.1 GB written for a 7.3
+        // MB log). Every mutation instead buffers a small delta op (see StateJournal) in memory;
+        // FlushState() appends the buffer to state.<gen>.jsonl (cheap: append + flush, no base
+        // rewrite), and is called after every idle slice plus at once on a checkpoint, session
+        // record, segment rotation and Dispose — those four also then compact (rewrite the base,
+        // bump the generation, drop the old journal) if the journal has grown past
+        // MinCompactionBytes relative to the base. If Revit dies in between, the base+journal on
+        // disk is behind the log: LastSeq/segment are recovered from the log itself on the next
+        // open, and the stale hashes just make the next reconcile re-write those records — the
+        // harmless duplicates the handoff's crash-safety rule #2 already allows.
+        internal static long MinCompactionBytes = 1L << 20;
+        private readonly List<string> _journalBuffer = new();
+
+        // A change batch's `chg` record, held until the batch actually writes a record (or has
+        // deletions): an edit that only touched views/annotation writes nothing at all.
+        private JsonObject? _pendingChange;
 
         /// <summary>True when another Revit session already holds this model's writer lock —
         /// the caller must not write anything and should log that it didn't (the handoff's
@@ -55,8 +75,16 @@ namespace Loam.Revit.Connector.ModelLog
 
             _statePath = Path.Combine(LogDirectory, "state.json");
             _state = StateStore.Load(_statePath);
+            if (!LockHeldElsewhere) StateJournal.DeleteStaleGenerations(_statePath, _state.JournalGeneration);
 
-            _segment = new LogSegmentWriter(LogDirectory, _state.CurrentSegment);
+            // state (base+journal) may be behind the log (LastSeq is only journaled at a
+            // checkpoint/session/rotation, not per record): never reopen an older segment number,
+            // and never reuse a seq already on disk.
+            var segment = Math.Max(_state.CurrentSegment, LogSegmentWriter.DiscoverLatestSegment(LogDirectory));
+            var lastSeqOnDisk = LogSegmentWriter.LastSeqIn(Path.Combine(LogDirectory, $"{segment:D6}.jsonl"));
+            if (lastSeqOnDisk > _state.LastSeq) _state.LastSeq = lastSeqOnDisk;
+
+            _segment = new LogSegmentWriter(LogDirectory, segment);
             _state.CurrentSegment = _segment.SegmentNumber;
         }
 
@@ -71,11 +99,18 @@ namespace Loam.Revit.Connector.ModelLog
         // ── Raw append (every write goes through this) ──────────────────────────
 
         /// <summary>Appends one record of kind <paramref name="kind"/> with the given fields,
-        /// stamping <c>seq</c>/<c>ts</c>. Flushes the line, THEN persists state.json — never the
-        /// other order: a crash between the two just re-writes the same state on the next
-        /// reconcile, a harmless duplicate, per the handoff's crash-safety rule #2.</summary>
+        /// stamping <c>seq</c>/<c>ts</c>. Flushes the line, THEN (at the callers that buffer a
+        /// journal op alongside it) persists state — never the other order: a crash between the
+        /// two just re-writes the same state on the next reconcile, a harmless duplicate, per the
+        /// handoff's crash-safety rule #2.</summary>
         public long Append(string kind, JsonObject fields)
         {
+            if (_pendingChange is not null && kind != RecordKinds.Chg)
+            {
+                var chg = _pendingChange;
+                _pendingChange = null;
+                Append(RecordKinds.Chg, chg);
+            }
             _state.LastSeq++;
             var line = new JsonObject
             {
@@ -85,9 +120,27 @@ namespace Loam.Revit.Connector.ModelLog
             };
             foreach (var kv in fields) line[kv.Key] = kv.Value?.DeepClone();
             _segment.AppendLine(line.ToJsonString());
-            SaveState();
             return _state.LastSeq;
         }
+
+        /// <summary>Starts one live-edit batch. Its <c>chg</c> record is written just before
+        /// the batch's first real record, or right away when it deleted something (deletions
+        /// never write a record of their own until the next reconcile, so the chg is their only
+        /// trace); a batch that ends up writing nothing leaves the log untouched.</summary>
+        public void BeginChange(JsonObject chgFields, int deleted)
+        {
+            _pendingChange = null;
+            if (deleted > 0) Append(RecordKinds.Chg, chgFields);
+            else _pendingChange = chgFields;
+        }
+
+        /// <summary>Ends the batch started by <see cref="BeginChange"/>, discarding its
+        /// <c>chg</c> record if nothing was written.</summary>
+        public void EndChange() => _pendingChange = null;
+
+        /// <summary>Appends whatever's buffered (hash-cache/pdef/cat/meta deltas) to the
+        /// journal and flushes. Cheap — never rewrites the base. Call after each idle slice.</summary>
+        public void FlushState() => FlushJournalBuffer();
 
         // ── Header / segment rotation ────────────────────────────────────────────
 
@@ -127,6 +180,9 @@ namespace Loam.Revit.Connector.ModelLog
             _state.CurrentSegment = _segment.SegmentNumber;
             _headerWrittenThisSegment = false;
             WriteHeader(headerFields);
+            _journalBuffer.Add(StateJournal.MetaOp(_state));
+            FlushJournalBuffer();
+            MaybeCompact();
         }
 
         // ── Checkpoints and gaps ──────────────────────────────────────────────────
@@ -149,7 +205,9 @@ namespace Loam.Revit.Connector.ModelLog
 
             _state.LastCheckpointClosed = closed;
             _state.LastModelVersion = modelVersion;
-            SaveState();
+            _journalBuffer.Add(StateJournal.MetaOp(_state));
+            FlushJournalBuffer();
+            MaybeCompact();
         }
 
         /// <summary>Call once per <c>DocumentOpened</c>, right after deciding whether this is a
@@ -165,7 +223,8 @@ namespace Loam.Revit.Connector.ModelLog
             Append(RecordKinds.Session, fields);
 
             _state.LastProducerVersion = producerVersion;
-            SaveState();
+            _journalBuffer.Add(StateJournal.MetaOp(_state));
+            FlushJournalBuffer();
         }
 
         /// <summary>Called once at startup, before the first snapshot/reconcile pass, when the
@@ -207,6 +266,7 @@ namespace Loam.Revit.Connector.ModelLog
             {
                 Append(family, WithId(fullFields, id));
                 _state.Cache.Set(family, id, newHashes);
+                _journalBuffer.Add(StateJournal.HashSetOp(family, id, newHashes));
                 return true;
             }
 
@@ -227,6 +287,7 @@ namespace Loam.Revit.Connector.ModelLog
             if (unset is not null) changed["unset"] = unset;
             Append(family, WithId(changed, id));
             _state.Cache.Set(family, id, newHashes);
+            _journalBuffer.Add(StateJournal.HashSetOp(family, id, newHashes));
             return true;
         }
 
@@ -238,6 +299,7 @@ namespace Loam.Revit.Connector.ModelLog
             var seen = family == RecordKinds.Pdef ? _state.Cache.PdefSeen : _state.Cache.CatSeen;
             if (!seen.Add(id)) return false;
             Append(family, WithId(fields, id));
+            _journalBuffer.Add(family == RecordKinds.Pdef ? StateJournal.PdefSeenOp(id) : StateJournal.CatSeenOp(id));
             return true;
         }
 
@@ -270,17 +332,69 @@ namespace Loam.Revit.Connector.ModelLog
             if (elementId is not null) fields["eid"] = elementId.Value;
             Append(RecordKinds.Del, fields);
             _state.Cache.Remove(RecordKinds.El, uniqueId);
+            _journalBuffer.Add(StateJournal.HashRemoveOp(RecordKinds.El, uniqueId));
         }
 
-        private void SaveState() => StateStore.Save(_statePath, _state);
+        private void FlushJournalBuffer()
+        {
+            if (_journalBuffer.Count == 0) return;
+            if (LockHeldElsewhere) { _journalBuffer.Clear(); return; } // never write the owning session's state
+            StateJournal.Append(_statePath, _state.JournalGeneration, _journalBuffer);
+            _journalBuffer.Clear();
+        }
+
+        /// <summary>Rewrites the base (state.json) from the in-memory state, bumps the journal
+        /// generation, and drops the old journal — but only when the journal has grown past
+        /// <see cref="MinCompactionBytes"/> relative to the base (a small journal is cheaper to
+        /// keep appending to than to fold into a full rewrite). The base write is atomic (see
+        /// StateStore.Save); a crash between it and the old-journal delete leaves a loadable
+        /// state either way — base gen N + journal N (crash before the rename), or base gen N+1
+        /// with the stale journal N left behind (crash after) — the next open ignores that stale
+        /// journal and deletes it opportunistically (see StateJournal.DeleteStaleGenerations).
+        /// Best-effort: an I/O failure here leaves the (still valid, already-flushed) journal at
+        /// its old generation and must not fail whatever called this (a checkpoint, a rotation,
+        /// or Dispose) — nothing is lost, just a rewrite deferred to the next opportunity.</summary>
+        private void MaybeCompact()
+        {
+            if (LockHeldElsewhere) return;
+            var baseBytes = File.Exists(_statePath) ? new FileInfo(_statePath).Length : 0;
+            var threshold = Math.Max(MinCompactionBytes, baseBytes / 4);
+            var journalBytes = StateJournal.SizeBytes(_statePath, _state.JournalGeneration);
+            if (journalBytes <= threshold) return;
+
+            var oldGeneration = _state.JournalGeneration;
+            _state.JournalGeneration = oldGeneration + 1;
+            try
+            {
+                StateStore.Save(_statePath, _state);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _state.JournalGeneration = oldGeneration; // save didn't land — keep the old journal current
+                return;
+            }
+            StateJournal.DeleteGeneration(_statePath, oldGeneration);
+        }
 
         private static string Timestamp() =>
             DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
 
         public void Dispose()
         {
-            _segment.Dispose();
-            _lock?.Dispose();
+            try
+            {
+                _pendingChange = null;
+                FlushJournalBuffer();
+                MaybeCompact();
+            }
+            finally
+            {
+                // Always released, even if flushing/compacting the state above threw — an
+                // unreleased lock or an open segment handle would outlive this process for no
+                // benefit (compaction is already best-effort; nothing more is recoverable here).
+                _segment.Dispose();
+                _lock?.Dispose();
+            }
         }
     }
 }

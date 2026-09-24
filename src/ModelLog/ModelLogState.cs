@@ -15,5 +15,11 @@ namespace Loam.Revit.Connector.ModelLog
         public string? LastModelVersion { get; set; }
         public string? LastProducerVersion { get; set; }
         public HashCache Cache { get; set; } = new();
+
+        /// <summary>Which <c>state.&lt;gen&gt;.jsonl</c> delta journal this base was last
+        /// compacted with — bumped by one on every compaction. Defaults to 0 so an old state.json
+        /// written before the journal existed still loads (paired with journal generation 0, or
+        /// none at all).</summary>
+        public long JournalGeneration { get; set; }
     }
 }

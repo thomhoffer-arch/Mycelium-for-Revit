@@ -33,7 +33,7 @@ namespace Loam.Revit.Connector.ModelLog
             Open();
         }
 
-        private static long DiscoverLatestSegment(string dir)
+        public static long DiscoverLatestSegment(string dir)
         {
             if (!Directory.Exists(dir)) return 1;
             long max = 0;
@@ -45,6 +45,37 @@ namespace Loam.Revit.Connector.ModelLog
                 if (long.TryParse(stem, out var n) && n > max) max = n;
             }
             return max == 0 ? 1 : max;
+        }
+
+        /// <summary>The <c>seq</c> of the last complete line in a plain segment, or 0 when the
+        /// file is missing/empty or its tail has no parseable line (a torn last line is
+        /// ignored, same as any reader does).</summary>
+        public static long LastSeqIn(string plainSegmentPath)
+        {
+            try
+            {
+                if (!File.Exists(plainSegmentPath)) return 0;
+                using var fs = new FileStream(plainSegmentPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                var take = (int)Math.Min(fs.Length, 256 * 1024);
+                fs.Seek(-take, SeekOrigin.End);
+                var buf = new byte[take];
+                var read = 0;
+                while (read < take) { var r = fs.Read(buf, read, take - read); if (r <= 0) break; read += r; }
+                var lines = Encoding.UTF8.GetString(buf, 0, read).Split('\n');
+                for (var i = lines.Length - 1; i >= 0; i--)
+                {
+                    var line = lines[i].Trim();
+                    if (line.Length == 0) continue;
+                    try
+                    {
+                        using var json = System.Text.Json.JsonDocument.Parse(line);
+                        if (json.RootElement.TryGetProperty("seq", out var seq) && seq.TryGetInt64(out var v)) return v;
+                    }
+                    catch (System.Text.Json.JsonException) { /* torn or partial line — try the one before */ }
+                }
+            }
+            catch (IOException) { }
+            return 0;
         }
 
         private string SegmentPath(long n) => Path.Combine(_dir, $"{n:D6}.jsonl");

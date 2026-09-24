@@ -234,6 +234,243 @@ namespace ModelLog.Tests
             Assert.False(parsed.ContainsKey("revitVersion"));
         }
 
+        private string StatePath => Path.Combine(_root, "model-a", "state.json");
+        private string Seg(int n) => Path.Combine(_root, "model-a", $"{n:D6}.jsonl");
+        private string Journal(long gen) => Path.Combine(_root, "model-a", $"state.{gen}.jsonl");
+
+        /// <summary>Lowers ModelLogWriter.MinCompactionBytes for the duration of one test and
+        /// restores it afterwards — the production default (1 MiB) would make a compaction test
+        /// write an unreasonable number of records.</summary>
+        private sealed class LowCompactionThreshold : IDisposable
+        {
+            private readonly long _previous;
+            public LowCompactionThreshold(long bytes)
+            {
+                _previous = ModelLogWriter.MinCompactionBytes;
+                ModelLogWriter.MinCompactionBytes = bytes;
+            }
+            public void Dispose() => ModelLogWriter.MinCompactionBytes = _previous;
+        }
+
+        [Fact]
+        public void Appends_DoNotTouchStateJson_UntilCompaction()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                for (var i = 0; i < 10; i++) w.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W"));
+                w.FlushState();
+
+                Assert.False(File.Exists(StatePath)); // no base yet — nowhere near MinCompactionBytes
+                Assert.True(File.Exists(Journal(0)));
+                Assert.True(new FileInfo(Journal(0)).Length > 0);
+            }
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.Equal(10, reopened.LastSeq);
+            Assert.Equal(10, reopened.KnownElementIdsNotIn(new HashSet<string>()).Count);
+            Assert.False(reopened.WriteIfChanged(RecordKinds.El, "guid-0", El(0, 1, "W"))); // hash cache restored
+        }
+
+        [Fact]
+        public void NoOpReconcileThenCheckpoint_StateJsonUnchanged()
+        {
+            using (var lowered = new LowCompactionThreshold(2048))
+            {
+                using (var w = new ModelLogWriter(_root, "model-a"))
+                {
+                    for (var i = 0; i < 200; i++) w.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W"));
+                    w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 200, closed: false);
+                }
+                Assert.True(File.Exists(StatePath)); // compaction happened during that checkpoint
+
+                var stamp = File.GetLastWriteTimeUtc(StatePath);
+                var content = File.ReadAllBytes(StatePath);
+                System.Threading.Thread.Sleep(50);
+
+                using (var w = new ModelLogWriter(_root, "model-a"))
+                {
+                    var linesBefore = File.ReadAllLines(Seg(1)).Length;
+                    for (var i = 0; i < 200; i++)
+                        Assert.False(w.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W"))); // nothing changed
+                    w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 200, closed: false);
+
+                    // Only the cp log line was appended — reconcile itself wrote nothing.
+                    Assert.Equal(linesBefore + 1, File.ReadAllLines(Seg(1)).Length);
+                }
+
+                Assert.Equal(stamp, File.GetLastWriteTimeUtc(StatePath));
+                Assert.Equal(content, File.ReadAllBytes(StatePath));
+            }
+        }
+
+        [Fact]
+        public void Compaction_TriggersAtCheckpoint_NewGenerationOldJournalGone()
+        {
+            using var lowered = new LowCompactionThreshold(2048);
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                for (var i = 0; i < 200; i++) w.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W"));
+                w.FlushState();
+                Assert.True(new FileInfo(Journal(0)).Length > 2048); // past threshold before the checkpoint compacts it
+
+                w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 200, closed: false);
+
+                Assert.True(File.Exists(StatePath));
+                Assert.False(File.Exists(Journal(0))); // old generation's journal is gone
+            }
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            for (var i = 0; i < 200; i++)
+                Assert.False(reopened.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W")));
+        }
+
+        [Fact]
+        public void Compaction_SaveFailure_IsBestEffort_CheckpointStillSucceeds()
+        {
+            using var lowered = new LowCompactionThreshold(2048);
+            using var w = new ModelLogWriter(_root, "model-a");
+            for (var i = 0; i < 200; i++) w.WriteIfChanged(RecordKinds.El, "guid-" + i, El(i, 1, "W"));
+            w.FlushState();
+
+            // Force the compaction's tmp write to fail deterministically, without relying on
+            // filesystem permissions: state.json.tmp is itself a directory.
+            Directory.CreateDirectory(StatePath + ".tmp");
+
+            var ex = Record.Exception(() =>
+                w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 200, closed: false));
+
+            Assert.Null(ex); // best-effort: a failed compaction must never fail the checkpoint
+            Assert.False(File.Exists(StatePath)); // never compacted
+            Assert.True(File.Exists(Journal(0))); // journal generation wasn't bumped — still current
+        }
+
+        [Fact]
+        public void LeftoverTmpFile_DoesNotBreakNextSave()
+        {
+            Directory.CreateDirectory(Path.Combine(_root, "model-a"));
+            File.WriteAllText(StatePath + ".tmp", "garbage from an interrupted save");
+
+            var state = new ModelLogState { LastSeq = 7 };
+            StateStore.Save(StatePath, state);
+
+            Assert.Equal(7, StateStore.Load(StatePath).LastSeq);
+        }
+
+        [Fact]
+        public void TornLastJournalLine_Ignored()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+                w.FlushState();
+            }
+
+            File.AppendAllText(Journal(0), "{\"op\":\"hs\",\"f\":\"el\",\"id\":\"guid-2\",\"h\":{");
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.False(reopened.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"))); // survived
+            Assert.True(reopened.WriteIfChanged(RecordKinds.El, "guid-2", El(2, 1, "W"))); // torn op never applied
+        }
+
+        [Fact]
+        public void StaleJournalGeneration_Ignored()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+                w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+
+            // Simulate a compaction interrupted after the new base was written but before the old
+            // journal was deleted: a leftover gen-0 journal claiming a since-removed id, next to a
+            // base already at gen 1 with no gen-1 journal.
+            var state = StateStore.Load(StatePath);
+            Assert.Equal(0, state.JournalGeneration); // no compaction actually happened yet here
+            state.JournalGeneration = 1;
+            StateStore.Save(StatePath, state);
+            File.WriteAllText(Journal(0), "{\"op\":\"hr\",\"f\":\"el\",\"id\":\"guid-1\"}\n");
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.False(reopened.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"))); // gen-0 op not replayed
+            Assert.False(File.Exists(Journal(0))); // cleaned up opportunistically on open
+        }
+
+        [Fact]
+        public void OldFormatStateJson_NoJournalGenerationNoJournal_LoadsFine()
+        {
+            Directory.CreateDirectory(Path.Combine(_root, "model-a"));
+            File.WriteAllText(StatePath, "{\n  \"LastSeq\": 5,\n  \"CurrentSegment\": 1,\n  \"LastCheckpointClosed\": true\n}\n");
+
+            using var w = new ModelLogWriter(_root, "model-a");
+            Assert.True(w.LastCheckpointClosed);
+            Assert.True(w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"))); // never seen before
+        }
+
+        [Fact]
+        public void ChangeBatch_ThatWritesNothing_LeavesLogUntouched()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+            var lines = File.ReadAllLines(Seg(1)).Length;
+
+            w.BeginChange(new JsonObject { ["modified"] = 1 }, deleted: 0);
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W")); // unchanged
+            w.EndChange();
+
+            Assert.Equal(lines, File.ReadAllLines(Seg(1)).Length);
+        }
+
+        [Fact]
+        public void ChangeBatch_ChgWrittenJustBeforeFirstRecord()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+
+            w.BeginChange(new JsonObject { ["modified"] = 1 }, deleted: 0);
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 2, "W"));
+            w.EndChange();
+
+            var kinds = File.ReadAllLines(Seg(1)).Select(l => JsonNode.Parse(l)!["k"]!.GetValue<string>()).ToList();
+            Assert.Equal(new[] { "el", "chg", "el" }, kinds);
+        }
+
+        [Fact]
+        public void ChangeBatch_WithDeletions_WritesChgRightAway()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.BeginChange(new JsonObject { ["deleted"] = 2 }, deleted: 2);
+            w.EndChange();
+
+            Assert.Single(File.ReadAllLines(Seg(1)), l => l.Contains("\"k\":\"chg\""));
+        }
+
+        [Fact]
+        public void StateBehindLog_SeqRecoveredFromLog_NeverReused()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+                w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" }); // saved on Dispose: LastSeq 1
+
+            // Lines flushed after the last state save, then Revit died before the next one.
+            File.AppendAllText(Seg(1), "{\"seq\":2,\"ts\":\"x\",\"k\":\"el\",\"id\":\"a\"}\n");
+            File.AppendAllText(Seg(1), "{\"seq\":3,\"ts\":\"x\",\"k\":\"el\",\"id\":\"b\"}\n");
+            File.AppendAllText(Seg(1), "{\"seq\":4,\"ts\":\"x\",\"k\""); // torn last line
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.Equal(3, reopened.LastSeq);
+            Assert.Equal(4, reopened.Append(RecordKinds.Project, new JsonObject()));
+        }
+
+        [Fact]
+        public void StateBehindLog_NewerSegmentOnDisk_IsReopened()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+                w.Append(RecordKinds.Project, new JsonObject()); // state says segment 1
+
+            // A rotation happened after that save; its state was never persisted.
+            File.WriteAllText(Seg(2), "{\"seq\":9,\"ts\":\"x\",\"k\":\"header\"}\n");
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.Equal(10, reopened.Append(RecordKinds.Project, new JsonObject()));
+            Assert.Equal(2, File.ReadAllLines(Seg(2)).Length);
+        }
+
         [Fact]
         public void SecondWriter_SameModel_LockHeldElsewhere()
         {
