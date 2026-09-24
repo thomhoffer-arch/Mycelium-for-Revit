@@ -169,6 +169,7 @@ namespace Loam.Revit.Connector
         private void OnDocumentReloadedLatest(object sender, DocumentReloadedLatestEventArgs e)
         {
             if (e.Document is null) return;
+            try { RefreshFacts(e.Document); } catch { }
             try { _modelLog?.OnDocumentSyncedOrReloaded(e.Document); } catch { }
         }
 
@@ -176,6 +177,7 @@ namespace Loam.Revit.Connector
         {
             Emit("closed", e.Document);
             try { _modelLog?.OnDocumentClosing(e.Document); } catch { /* best-effort — never block close */ }
+            _factsCache.Remove(e.Document);
         }
 
         // Mirrors LoamEventClient.MaxChangedIds — past this, a batch lookup isn't worth it anyway, so
@@ -192,7 +194,7 @@ namespace Loam.Revit.Connector
         {
             var doc = e.GetDocument();
             if (doc is null) return;
-            var facts = ModelFacts.From(doc);
+            var facts = CachedFacts(doc);
 
             // ENERGY EFFICIENCY (live request: "Loam should always only ask for new/changed things") —
             // hand Loam the ACTUAL touched UniqueIds for THIS transaction, not just "something changed",
@@ -293,8 +295,37 @@ namespace Loam.Revit.Connector
         private void Emit(string kind, Document doc, string? cause = null)
         {
             if (doc is null) return;
-            var facts = ModelFacts.From(doc);
+            var facts = RefreshFacts(doc);
             _events?.Send(kind, facts, cause);
         }
+
+        // ── ModelFacts cache ────────────────────────────────────────────────────
+        // REGRESSION FIX (live report: "blocking/slow for several seconds after most actions",
+        // and "syncing is also very slow"): OnDocumentChanged used to call ModelFacts.From(doc)
+        // — fresh, unconditionally, before any batching/debounce logic — on EVERY single
+        // DocumentChanged event, i.e. every user edit. ModelFacts.From calls
+        // doc.GetWorksharingCentralModelPath()/ModelPathUtils.ConvertModelPathToUserVisiblePath()
+        // (and, for a cloud model, doc.GetCloudModelPath()) — Revit API calls well documented as
+        // slow, sometimes requiring a round trip to the worksharing/cloud service, especially on
+        // BIM 360/ACC-hosted models. None of these facts (central path, cloud project/model GUID,
+        // worksharing state) actually change between edits, so recomputing them synchronously on
+        // every transaction (which blocks Revit's UI thread, since DocumentChanged runs
+        // synchronously as part of the transaction-commit pipeline) was pure waste — and squarely
+        // matches both symptoms: sync is exactly where worksharing/cloud path resolution is most
+        // likely to hit a slow path, and "most actions" matches every ordinary edit paying this
+        // cost. Cached per document instead, refreshed only at the infrequent milestone events
+        // (open/save/sync/reload — see Emit and OnDocumentSynced/OnDocumentReloadedLatest) where
+        // recomputing costs nothing noticeable; DocumentChanged now just reads the cached value.
+        private readonly Dictionary<Document, ModelFacts> _factsCache = new();
+
+        private ModelFacts RefreshFacts(Document doc)
+        {
+            var facts = ModelFacts.From(doc);
+            _factsCache[doc] = facts;
+            return facts;
+        }
+
+        private ModelFacts CachedFacts(Document doc) =>
+            _factsCache.TryGetValue(doc, out var cached) ? cached : RefreshFacts(doc);
     }
 }

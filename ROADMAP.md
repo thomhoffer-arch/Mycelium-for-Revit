@@ -135,6 +135,24 @@ log instead. Loam reads the log; nobody calls anyone.
 
 ## Fixed
 
+- [x] **`OnDocumentChanged` recomputed `ModelFacts` (central path, cloud project/model GUID,
+      worksharing state) fresh on every single edit, blocking Revit's UI thread for the duration**
+      — live reports: "connector blocking processes in Revit ... stuck/slow for several seconds
+      after most actions" and "syncing is also very slow." `ModelFacts.From` calls
+      `doc.GetWorksharingCentralModelPath()`/`ModelPathUtils.ConvertModelPathToUserVisiblePath()`
+      (and, for a cloud model, `doc.GetCloudModelPath()`) — Revit API calls well documented as
+      slow, sometimes requiring a round trip to the worksharing/cloud service, especially on BIM
+      360/ACC-hosted models — and `App.cs`'s `OnDocumentChanged` called this, unconditionally and
+      synchronously, before any of `LoamEventClient`'s own batching/debounce logic even began,
+      on every `DocumentChanged` event (i.e. every user edit). None of these facts actually change
+      between edits within one open document. Fixed with a per-document `ModelFacts` cache
+      (`App._factsCache`) refreshed only at the infrequent milestone events (open/save/sync/
+      reload, via `Emit`/`RefreshFacts`) — `OnDocumentChanged` now reads the cached value instead
+      of recomputing it. Predates the round-4 model-log work entirely (present since the original
+      event-push feature); `WorksharingUtils.GetWorksharingTooltipInfo`'s own per-transaction "who
+      changed it" lookup is left as-is (it genuinely can differ per edit, unlike the cached
+      facts) — worth revisiting if slowness persists after this fix, since that call is also
+      documented as slow on cloud-hosted workshared models.
 - [x] **`docs/CONTRACT.md` had drifted from the code in six places, plus an env-var name drift in
       `README.md`** — a sibling repo's plan doc (Loam PR #669) found this document showed `get_rooms`
       returning flat `level_name`/`area_sqft`/`area_display` (the code has always nested `level{}` and
