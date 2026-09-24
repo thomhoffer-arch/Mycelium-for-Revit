@@ -1,5 +1,6 @@
 using Autodesk.Revit.DB;
 using Autodesk.Revit.DB.Architecture;
+using Loam.Revit.Connector.ModelLog;
 using PDRA.Services.Ai.Tools.Queries;
 using System;
 using System.Collections.Generic;
@@ -92,7 +93,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
             header["fieldRoles"] = new JsonObject
             {
-                ["identity"] = new JsonArray { "id", "eid" },
+                ["identity"] = new JsonArray { "id", "eid", "ifc" },
                 ["handle"] = new JsonArray { "h", "grid" },
                 ["location"] = new JsonArray { "loc", "bb", "pt" },
                 ["type"] = new JsonArray { "type" },
@@ -449,6 +450,9 @@ namespace Loam.Revit.Connector.ModelLogCapture
         {
             var fields = new JsonObject { ["eid"] = el.Id.Value };
 
+            var ifc = BuildIfcRef(el);
+            if (ifc is not null) fields["ifc"] = ifc;
+
             if (el.Category is not null) fields["cat"] = CategoryId(el.Category);
             try { if (el is FamilyInstance fi && !string.IsNullOrEmpty(fi.Symbol?.FamilyName)) fields["fam"] = fi.Symbol.FamilyName; } catch { }
 
@@ -514,6 +518,33 @@ namespace Loam.Revit.Connector.ModelLogCapture
             if (p is not null) fields["p"] = p;
 
             return fields;
+        }
+
+        /// <summary>IFC GlobalId — an extra identifier, not a conversion: this never turns the
+        /// model into IFC, it just names the element the way ClashControl, BCF issues, IFC
+        /// exports and emails already do, so Loam can link those back to the right Revit element
+        /// without anyone re-exporting anything. The stored <c>IFC_GUID</c> parameter (what
+        /// Revit's own IFC exporter actually wrote, when "Store IFC GUID" was enabled for a past
+        /// export) is authoritative when present; otherwise the value is computed from
+        /// <see cref="Element.UniqueId"/> via <see cref="IfcGuid.FromRevitUniqueId"/> and marked
+        /// <c>derived: true</c> so a reader knows it hasn't been confirmed against an actual IFC
+        /// export of this model. NEEDS LIVE-REVIT CHECK: export a small IFC from Revit with
+        /// "Store IFC GUID" on and confirm the derived values here match the export's GlobalIds
+        /// for elements that have never been exported before (so `IFC_GUID` was empty until that
+        /// export set it).</summary>
+        private static JsonObject? BuildIfcRef(Element el)
+        {
+            try
+            {
+                var stored = el.get_Parameter(BuiltInParameter.IFC_GUID)?.AsString();
+                if (!string.IsNullOrEmpty(stored)) return new JsonObject { ["guid"] = stored };
+            }
+            catch { }
+
+            string? derived;
+            try { derived = IfcGuid.FromRevitUniqueId(el.UniqueId); }
+            catch { derived = null; }
+            return derived is null ? null : new JsonObject { ["guid"] = derived, ["derived"] = true };
         }
 
         private static JsonObject? BuildLocationRef(
