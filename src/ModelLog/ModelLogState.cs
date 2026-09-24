@@ -14,6 +14,15 @@ namespace Loam.Revit.Connector.ModelLog
         public bool LastCheckpointClosed { get; set; }
         public string? LastModelVersion { get; set; }
         public string? LastProducerVersion { get; set; }
+
+        /// <summary>The model version (GUID string) a checkpoint last confirmed the log matched
+        /// EXACTLY — set only when that checkpoint was both <c>complete</c> and the document had
+        /// no unsaved changes at that moment, and cleared on anything else (an interrupted pass,
+        /// an unsaved edit since, or a new log generation). The only baseline
+        /// <c>Document.GetChangedElements</c> may ever be trusted against — see
+        /// ModelLogCapture.ModelLogService.ReconcileJob.</summary>
+        public string? LastCompleteModelVersion { get; set; }
+
         public HashCache Cache { get; set; } = new();
 
         /// <summary>Which <c>state.&lt;gen&gt;.jsonl</c> delta journal this base was last

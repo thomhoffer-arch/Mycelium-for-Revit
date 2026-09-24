@@ -234,6 +234,71 @@ namespace ModelLog.Tests
             Assert.False(parsed.ContainsKey("revitVersion"));
         }
 
+        [Fact]
+        public void WriteCheckpoint_CompleteAndUnmodified_SetsLastCompleteModelVersion()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            Assert.Null(w.LastCompleteModelVersion);
+
+            w.WriteCheckpoint(complete: true, modelVersion: "guid-1", elementCount: 5, closed: false,
+                modelSaves: 3, documentUnmodified: true);
+
+            Assert.Equal("guid-1", w.LastCompleteModelVersion);
+
+            var lastLine = File.ReadAllLines(Seg(1)).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.Equal(3, parsed["modelSaves"]!.GetValue<int>());
+        }
+
+        [Theory]
+        [InlineData(false, true)]  // incomplete pass — never a trustworthy baseline
+        [InlineData(true, false)]  // complete, but the document had unsaved changes at that moment
+        public void WriteCheckpoint_NotBothCompleteAndUnmodified_ClearsLastCompleteModelVersion(bool complete, bool documentUnmodified)
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteCheckpoint(complete: true, modelVersion: "guid-1", elementCount: 5, closed: false, documentUnmodified: true);
+            Assert.Equal("guid-1", w.LastCompleteModelVersion);
+
+            w.WriteCheckpoint(complete: complete, modelVersion: "guid-2", elementCount: 5, closed: false, documentUnmodified: documentUnmodified);
+
+            Assert.Null(w.LastCompleteModelVersion);
+        }
+
+        [Fact]
+        public void LastCompleteModelVersion_PersistsAcrossReopen()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+                w.WriteCheckpoint(complete: true, modelVersion: "guid-1", elementCount: 5, closed: true, documentUnmodified: true);
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.Equal("guid-1", reopened.LastCompleteModelVersion);
+        }
+
+        [Fact]
+        public void BeginNewGeneration_ClearsLastCompleteModelVersion()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteCheckpoint(complete: true, modelVersion: "guid-1", elementCount: 5, closed: false, documentUnmodified: true);
+            Assert.Equal("guid-1", w.LastCompleteModelVersion);
+
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            Assert.Null(w.LastCompleteModelVersion);
+        }
+
+        [Fact]
+        public void KnownElementUniqueIds_ReflectsHashCache()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+            w.WriteIfChanged(RecordKinds.El, "guid-2", El(2, 1, "W"));
+
+            Assert.Equal(new[] { "guid-1", "guid-2" }, w.KnownElementUniqueIds().OrderBy(s => s));
+
+            w.WriteDelete("guid-1");
+            Assert.Equal(new[] { "guid-2" }, w.KnownElementUniqueIds());
+        }
+
         private string StatePath => Path.Combine(_root, "model-a", "state.json");
         private string Seg(int n) => Path.Combine(_root, "model-a", $"{n:D6}.jsonl");
         private string Journal(long gen) => Path.Combine(_root, "model-a", $"state.{gen}.jsonl");

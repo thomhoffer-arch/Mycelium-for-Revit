@@ -83,7 +83,7 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued |
 | `link` | Snapshot; on change | Linked model instance: the link's model identity and its transform |
 | `chg` | Before the records of one edit | Revit transaction names, the editor, and counts of added/modified/deleted |
-| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, element count, `lastSeq`, `closed` |
+| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, `modelSaves` (`DocumentVersion.NumberOfSaves` — additive alongside model version, the handoff's "version = GUID + number"), element count, `lastSeq`, `closed` |
 | `gap` | When the connector knows it missed events | `fromSeq`, reason; closed by the next checkpoint |
 
 **Field roles** are declared once in the header (`identity`, `handle`, `location`, `type`,
@@ -141,7 +141,7 @@ every trigger below cheap, and makes the log self-healing.
 | Trigger | Revit hook | What the connector does |
 |---|---|---|
 | Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
-| Model opened, log exists, same producer version, segment not due for rotation | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. Never rotates the segment. |
+| Model opened, log exists, same producer version, segment not due for rotation | `DocumentOpened` | Write a `session` record, then **reconcile.** Incremental when possible: if the last `cp` set a trusted baseline (see "Incremental reconcile" below), `Document.GetChangedElements` gives exactly what changed and only those ids (plus `del` for real deletions) are written. Otherwise (no baseline, the baseline GUID is rejected, or the diff touches something whose change can silently affect OTHER elements — a Grid, Level, Room/Space/Area, ViewSheet, Viewport, Phase or DesignOption) falls back to the FULL walk: write only what differs from the hash cache (partial states), `del` for every id that no longer exists, same as before. Either way ends in a `cp`. This catches edits made while the connector wasn't running. Never rotates the segment. |
 | Model opened, log exists, producer version changed since the last `session`, OR the active segment is already past 64 MB | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. This is the ONLY way a segment ever rotates, so one never starts with just a header. |
 | User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. Never rotates the segment, even past 64 MB — the next open/sync/reconcile does. |
 | Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile** (or a new log generation instead, by the same rotation-due rule above), then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
@@ -150,6 +150,34 @@ every trigger below cheap, and makes the log self-healing.
 **Who changed it:** on workshared models, `WorksharingUtils.GetWorksharingTooltipInfo(doc,
 id).LastChangedBy` after a sync; for local edits, `Application.Username`. Leave `by` out when
 unknown.
+
+**Incremental reconcile:** a full reconcile re-reads every element just to compare hashes —
+wasteful once the model is large and only a handful of elements changed since the last open or
+sync. `ModelLogWriter.LastCompleteModelVersion` tracks the one thing that makes a shortcut safe:
+a model version (`cp.modelVersion`) a checkpoint confirmed the log matches EXACTLY — set only
+when that checkpoint was both `complete` and the document had no unsaved changes at that moment
+(`doc.IsModified == false`), and cleared on anything else (an interrupted pass, an edit made
+since, or a new log generation) — otherwise a user could edit, close without saving, and reopening
+would wrongly trust a log that already contains changes the saved file doesn't have.
+`ReconcileJob` hands that GUID to `Document.GetChangedElements`; on success (it throws for a GUID
+this document doesn't recognize — a different local copy, most likely — caught, not propagated)
+the diff's created/modified ids are each processed exactly as `ChangeCaptureJob` processes a live
+edit (same shared per-id write path, `ModelLogService.WriteOneElement`), and deleted ids are
+matched against the hash cache's own known `el` UniqueIds by their numeric tail (a UniqueId's hex
+after its last `-` — `src/ModelLog/UniqueIdElementId.cs`), since a deleted ElementId never
+resolves to anything Revit will hand back a UniqueId for. Falls back to the full walk whenever no
+baseline exists, the GUID is rejected, the diff touches a Grid, Level, Room/Space/Area,
+ViewSheet, Viewport, Phase or DesignOption (any of those can silently change OTHER, untouched
+elements' own derived fields without touching their own hash), OR — on the very first reconcile
+after an open — the PREVIOUS session didn't close cleanly (no closed `cp`, the same case that
+already writes a `gap`): a crash can leave live-edit records in the log that were never followed
+by a checkpoint, so the baseline's `modelVersion` is still the one from BEFORE those edits while
+`GetChangedElements` would report nothing changed — only a full reconcile re-derives the truth
+then. A later, in-session reconcile (after a sync) is unaffected by this last rule; only that
+first post-open one is ever gated by it. **NEEDS LIVE-REVIT CHECK:** whether
+a local copy's (as opposed to the central/cloud model's) own version history survives closing and
+reopening Revit at all — if it doesn't, `GetChangedElements` simply throws every time and every
+reconcile falls back to full, which is still correct, just not faster.
 
 **Keeping Revit responsive:**
 
@@ -403,6 +431,26 @@ Two independent fixes, same review pass:
   `_newGenerationOwed`, since it's no longer upgrade-only) instead of a plain reconcile. A plain
   reconcile and live change capture never rotate now, so the active segment can run slightly over
   64 MB until the next open/sync/reconcile catches it.
+
+## Round 9: incremental reconcile (2026-09-24)
+
+Every reconcile (open with an existing log, and after every sync/reload) re-walked and re-hashed
+every element just to find the handful that actually changed. Revit 2024+'s
+`Document.GetChangedElements(Guid baseVersion)` names exactly what changed since a prior version,
+so `ReconcileJob` now uses it when a trusted baseline exists (see "Incremental reconcile" above):
+`ModelLogState.LastCompleteModelVersion` (persisted, journaled like the other scalar fields),
+set only by a checkpoint that was both `complete` and caught the document unmodified
+(`ModelLogWriter.WriteCheckpoint`'s new `documentUnmodified` parameter, from `!doc.IsModified`),
+cleared by anything else and by `BeginNewGeneration`. The per-id write path is shared with live
+change capture (`ModelLogService.WriteOneElement`, extracted from `ChangeCaptureJob`'s own loop,
+which now also covers sheet/revision/material/link edits it previously left for the next full
+reconcile) so there is exactly one "how to turn one Revit element into a record". Deletions are
+matched by parsing the numeric ElementId out of a UniqueId's hex tail
+(`src/ModelLog/UniqueIdElementId.cs`, unit-tested, including a 64-bit id and malformed input) and
+looking it up against the hash cache's own known `el` ids — never asking Revit, which can no
+longer resolve a deleted id to anything. `cp` records also gained `modelSaves`
+(`DocumentVersion.NumberOfSaves`) alongside `modelVersion`, per the handoff's "version = GUID +
+number".
 
 ## Order, verification and done
 

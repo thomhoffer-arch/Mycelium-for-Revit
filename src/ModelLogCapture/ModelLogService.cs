@@ -17,8 +17,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
     /// <item>Model opened, no log yet → full snapshot (definitions, then every element/sheet/
     /// revision/link), then a checkpoint.</item>
     /// <item>Model opened, log exists, same producer version → gap (if the previous session
-    /// didn't close cleanly), then reconcile (write only what differs from the hash cache,
-    /// delete what's gone), then a checkpoint.</item>
+    /// didn't close cleanly), then reconcile: an INCREMENTAL pass over
+    /// <c>Document.GetChangedElements</c>'s diff against the last checkpoint's trusted baseline
+    /// when one exists (<see cref="ModelLogWriter.LastCompleteModelVersion"/>) and nothing in it
+    /// needs a full walk anyway (<see cref="RequiresFullReconcile"/>), else the full walk as
+    /// before — either way, delete what's gone, then a checkpoint.</item>
     /// <item>Model opened, log exists, producer version changed, OR the active segment is due
     /// for rotation → a NEW LOG GENERATION: a fresh segment (header, session, project, every
     /// definition re-emitted, full state of everything, deletion detection), then a checkpoint —
@@ -253,9 +256,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             else
             {
                 writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
+                // Read BEFORE WriteGapIfNeeded's own checkpoint-less write: reflects whether the
+                // PREVIOUS session closed cleanly. A crash leaves this false — the log may then
+                // hold edits made after LastCompleteModelVersion that the file on disk never saw
+                // (Revit died before any save), which GetChangedElements(baseline) can't know
+                // about; only a full reconcile re-derives the truth in that case.
+                var previousSessionClosedCleanly = writer.LastCheckpointClosed;
                 writer.WriteGapIfNeeded("no closed checkpoint from the previous session");
                 _walkOutstanding.Add(doc);
-                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, Generation(doc)));
+                _idle.Enqueue("reconcile-on-open",
+                    ReconcileJob(doc, writer, Generation(doc), allowIncremental: previousSessionClosedCleanly));
             }
         }
 
@@ -300,7 +310,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var version = SafeVersionGuid(doc);
             // Only "complete" if the last snapshot/reconcile actually finished — closing mid-walk
             // must not claim the log holds the whole model.
-            writer.WriteCheckpoint(complete: !_walkOutstanding.Contains(doc), modelVersion: version, elementCount: null, closed: true);
+            writer.WriteCheckpoint(complete: !_walkOutstanding.Contains(doc), modelVersion: version, elementCount: null, closed: true,
+                modelSaves: SafeModelSaves(doc), documentUnmodified: !SafeIsModified(doc));
             writer.Dispose();
             _writers.Remove(doc);
             _pending.Remove(doc);
@@ -432,23 +443,36 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
-            writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
+            writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false,
+                modelSaves: SafeModelSaves(doc), documentUnmodified: !SafeIsModified(doc));
         }
 
         /// <summary>An ordinary reconcile — same producer version as the last session, and the
         /// active segment isn't due for rotation (both handled by <see cref="SnapshotJob"/>'s
         /// <c>newGeneration</c> path instead — see <see cref="OnDocumentOpened"/> — so this never
         /// rotates the segment: rotating here would start one with only a header, never the full
-        /// state every segment must begin with). Only what differs from the hash cache is
-        /// written; deletion detection (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) always
-        /// runs, since that's the whole point of a reconcile (catching elements deleted while the
-        /// connector wasn't watching).</summary>
-        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen)
+        /// state every segment must begin with). Prefers the INCREMENTAL fast path — <see
+        /// cref="TryGetIncrementalDiff"/> plus <see cref="RequiresFullReconcile"/> — over the full
+        /// whole-model walk; either way deletion detection always runs, since that's the whole
+        /// point of a reconcile (catching elements deleted while the connector wasn't
+        /// watching). <paramref name="allowIncremental"/> is false only for the very first
+        /// reconcile after an open whose PREVIOUS session didn't close cleanly (see
+        /// <see cref="OnDocumentOpened"/>'s own comment) — every other caller (a post-sync
+        /// reconcile within this same, cleanly-running session) leaves it true.</summary>
+        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen, bool allowIncremental = true)
         {
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
+            var incremental = allowIncremental && TryGetIncrementalDiff(doc, writer, out var diff) && !RequiresFullReconcile(doc, diff!);
+            if (incremental)
+            {
+                foreach (var step in IncrementalReconcile(doc, writer, diff!, IsStale)) yield return step;
+            }
+            else
+            {
+                foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
+            }
             if (IsStale()) yield break; // see SnapshotJob
             _walkOutstanding.Remove(doc);
             ClearWalkCoveredPending(doc);
@@ -456,7 +480,140 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
-            writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
+            writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false,
+                modelSaves: SafeModelSaves(doc), documentUnmodified: !SafeIsModified(doc));
+        }
+
+        /// <summary>True, with <paramref name="diff"/> set, only when <paramref name="writer"/>
+        /// has a trusted baseline (<see cref="ModelLogWriter.LastCompleteModelVersion"/> — a
+        /// checkpoint that was both complete and caught the document with no unsaved changes) AND
+        /// <c>Document.GetChangedElements</c> accepts it. That call throws when the GUID is
+        /// invalid for THIS document (e.g. a different local copy whose version history doesn't
+        /// carry it — NEEDS LIVE-REVIT CHECK: whether a local copy's version history even
+        /// survives a reopen at all); either way, this just falls back to a full reconcile rather
+        /// than propagate the exception.</summary>
+        private static bool TryGetIncrementalDiff(Document doc, ModelLogWriter writer, out DocumentDifference? diff)
+        {
+            diff = null;
+            if (writer.LastCompleteModelVersion is not { } baseline || !Guid.TryParse(baseline, out var baseGuid))
+                return false;
+            try { diff = doc.GetChangedElements(baseGuid); }
+            catch { diff = null; }
+            return diff is not null;
+        }
+
+        // Kept deliberately small (the task's own instruction): a changed Grid/Level/Room-Space-
+        // Area shifts OTHER, unchanged elements' own derived fields (grid label, storey/space
+        // reference), and a changed ViewSheet/Viewport/Phase/DesignOption can change what an
+        // element's own `sheets`/`rel` fields resolve to — none of that shows up as a hash change
+        // on the element itself, so an incremental pass touching any of these can't be trusted;
+        // fall back to the full walk instead. Only checked against CREATED/MODIFIED ids (a
+        // deleted one of these can't be resolved to a type any more to check) — a rare gap this
+        // repo's existing "next full pass catches up" property already covers eventually.
+        private static bool RequiresFullReconcile(Document doc, DocumentDifference diff)
+        {
+            foreach (var id in diff.GetCreatedElementIds().Concat(diff.GetModifiedElementIds()))
+            {
+                var el = doc.GetElement(id);
+                if (el is Grid or Level or SpatialElement or ViewSheet or Viewport or Phase or DesignOption)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>The <c>GetChangedElements</c> fast path: processes only what <paramref
+        /// name="diff"/> reports created/modified, reusing <see cref="WriteOneElement"/> — the
+        /// exact per-id logic <see cref="ChangeCaptureJob"/>'s edit loop uses, so there is no
+        /// second copy of "how to turn one Revit element into a record". A created/modified
+        /// <see cref="IndependentTag"/> in the diff also refreshes the tag-per-sheet index once
+        /// (so `sheets` catches up on every element it tags). Deleted ids are matched against the
+        /// hash cache's own known `el` UniqueIds by their numeric tail (<see
+        /// cref="UniqueIdElementId"/>) — <c>GetDeletedElementIds()</c> only ever gives numbers,
+        /// never resolvable to a live Element or UniqueId any more; an id with no match simply
+        /// isn't in the log.</summary>
+        private IEnumerable<bool> IncrementalReconcile(
+            Document doc, ModelLogWriter writer, DocumentDifference diff, Func<bool> isStale)
+        {
+            // Same "read fresh, after every pending edit up to this instant" guarantee WalkModel's
+            // own first step gives — see MarkWalkElementSnapshot's doc comment.
+            MarkWalkElementSnapshot(doc);
+
+            if (!_indexCache.TryGetValue(doc, out var cache))
+                _indexCache[doc] = cache = new IndexCache
+                {
+                    NodeIndex = BuildNodeIndex(doc),
+                    GridLines = BuildGridLines(doc),
+                    TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc),
+                };
+            yield return true;
+
+            // A HashSet, not a list: a touched tag (below) adds its own tagged element ids into
+            // this same set, and those must be deduplicated against whatever's already in it.
+            var changedIds = new HashSet<ElementId>(diff.GetCreatedElementIds());
+            changedIds.UnionWith(diff.GetModifiedElementIds());
+
+            var touchedTags = new List<ElementId>();
+            var touchesSheet = false;
+            foreach (var id in changedIds)
+            {
+                var el = doc.GetElement(id);
+                if (el is IndependentTag) touchedTags.Add(id);
+                else if (el is ViewSheet) touchesSheet = true;
+            }
+
+            if (touchedTags.Count > 0 || touchesSheet)
+            {
+                cache.TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
+                yield return true;
+
+                // Rule: a touched IndependentTag also gets its OWN tagged elements reprocessed —
+                // their `sheets` field can change even though the elements themselves weren't
+                // otherwise edited.
+                foreach (var tagId in touchedTags)
+                {
+                    if (doc.GetElement(tagId) is not IndependentTag tag) continue;
+                    try { foreach (var tid in tag.GetTaggedLocalElementIds()) changedIds.Add(tid); }
+                    catch { /* tag geometry unresolvable — its own record still got the fresh index above */ }
+                }
+            }
+
+            var defaultPhase = ElementContextReader.DefaultPhase(doc, null);
+            var typeIds = new HashSet<ElementId>();
+            void OnParamDef(Parameter p, bool isType)
+            {
+                var id = RecordBuilder.ParamDefId(p);
+                if (id is null) return;
+                writer.WriteIfUnseen(RecordKinds.Pdef, id, RecordBuilder.BuildParamDef(p, isType));
+            }
+
+            foreach (var id in changedIds)
+            {
+                if (isStale()) yield break;
+                var el = doc.GetElement(id);
+                if (el is null) { yield return true; continue; }
+                WriteOneElement(doc, writer, el, cache.NodeIndex, cache.GridLines, defaultPhase, cache.TaggedSheets,
+                    typeIds, OnParamDef, forceFullState: false);
+                yield return true;
+            }
+
+            var deletedIds = diff.GetDeletedElementIds();
+            if (deletedIds.Count == 0) yield break;
+
+            // Built ONCE for the whole batch, not per deleted id — a per-id linear scan over a
+            // large model's known ids would make a big deletion batch quadratic.
+            var knownByTail = new Dictionary<long, string>();
+            foreach (var uid in writer.KnownElementUniqueIds())
+                if (UniqueIdElementId.TryGetElementIdTail(uid, out var tail))
+                    knownByTail[tail] = uid;
+            yield return true;
+
+            foreach (var deletedId in deletedIds)
+            {
+                if (isStale()) yield break;
+                if (knownByTail.TryGetValue(deletedId.Value, out var uid))
+                    writer.WriteDelete(uid, deletedId.Value);
+                yield return true;
+            }
         }
 
         /// <summary>Called as the very FIRST step of <see cref="WalkModel"/>, before any section
@@ -497,6 +654,82 @@ namespace Loam.Revit.Connector.ModelLogCapture
                     p.Modified.ExceptWith(covered);
                 }
             }
+        }
+
+        /// <summary>Writes (or updates) whatever record kind ONE element maps to — Level/Grid/
+        /// SpatialElement each get their own live `node`/`grid` record; anything else loggable
+        /// gets its type record (once per batch, via <paramref name="typeIds"/>) and its own
+        /// `el` record. The single per-id write path <see cref="ChangeCaptureJob"/>'s edit loop
+        /// and <see cref="IncrementalReconcile"/> both use, so "how to turn one Revit element
+        /// into a record" exists exactly once.</summary>
+        private static void WriteOneElement(
+            Document doc, ModelLogWriter writer, Element el,
+            Dictionary<ElementId, string> nodeIdByLevelOrSpace, List<(string Name, Line Line)> gridLines,
+            Phase? defaultPhase, IReadOnlyDictionary<ElementId, List<string>> taggedSheets,
+            HashSet<ElementId> typeIds, Action<Parameter, bool> onParamDef, bool forceFullState)
+        {
+            if (el is Level lvl)
+            {
+                var nid = RecordBuilder.NodeId(lvl.Id);
+                nodeIdByLevelOrSpace[lvl.Id] = nid;
+                writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildLevelNode(lvl), forceFullState);
+                return;
+            }
+            if (el is SpatialElement space)
+            {
+                ElementId? levelId = null;
+                try { levelId = space.LevelId; } catch { }
+                var nid = RecordBuilder.NodeId(space.Id);
+                nodeIdByLevelOrSpace[space.Id] = nid;
+                writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildSpaceNode(space, levelId), forceFullState);
+                return;
+            }
+            if (el is Grid grid)
+            {
+                writer.WriteIfChanged(RecordKinds.Grid, grid.UniqueId, RecordBuilder.BuildGrid(grid), forceFullState);
+                if (grid.Curve is Line gridLine) gridLines.Add((grid.Name, gridLine));
+                return;
+            }
+            // Sheet/revision/material/link are their own record kinds (never `el` — see
+            // RecordBuilder.IsLoggableModelElement, which excludes ViewSheet/Material outright).
+            // WalkModel's full reconcile always covers these via their own OfClass sections;
+            // added here so the incremental path (and ChangeCaptureJob, sharing this method) is
+            // no less complete.
+            if (el is ViewSheet sheet)
+            {
+                writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
+                return;
+            }
+            if (el is Revision rev)
+            {
+                writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
+                return;
+            }
+            if (el is Material mat)
+            {
+                writer.WriteIfChanged(RecordKinds.Mat, RecordBuilder.MaterialId(mat.Id), RecordBuilder.BuildMaterial(mat), forceFullState);
+                return;
+            }
+            if (el is RevitLinkInstance link)
+            {
+                ModelFacts? linkedFacts = null;
+                try { var linkDoc = link.GetLinkDocument(); if (linkDoc is not null) linkedFacts = ModelFacts.From(linkDoc); } catch { }
+                writer.WriteIfChanged(RecordKinds.Link, link.UniqueId, RecordBuilder.BuildLink(link, linkedFacts), forceFullState);
+                return;
+            }
+
+            if (!RecordBuilder.IsLoggableModelElement(el)) return;
+
+            var typeElId = el.GetTypeId();
+            if (typeElId != ElementId.InvalidElementId && typeIds.Add(typeElId) &&
+                doc.GetElement(typeElId) is ElementType type)
+            {
+                writer.WriteIfChanged(RecordKinds.Type, RecordBuilder.TypeId(typeElId),
+                    RecordBuilder.BuildType(type, onParamDef), forceFullState);
+            }
+
+            var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, onParamDef, taggedSheets);
+            writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields, forceFullState);
         }
 
         /// <summary>Rebuilds the whole-document node/grid/tagged-sheet indexes ONCE, right after
@@ -569,46 +802,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 var el = doc.GetElement(elId);
                 if (el is null) { yield return true; continue; }
 
-                // Levels/spaces/grids are `node`/`grid` records, not `el` — an edit to one of
-                // these must update ITS OWN record live, not wait for the next reconcile.
-                if (el is Level lvl)
-                {
-                    var nid = RecordBuilder.NodeId(lvl.Id);
-                    nodeIdByLevelOrSpace[lvl.Id] = nid;
-                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildLevelNode(lvl));
-                    yield return true;
-                    continue;
-                }
-                if (el is SpatialElement space)
-                {
-                    ElementId? levelId = null;
-                    try { levelId = space.LevelId; } catch { }
-                    var nid = RecordBuilder.NodeId(space.Id);
-                    nodeIdByLevelOrSpace[space.Id] = nid;
-                    writer.WriteIfChanged(RecordKinds.Node, nid, RecordBuilder.BuildSpaceNode(space, levelId));
-                    yield return true;
-                    continue;
-                }
-                if (el is Grid grid)
-                {
-                    writer.WriteIfChanged(RecordKinds.Grid, grid.UniqueId, RecordBuilder.BuildGrid(grid));
-                    if (grid.Curve is Line gridLine) gridLines.Add((grid.Name, gridLine));
-                    yield return true;
-                    continue;
-                }
-
-                if (!RecordBuilder.IsLoggableModelElement(el)) { yield return true; continue; }
-
-                var typeElId = el.GetTypeId();
-                if (typeElId != ElementId.InvalidElementId && typeIds.Add(typeElId) &&
-                    doc.GetElement(typeElId) is ElementType type)
-                {
-                    writer.WriteIfChanged(RecordKinds.Type, RecordBuilder.TypeId(typeElId),
-                        RecordBuilder.BuildType(type, OnParamDef));
-                }
-
-                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef, taggedSheets);
-                writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields);
+                WriteOneElement(doc, writer, el, nodeIdByLevelOrSpace, gridLines, defaultPhase, taggedSheets,
+                    typeIds, OnParamDef, forceFullState: false);
                 yield return true;
             }
 
@@ -834,6 +1029,25 @@ namespace Loam.Revit.Connector.ModelLogCapture
         {
             try { return new FilteredElementCollector(doc).WhereElementIsNotElementType().GetElementCount(); }
             catch { return 0; }
+        }
+
+        /// <summary>The handoff's "version = GUID + number": <c>DocumentVersion.NumberOfSaves</c>,
+        /// an additive `cp.modelSaves` field alongside `cp.modelVersion` — never a replacement.</summary>
+        private static int? SafeModelSaves(Document doc)
+        {
+            try { return Document.GetDocumentVersion(doc)?.NumberOfSaves; }
+            catch { return null; }
+        }
+
+        /// <summary>Whether the document has unsaved changes right now — the signal a checkpoint
+        /// needs to know its <c>modelVersion</c> can be trusted as a future incremental
+        /// reconcile's baseline (see <see cref="ModelLogWriter.WriteCheckpoint"/>). Unknown (the
+        /// property throws) is treated as modified — the safe direction: it just means the
+        /// baseline isn't set, never that a wrong one is trusted.</summary>
+        private static bool SafeIsModified(Document doc)
+        {
+            try { return doc.IsModified; }
+            catch { return true; }
         }
     }
 }

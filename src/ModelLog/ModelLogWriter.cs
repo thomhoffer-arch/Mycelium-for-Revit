@@ -71,6 +71,19 @@ namespace Loam.Revit.Connector.ModelLog
         /// full reconcile (with deletion detection) is owed, per docs/MODEL_LOG.md.</summary>
         public string? LastProducerVersion => _state.LastProducerVersion;
 
+        /// <summary>The model version a checkpoint last confirmed the log matched EXACTLY — see
+        /// <see cref="ModelLogState.LastCompleteModelVersion"/>'s own doc comment. The only
+        /// baseline <see cref="ModelLogCapture.ModelLogService.ReconcileJob"/> may hand to
+        /// <c>Document.GetChangedElements</c> for an incremental reconcile.</summary>
+        public string? LastCompleteModelVersion => _state.LastCompleteModelVersion;
+
+        /// <summary>Every UniqueId this log's hash cache currently knows for the <c>el</c>
+        /// family — the set an incremental reconcile's deletion matching builds its numeric-
+        /// ElementId reverse map from (<c>DocumentDifference.GetDeletedElementIds()</c> only ever
+        /// gives numbers, never resolvable to a UniqueId any more — see
+        /// <see cref="UniqueIdElementId"/>).</summary>
+        public IEnumerable<string> KnownElementUniqueIds() => _state.Cache.KnownIds(RecordKinds.El);
+
         public ModelLogWriter(string modelLogRoot, string modelId)
         {
             LogDirectory = Path.Combine(modelLogRoot, SanitizeForPath(modelId));
@@ -223,6 +236,10 @@ namespace Loam.Revit.Connector.ModelLog
 
             _state.Cache.PdefSeen.Clear();
             _state.Cache.CatSeen.Clear();
+            // A new generation's records may differ from whatever an incremental reconcile would
+            // assume still holds (e.g. a corrected `spec`) — never trust a pre-generation
+            // baseline for GetChangedElements after this.
+            _state.LastCompleteModelVersion = null;
 
             _journalBuffer.Add(StateJournal.MetaOp(_state));
             FlushJournalBuffer();
@@ -234,8 +251,19 @@ namespace Loam.Revit.Connector.ModelLog
         /// <summary>Checkpoint: end of snapshot/reconcile, after sync, or on close.
         /// <paramref name="closed"/> true only on <c>DocumentClosing</c> — its presence (or
         /// absence, checked on the NEXT open) is what tells a reader "Revit closed cleanly" from
-        /// "the connector crashed mid-session".</summary>
-        public void WriteCheckpoint(bool complete, string? modelVersion, int? elementCount, bool closed)
+        /// "the connector crashed mid-session". <paramref name="modelSaves"/> is
+        /// <c>DocumentVersion.NumberOfSaves</c> when known — an additive field alongside
+        /// <paramref name="modelVersion"/> (the handoff's "version = GUID + number"), never a
+        /// replacement for it. <paramref name="documentUnmodified"/> — pass <c>!doc.IsModified</c>
+        /// — is what makes <paramref name="modelVersion"/> trustworthy as the NEXT reconcile's
+        /// incremental baseline: only a checkpoint that is both <paramref name="complete"/> and
+        /// caught the document with no unsaved changes proves the log exactly matches that SAVED
+        /// version (see <see cref="ModelLogState.LastCompleteModelVersion"/>); anything else
+        /// clears the baseline rather than risk it being wrong (e.g. edits made, then the model
+        /// closed without saving — reopening must not skip re-checking those edits).</summary>
+        public void WriteCheckpoint(
+            bool complete, string? modelVersion, int? elementCount, bool closed,
+            int? modelSaves = null, bool documentUnmodified = false)
         {
             if (LockHeldElsewhere) return;
             var fields = new JsonObject
@@ -246,10 +274,12 @@ namespace Loam.Revit.Connector.ModelLog
             };
             if (modelVersion is not null) fields["modelVersion"] = modelVersion;
             if (elementCount is not null) fields["elementCount"] = elementCount.Value;
+            if (modelSaves is not null) fields["modelSaves"] = modelSaves.Value;
             Append(RecordKinds.Checkpoint, fields);
 
             _state.LastCheckpointClosed = closed;
             _state.LastModelVersion = modelVersion;
+            _state.LastCompleteModelVersion = (complete && documentUnmodified) ? modelVersion : null;
             _journalBuffer.Add(StateJournal.MetaOp(_state));
             FlushJournalBuffer();
             MaybeCompact();
