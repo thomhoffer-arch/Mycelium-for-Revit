@@ -68,12 +68,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             public Dictionary<ElementId, string> NodeIndex = new();
             public List<(string Name, Line Line)> GridLines = new();
             public Dictionary<ElementId, List<string>> TaggedSheets = new();
+            public Dictionary<ElementId, List<string>> HostedIndex = new();
         }
 
-        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null)
+        private readonly int _retentionDays;
+
+        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null, int retentionDays = 90)
         {
             _modelLogRoot = modelLogRoot;
             _producerVersion = producerVersion;
+            _retentionDays = retentionDays;
             _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }), onJobFailed: (_, __) => { });
         }
 
@@ -215,7 +219,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
         public void OnDocumentOpened(Document doc)
         {
             var facts = ModelFacts.From(doc);
-            var writer = new ModelLogWriter(_modelLogRoot, ModelId(doc, facts));
+            var writer = new ModelLogWriter(_modelLogRoot, ModelId(doc, facts), _retentionDays);
             if (writer.LockHeldElsewhere)
             {
                 // Another Revit session already writes this model's log — per the handoff's
@@ -456,7 +460,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.Append(RecordKinds.Project, RecordBuilder.BuildProject(doc));
             yield return true;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: newGeneration, IsStale)) yield return step;
+            var indexCache = new IndexCache();
+            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: newGeneration, IsStale, indexCache)) yield return step;
             // Interrupted by a sync/reload/close: never checkpoint a partial walk as complete.
             // After a sync/reload the post-event has already queued this snapshot again.
             if (IsStale()) yield break;
@@ -464,7 +469,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _newGenerationOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             ClearWalkCoveredPending(doc);
-            RefreshIndexCache(doc);
+            // WalkModel already built this — no second whole-document walk to redo it.
+            _indexCache[doc] = indexCache;
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
@@ -495,18 +501,23 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // and assigned via a plain `out diff` instead of `out var diff`.
             DocumentDifference? diff = null;
             var incremental = allowIncremental && TryGetIncrementalDiff(doc, writer, out diff) && !RequiresFullReconcile(doc, diff!);
+            IndexCache? freshIndexCache = null;
             if (incremental)
             {
                 foreach (var step in IncrementalReconcile(doc, writer, diff!, IsStale)) yield return step;
             }
             else
             {
-                foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
+                freshIndexCache = new IndexCache();
+                foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale, freshIndexCache)) yield return step;
             }
             if (IsStale()) yield break; // see SnapshotJob
             _walkOutstanding.Remove(doc);
             ClearWalkCoveredPending(doc);
-            RefreshIndexCache(doc);
+            if (freshIndexCache is not null)
+                _indexCache[doc] = freshIndexCache; // the full walk already built this — no second whole-document walk
+            else
+                RefreshIndexCache(doc); // incremental pass only merges in what changed — this purges anything deleted
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
@@ -624,7 +635,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 var el = doc.GetElement(id);
                 if (el is null) { yield return true; continue; }
                 WriteOneElement(doc, writer, el, cache.NodeIndex, cache.GridLines, defaultPhase, cache.TaggedSheets,
-                    typeIds, OnParamDef, forceFullState: false);
+                    typeIds, OnParamDef, forceFullState: false, cache.HostedIndex);
                 yield return true;
             }
 
@@ -734,7 +745,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
             Document doc, ModelLogWriter writer, Element el,
             Dictionary<ElementId, string> nodeIdByLevelOrSpace, List<(string Name, Line Line)> gridLines,
             Phase? defaultPhase, IReadOnlyDictionary<ElementId, List<string>> taggedSheets,
-            HashSet<ElementId> typeIds, Action<Parameter, bool> onParamDef, bool forceFullState)
+            HashSet<ElementId> typeIds, Action<Parameter, bool> onParamDef, bool forceFullState,
+            IReadOnlyDictionary<ElementId, List<string>>? hostedIndex = null,
+            IReadOnlyDictionary<string, List<string>>? sheetElements = null,
+            IReadOnlyDictionary<ElementId, List<string>>? sheetsByRevision = null,
+            IReadOnlyDictionary<ElementId, List<string>>? cloudsByRevision = null)
         {
             if (el is Level lvl)
             {
@@ -765,12 +780,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // no less complete.
             if (el is ViewSheet sheet)
             {
-                writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
+                writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet, sheetElements), forceFullState);
                 return;
             }
             if (el is Revision rev)
             {
-                writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
+                writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId,
+                    RecordBuilder.BuildRevision(rev, sheetsByRevision, cloudsByRevision), forceFullState);
                 return;
             }
             if (el is Material mat)
@@ -796,7 +812,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                     RecordBuilder.BuildType(type, onParamDef), forceFullState);
             }
 
-            var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, onParamDef, taggedSheets);
+            var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, onParamDef, taggedSheets, hostedIndex);
             writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields, forceFullState);
         }
 
@@ -871,7 +887,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 if (el is null) { yield return true; continue; }
 
                 WriteOneElement(doc, writer, el, nodeIdByLevelOrSpace, gridLines, defaultPhase, taggedSheets,
-                    typeIds, OnParamDef, forceFullState: false);
+                    typeIds, OnParamDef, forceFullState: false, cache.HostedIndex);
                 yield return true;
             }
 
@@ -897,8 +913,15 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// BOTH — the handoff's "self-healing" property (catches edits made while the connector
         /// wasn't running, or by another user, regardless of whether DocumentChanged ever
         /// reported them) plus backfilling whatever the new version adds.</summary>
+        /// <param name="cache">Filled IN PLACE as the walk goes (node/grid/tag-sheet indexes) —
+        /// the SAME structures <see cref="RefreshIndexCache"/> used to rebuild with a whole
+        /// SECOND document walk right after this one finished. The caller commits it to
+        /// <c>_indexCache[doc]</c> itself, only once its own staleness check after this method
+        /// confirms the pass actually completed — same "only refresh on confirmed success" rule
+        /// <see cref="RefreshIndexCache"/> always followed, just without the redundant
+        /// re-walk.</param>
         private IEnumerable<bool> WalkModel(
-            Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions, Func<bool> isStale)
+            Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions, Func<bool> isStale, IndexCache cache)
         {
             // Snapshot taken before ANY section below (levels/rooms/grids are walked before the
             // element section) — see MarkWalkElementSnapshot's own doc comment for why this must
@@ -919,7 +942,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 yield return true;
             }
 
-            var nodeIdByLevelOrSpace = new Dictionary<ElementId, string>();
+            var nodeIdByLevelOrSpace = cache.NodeIndex;
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Level))))
             {
                 if (isStale()) yield break;
@@ -949,7 +972,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 yield return true;
             }
 
-            var gridLines = new List<(string, Line)>();
+            var gridLines = cache.GridLines;
             var seenGridIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Grid))))
             {
@@ -977,7 +1000,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
 
             var defaultPhase = ElementContextReader.DefaultPhase(doc, null);
-            var taggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
+            cache.TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
+            var taggedSheets = cache.TaggedSheets;
+            cache.HostedIndex = RecordBuilder.BuildHostedIndex(doc);
+            var hostedIndex = cache.HostedIndex;
             var typeIds = new HashSet<ElementId>();
             void OnParamDef(Parameter p, bool isType)
             {
@@ -1006,10 +1032,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
                         RecordBuilder.BuildType(type, OnParamDef), forceFullState);
                 }
 
-                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef, taggedSheets);
+                var fields = RecordBuilder.BuildElementFields(el, nodeIdByLevelOrSpace, gridLines, defaultPhase, OnParamDef, taggedSheets, hostedIndex);
                 writer.WriteIfChanged(RecordKinds.El, el.UniqueId, fields, forceFullState);
                 yield return true;
             }
+
+            // Reuses taggedSheets (already built above) for the tagged half — see its own doc
+            // comment. One more whole-document walk (dimensions), same cost class as taggedSheets
+            // itself, paid once per full pass, never per element.
+            var sheetElements = RecordBuilder.BuildSheetElementIndex(doc, taggedSheets);
+            yield return true;
 
             var seenSheetIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(ViewSheet))))
@@ -1018,10 +1050,15 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 if (doc.GetElement(id) is ViewSheet sheet)
                 {
                     seenSheetIds.Add(sheet.UniqueId);
-                    writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
+                    writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet, sheetElements), forceFullState);
                 }
                 yield return true;
             }
+
+            var sheetsByRevision = RecordBuilder.BuildRevisionSheetIndex(doc);
+            var cloudsByRevision = RecordBuilder.BuildRevisionCloudIndex(doc);
+            yield return true;
+
             var seenRevIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Revision))))
             {
@@ -1029,7 +1066,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 if (doc.GetElement(id) is Revision rev)
                 {
                     seenRevIds.Add(rev.UniqueId);
-                    writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
+                    writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId,
+                        RecordBuilder.BuildRevision(rev, sheetsByRevision, cloudsByRevision), forceFullState);
                 }
                 yield return true;
             }

@@ -48,6 +48,7 @@ namespace ModelLog.Tests
             using var w = new ModelLogWriter(_root, "model-a");
             w.WriteHeader(new JsonObject { ["title"] = "Test.rvt" });
             w.WriteHeader(new JsonObject { ["title"] = "Test.rvt" });
+            w.FlushState(); // the log is no longer flushed per line — see LogSegmentWriter.AppendLine
 
             var lines = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl"));
             Assert.Single(lines, l => l.Contains("\"k\":\"header\""));
@@ -89,6 +90,7 @@ namespace ModelLog.Tests
             var wrote = w.WriteIfChanged(RecordKinds.El, "guid-1", updated);
             Assert.True(wrote);
             Assert.Equal(seqBefore + 1, w.LastSeq);
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -104,6 +106,7 @@ namespace ModelLog.Tests
 
             var cleared = new JsonObject { ["q"] = new JsonObject { ["length"] = 20.997, ["height"] = 10.006 } };
             w.WriteIfChanged(RecordKinds.El, "guid-1", cleared);
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -117,6 +120,7 @@ namespace ModelLog.Tests
             using var w = new ModelLogWriter(_root, "model-a");
             w.WriteIfChanged(RecordKinds.El, "guid-1", El(20.997, 10.006, "W-12"));
             w.WriteDelete("guid-1");
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -130,6 +134,7 @@ namespace ModelLog.Tests
         {
             using var w = new ModelLogWriter(_root, "model-a");
             w.WriteDelete("guid-2", 303793);
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -167,6 +172,7 @@ namespace ModelLog.Tests
             using var w = new ModelLogWriter(_root, "model-a");
             w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
             w.WriteDelete("guid-1"); // default family: el
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Seg(1)).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -185,6 +191,7 @@ namespace ModelLog.Tests
         {
             using var w = new ModelLogWriter(_root, "model-a");
             w.WriteDelete("some-id", family: family);
+            w.FlushState();
 
             var lastLine = File.ReadAllLines(Seg(1)).Last();
             var parsed = JsonNode.Parse(lastLine)!.AsObject();
@@ -558,6 +565,7 @@ namespace ModelLog.Tests
             w.BeginChange(new JsonObject { ["modified"] = 1 }, deleted: 0);
             w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 2, "W"));
             w.EndChange();
+            w.FlushState();
 
             var kinds = File.ReadAllLines(Seg(1)).Select(l => JsonNode.Parse(l)!["k"]!.GetValue<string>()).ToList();
             Assert.Equal(new[] { "el", "chg", "el" }, kinds);
@@ -569,6 +577,7 @@ namespace ModelLog.Tests
             using var w = new ModelLogWriter(_root, "model-a");
             w.BeginChange(new JsonObject { ["deleted"] = 2 }, deleted: 2);
             w.EndChange();
+            w.FlushState();
 
             Assert.Single(File.ReadAllLines(Seg(1)), l => l.Contains("\"k\":\"chg\""));
         }
@@ -600,6 +609,7 @@ namespace ModelLog.Tests
 
             using var reopened = new ModelLogWriter(_root, "model-a");
             Assert.Equal(10, reopened.Append(RecordKinds.Project, new JsonObject()));
+            reopened.FlushState();
             Assert.Equal(2, File.ReadAllLines(Seg(2)).Length);
         }
 
@@ -638,6 +648,57 @@ namespace ModelLog.Tests
             Assert.Null(ex); // constructor/writes must not throw despite the owner's open handle
             Assert.True(File.Exists(tmp)); // the owner's in-flight file was left alone
             Assert.Equal(linesBefore, File.ReadAllLines(Seg(1)).Length); // second writer wrote nothing
+        }
+
+        private static void MakeOldGzSegment(string dir, int n, int daysOld)
+        {
+            var path = Path.Combine(dir, $"{n:D6}.jsonl.gz");
+            File.WriteAllBytes(path, new byte[] { 0x1f, 0x8b }); // just needs to exist + parse as a segment number
+            File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-daysOld));
+        }
+
+        [Fact]
+        public void Retention_DeletesOldFinishedSegments_KeepsNewestAndActive()
+        {
+            var dir = Path.Combine(_root, "model-a");
+            Directory.CreateDirectory(dir);
+            MakeOldGzSegment(dir, 1, daysOld: 120);
+            MakeOldGzSegment(dir, 2, daysOld: 100);
+            MakeOldGzSegment(dir, 3, daysOld: 10); // newest finished — kept regardless of age
+
+            using var w = new ModelLogWriter(_root, "model-a", retentionDays: 90);
+
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl.gz"))); // older than retention
+            Assert.False(File.Exists(Path.Combine(dir, "000002.jsonl.gz"))); // older than retention
+            Assert.True(File.Exists(Path.Combine(dir, "000003.jsonl.gz"))); // newest finished segment — always kept
+        }
+
+        [Fact]
+        public void Retention_Disabled_WhenNonPositive()
+        {
+            var dir = Path.Combine(_root, "model-a");
+            Directory.CreateDirectory(dir);
+            MakeOldGzSegment(dir, 1, daysOld: 400);
+
+            using var w = new ModelLogWriter(_root, "model-a", retentionDays: 0);
+
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+        }
+
+        [Fact]
+        public void Retention_NeverAppliedByNonOwningWriter()
+        {
+            var dir = Path.Combine(_root, "model-a");
+            Directory.CreateDirectory(dir);
+            using var w1 = new ModelLogWriter(_root, "model-a"); // holds the lock
+            MakeOldGzSegment(dir, 1, daysOld: 400);
+            MakeOldGzSegment(dir, 2, daysOld: 400); // "newest" from w2's perspective, still shouldn't matter
+
+            using var w2 = new ModelLogWriter(_root, "model-a", retentionDays: 90);
+
+            Assert.True(w2.LockHeldElsewhere);
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+            Assert.True(File.Exists(Path.Combine(dir, "000002.jsonl.gz")));
         }
 
         [Fact]
@@ -694,6 +755,7 @@ namespace ModelLog.Tests
             w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" });
 
             w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+            w.FlushState();
 
             var firstLine = File.ReadAllLines(Seg(2)).First();
             var parsed = JsonNode.Parse(firstLine)!.AsObject();
@@ -776,6 +838,7 @@ namespace ModelLog.Tests
             seg.AppendLine("{\"seq\":1}");
             seg.Rotate(); // must not block on gzip — the new segment is already open here
             seg.AppendLine("{\"seq\":2}");
+            seg.Flush();
 
             Assert.True(seg.WaitForBackgroundCompression(CompressionWait));
             Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));

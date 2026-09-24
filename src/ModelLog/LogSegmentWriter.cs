@@ -9,13 +9,16 @@ namespace Loam.Revit.Connector.ModelLog
 {
     /// <summary>
     /// The append-only segment file itself: opens/creates the active plain-text <c>.jsonl</c>
-    /// segment, appends complete lines with an immediate flush (crash safety — the handoff's
-    /// rule #1: "append one complete line, then flush. A reader ignores a torn last line." A
-    /// process crash between the write and the flush leaves nothing new on disk at all; this
-    /// flushes to the OS, which survives OUR process dying — the failure mode this guards
-    /// against — without paying for an fsync on every single line, which large-model snapshots
-    /// (hundreds of thousands of lines) can't afford), and rotates a finished segment once it
-    /// crosses the size threshold.
+    /// segment, appends complete lines (crash safety — the handoff's rule #1: "append one
+    /// complete line, then flush. A reader ignores a torn last line." A process crash between
+    /// the write and the flush leaves nothing new on disk at all; flushing to the OS survives
+    /// OUR process dying — the failure mode this guards against). <see cref="AppendLine"/>
+    /// itself no longer flushes on every call — measured as a real cost on a large snapshot
+    /// (tens of thousands of syscalls) — <see cref="Flush"/> is called once per idle slice
+    /// instead (see <c>ModelLogWriter.FlushJournalBuffer</c>), which still satisfies rule #1 at
+    /// that coarser grain: nothing is ever reported written (a checkpoint, a session record, …)
+    /// before its lines were flushed. Rotates a finished segment once it crosses the size
+    /// threshold.
     ///
     /// Gzip runs off this thread: <see cref="Rotate"/> closes the finished segment and opens the
     /// next one immediately (so writing resumes at once), then hands the finished file to a
@@ -106,15 +109,42 @@ namespace Loam.Revit.Connector.ModelLog
             _writer = new StreamWriter(_fileStream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
         }
 
-        public long CurrentSizeBytes => _fileStream?.Length ?? 0;
+        /// <summary>Flushes first — <see cref="AppendLine"/> no longer flushes per line, so
+        /// unflushed bytes still sitting in the <see cref="StreamWriter"/>'s own buffer wouldn't
+        /// otherwise show up in <see cref="FileStream.Length"/> yet, and a caller (<see
+        /// cref="ShouldRotate"/>, <c>ModelLogWriter.BeginNewGeneration</c>'s own "does this
+        /// segment already have content" check) needs the TRUE current size, not a stale
+        /// under-count. Only paid at these infrequent, pass-boundary checks — never per
+        /// record.</summary>
+        public long CurrentSizeBytes
+        {
+            get
+            {
+                _writer?.Flush();
+                return _fileStream?.Length ?? 0;
+            }
+        }
 
-        /// <summary>Appends one complete JSON line + <c>\n</c>, then flushes.</summary>
+        /// <summary>Appends one complete JSON line + <c>\n</c> — buffered, NOT flushed (see
+        /// <see cref="Flush"/>). Flushing after every single line was measured as a real cost on
+        /// a large snapshot (tens of thousands of small syscalls); the crash-safety rule this
+        /// used to satisfy on its own ("append one complete line, then flush") now holds at the
+        /// coarser grain of one flush per idle slice instead — still well within the "a reader
+        /// ignores a torn last line" guarantee, since nothing this buffers is ever reported
+        /// written (a checkpoint, a session record, …) without <see cref="Flush"/> having run
+        /// first (see <c>ModelLogWriter.FlushJournalBuffer</c>).</summary>
         public void AppendLine(string json)
         {
             _writer!.Write(json);
             _writer.Write('\n');
-            _writer.Flush();
         }
+
+        /// <summary>Flushes any buffered lines to the OS — cheap (no fsync), survives OUR
+        /// process dying, which is the failure mode this guards against. Called once per idle
+        /// slice (<c>ModelLogWriter.FlushState</c>) and before anything (a checkpoint, a session
+        /// record, a rotation) persists state that depends on those lines already being durable
+        /// — see crash-safety rule #2.</summary>
+        public void Flush() => _writer?.Flush();
 
         public bool ShouldRotate() => CurrentSizeBytes >= RotateAtBytes;
 

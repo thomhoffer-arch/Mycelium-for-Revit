@@ -172,6 +172,23 @@ namespace Loam.Revit.Connector.ModelLogCapture
                     if (ns is not null || ew is not null || elev is not null)
                         coords["surveyPoint"] = new JsonObject { ["e"] = ew, ["n"] = ns, ["elev"] = elev };
                 }
+
+                // The doc comment above has always promised this — it just never actually
+                // computed it. ActiveProjectLocation.GetTotalTransform() is what actually maps
+                // this model's internal coordinates into shared coordinates (project base
+                // point/angle above describe survey placement; this is the transform a linked
+                // model or another document's shared coordinates would use).
+                var transform = doc.ActiveProjectLocation?.GetTotalTransform();
+                if (transform is not null)
+                {
+                    coords["sharedTransform"] = new JsonObject
+                    {
+                        ["origin"] = ToArray(transform.Origin),
+                        ["basisX"] = ToArray(transform.BasisX),
+                        ["basisY"] = ToArray(transform.BasisY),
+                        ["basisZ"] = ToArray(transform.BasisZ),
+                    };
+                }
             }
             catch { }
             return coords;
@@ -439,6 +456,25 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return index;
         }
 
+        /// <summary>Reverse index: host ElementId → UniqueIds of every <see cref="FamilyInstance"/>
+        /// it hosts — built once per pass (like <see cref="BuildTaggedSheetIndex"/>), so `rel.hosted`
+        /// doesn't cost a per-element document walk. <c>FamilyInstance.Host</c> is the only
+        /// "hosted by" relationship the Revit API exposes this directly; a wall containing a room
+        /// isn't a host/hosted relationship in this sense (that's `loc.space`).</summary>
+        public static Dictionary<ElementId, List<string>> BuildHostedIndex(Document doc)
+        {
+            var index = new Dictionary<ElementId, List<string>>();
+            foreach (FamilyInstance fi in new FilteredElementCollector(doc).OfClass(typeof(FamilyInstance)))
+            {
+                Element? host;
+                try { host = fi.Host; } catch { continue; }
+                if (host is null) continue;
+                if (!index.TryGetValue(host.Id, out var list)) index[host.Id] = list = new List<string>();
+                list.Add(fi.UniqueId);
+            }
+            return index;
+        }
+
         // ── Elements (el) ────────────────────────────────────────────────────────
 
         /// <summary>Builds the full field-group set for one element (docs/MODEL_LOG.md's
@@ -455,7 +491,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
             IReadOnlyList<(string Name, Line Line)> grids,
             Phase? defaultPhase,
             Action<Parameter, bool> onParamDef,
-            IReadOnlyDictionary<ElementId, List<string>>? taggedSheets = null)
+            IReadOnlyDictionary<ElementId, List<string>>? taggedSheets = null,
+            IReadOnlyDictionary<ElementId, List<string>>? hostedIndex = null)
         {
             var fields = new JsonObject { ["eid"] = el.Id.Value };
 
@@ -508,7 +545,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             catch { }
 
-            var rel = BuildRelations(el, defaultPhase);
+            var rel = BuildRelations(el, defaultPhase, hostedIndex);
             if (rel is not null) fields["rel"] = rel;
 
             var q = BuildQuantities(el);
@@ -584,7 +621,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return loc.Count > 0 ? loc : null;
         }
 
-        private static JsonObject? BuildRelations(Element el, Phase? phase)
+        private static JsonObject? BuildRelations(Element el, Phase? phase, IReadOnlyDictionary<ElementId, List<string>>? hostedIndex)
         {
             var rel = new JsonObject();
             try
@@ -593,6 +630,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
                     rel["host"] = fi.Host.UniqueId;
             }
             catch { }
+
+            // The reverse of `host` above — everything hosted BY this element (e.g. a wall's
+            // hosted doors/windows). Skipped when the caller didn't build the index (rare — only
+            // the very first change-capture batch of a session, before any snapshot/reconcile has
+            // run yet — see BuildHostedIndex's own callers).
+            if (hostedIndex is not null && hostedIndex.TryGetValue(el.Id, out var hostedIds) && hostedIds.Count > 0)
+            {
+                var arr = new JsonArray();
+                foreach (var h in hostedIds) arr.Add(h);
+                rel["hosted"] = arr;
+            }
 
             // Room from/to — "anything between two spaces" (the first real-model test's fix
             // #3): doors are the common case, but get_FromRoom/get_ToRoom apply to any
@@ -727,6 +775,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
             ("area", new[] { "HOST_AREA_COMPUTED", "ROOM_AREA" }),
             ("volume", new[] { "HOST_VOLUME_COMPUTED", "ROOM_VOLUME" }),
             ("perimeter", new[] { "HOST_PERIMETER_COMPUTED", "ROOM_PERIMETER" }),
+            // Walls expose WALL_ATTR_WIDTH_PARAM on the instance already (mirrors Wall.Width);
+            // floors/roofs/ceilings carry their own thickness BIP the same way — resolved by
+            // name exactly like every other quantity above, no type-vs-instance special case.
+            ("thickness", new[] { "WALL_ATTR_WIDTH_PARAM", "FLOOR_ATTR_THICKNESS_PARAM", "ROOF_ATTR_THICKNESS_PARAM", "CEILING_THICKNESS" }),
         };
 
         private static JsonObject? BuildQuantities(Element el)
@@ -816,7 +868,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
         // ── Sheets, revisions, links ─────────────────────────────────────────────
 
-        public static JsonObject BuildSheet(ViewSheet sheet)
+        /// <param name="sheetElements">Optional (see <see cref="BuildSheetElementIndex"/>) —
+        /// UniqueIds of every element tagged or dimensioned in a view placed on this sheet.
+        /// Omitted (not an empty array) when the caller didn't build the index — a live/
+        /// incremental edit to just this one sheet reuses the sheet's own existing `elements`
+        /// value rather than pay for a whole-document index it doesn't otherwise need; the next
+        /// full pass fills it in.</param>
+        public static JsonObject BuildSheet(ViewSheet sheet, IReadOnlyDictionary<string, List<string>>? sheetElements = null)
         {
             var fields = new JsonObject
             {
@@ -841,10 +899,75 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 }
             }
             catch { }
+            if (sheetElements is not null && sheetElements.TryGetValue(sheet.SheetNumber, out var elementUids) && elementUids.Count > 0)
+            {
+                var arr = new JsonArray();
+                foreach (var uid in elementUids) arr.Add(uid);
+                fields["elements"] = arr;
+            }
             return fields;
         }
 
-        public static JsonObject BuildRevision(Revision rev)
+        // Bounds sheet.elements/BuildSheetElementIndex — a runaway dimension chain or a sheet
+        // with an unusual number of tags must never blow up a single sheet record.
+        private const int MaxElementsPerSheet = 500;
+
+        /// <summary>Sheet number → UniqueIds of every element tagged OR dimensioned in a view
+        /// placed on that sheet. Reuses <paramref name="taggedSheetsIndex"/> (<see
+        /// cref="BuildTaggedSheetIndex"/>'s own element→sheet-numbers map, inverted here) for the
+        /// tagged half; dimensions are walked separately (<c>Dimension.References</c> — every
+        /// element id a placed-view dimension references), each list capped at
+        /// <see cref="MaxElementsPerSheet"/>.</summary>
+        public static Dictionary<string, List<string>> BuildSheetElementIndex(
+            Document doc, IReadOnlyDictionary<ElementId, List<string>> taggedSheetsIndex)
+        {
+            var bySheet = new Dictionary<string, List<string>>();
+            void Add(string sheetNum, string uid)
+            {
+                if (!bySheet.TryGetValue(sheetNum, out var list)) bySheet[sheetNum] = list = new List<string>();
+                if (list.Count < MaxElementsPerSheet && !list.Contains(uid)) list.Add(uid);
+            }
+
+            foreach (var kv in taggedSheetsIndex)
+            {
+                var el = doc.GetElement(kv.Key);
+                if (el is null) continue;
+                foreach (var sheetNum in kv.Value) Add(sheetNum, el.UniqueId);
+            }
+
+            var viewToSheet = new Dictionary<ElementId, string>();
+            foreach (ViewSheet sheet in new FilteredElementCollector(doc).OfClass(typeof(ViewSheet)))
+            {
+                try { foreach (var vid in sheet.GetAllPlacedViews()) viewToSheet[vid] = sheet.SheetNumber; }
+                catch { }
+            }
+            foreach (Dimension dim in new FilteredElementCollector(doc).OfClass(typeof(Dimension)))
+            {
+                ElementId viewId;
+                try { viewId = dim.OwnerViewId; } catch { continue; }
+                if (!viewToSheet.TryGetValue(viewId, out var sheetNum)) continue;
+
+                ReferenceArray? refs;
+                try { refs = dim.References; } catch { continue; }
+                if (refs is null) continue;
+                foreach (Reference r in refs)
+                {
+                    if (r?.ElementId is not { } elId || elId == ElementId.InvalidElementId) continue;
+                    var el = doc.GetElement(elId);
+                    if (el is not null) Add(sheetNum, el.UniqueId);
+                }
+            }
+            return bySheet;
+        }
+
+        /// <param name="sheetsByRevision">Optional (see <see cref="BuildRevisionSheetIndex"/>) —
+        /// sheet numbers carrying this revision.</param>
+        /// <param name="cloudsByRevision">Optional (see <see cref="BuildRevisionCloudIndex"/>) —
+        /// RevisionCloud UniqueIds tagged with this revision.</param>
+        public static JsonObject BuildRevision(
+            Revision rev,
+            IReadOnlyDictionary<ElementId, List<string>>? sheetsByRevision = null,
+            IReadOnlyDictionary<ElementId, List<string>>? cloudsByRevision = null)
         {
             var fields = new JsonObject();
             try { fields["sequence"] = rev.SequenceNumber; } catch { }
@@ -852,7 +975,55 @@ namespace Loam.Revit.Connector.ModelLogCapture
             try { fields["date"] = rev.RevisionDate; } catch { }
             try { fields["description"] = rev.Description; } catch { }
             try { fields["issued"] = rev.Issued; } catch { }
+            if (sheetsByRevision is not null && sheetsByRevision.TryGetValue(rev.Id, out var sheetNums) && sheetNums.Count > 0)
+            {
+                var arr = new JsonArray();
+                foreach (var s in sheetNums) arr.Add(s);
+                fields["sheets"] = arr;
+            }
+            if (cloudsByRevision is not null && cloudsByRevision.TryGetValue(rev.Id, out var cloudUids) && cloudUids.Count > 0)
+            {
+                var arr = new JsonArray();
+                foreach (var c in cloudUids) arr.Add(c);
+                fields["clouds"] = arr;
+            }
             return fields;
+        }
+
+        /// <summary>Revision ElementId → sheet numbers whose <c>GetAllRevisionIds()</c> includes
+        /// it — built once per pass (reverse index), not per revision (which would be an
+        /// O(revisions × sheets) walk).</summary>
+        public static Dictionary<ElementId, List<string>> BuildRevisionSheetIndex(Document doc)
+        {
+            var index = new Dictionary<ElementId, List<string>>();
+            foreach (ViewSheet sheet in new FilteredElementCollector(doc).OfClass(typeof(ViewSheet)))
+            {
+                IList<ElementId>? revIds;
+                try { revIds = sheet.GetAllRevisionIds(); } catch { continue; }
+                if (revIds is null) continue;
+                foreach (var rid in revIds)
+                {
+                    if (!index.TryGetValue(rid, out var list)) index[rid] = list = new List<string>();
+                    list.Add(sheet.SheetNumber);
+                }
+            }
+            return index;
+        }
+
+        /// <summary>Revision ElementId → UniqueIds of every RevisionCloud carrying it — same
+        /// once-per-pass reverse-index shape as <see cref="BuildRevisionSheetIndex"/>.</summary>
+        public static Dictionary<ElementId, List<string>> BuildRevisionCloudIndex(Document doc)
+        {
+            var index = new Dictionary<ElementId, List<string>>();
+            foreach (RevisionCloud cloud in new FilteredElementCollector(doc).OfClass(typeof(RevisionCloud)))
+            {
+                ElementId revId;
+                try { revId = cloud.RevisionId; } catch { continue; }
+                if (revId == ElementId.InvalidElementId) continue;
+                if (!index.TryGetValue(revId, out var list)) index[revId] = list = new List<string>();
+                list.Add(cloud.UniqueId);
+            }
+            return index;
         }
 
         public static JsonObject BuildLink(RevitLinkInstance link, Loam.Revit.Connector.RevitBridge.ModelFacts? linkedFacts)

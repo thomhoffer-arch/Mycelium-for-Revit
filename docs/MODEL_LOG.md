@@ -68,7 +68,7 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 
 | `k` | Written | Carries |
 |---|---|---|
-| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north); the field-role map |
+| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north angle, and `sharedTransform` — `ActiveProjectLocation.GetTotalTransform()`'s origin/basisX/basisY/basisZ, mapping this model's internal coordinates into shared coordinates); the field-role map |
 | `session` | Every `DocumentOpened` | `producerVersion`, `revitVersion` (when known) — lets a reader tell exactly which connector version wrote the records that follow, without diffing `header` records across segments. Also drives the connector's own upgrade cleanup: see "When the connector writes" below. |
 | `project` | Snapshot; on change | Project information: number, name, client, address, status, and every other Project Information parameter |
 | `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec (the parameter's `Definition.GetDataType()`, e.g. `autodesk.spec.aec:length-2.0.0` — looked up in `header.units` for the display unit; never the unit itself), storage, instance or type |
@@ -79,8 +79,8 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `type` | Snapshot; on change | Id (`t:<ElementId>`), category, family, type name, all type parameters |
 | `el` | Snapshot (full); on change (partial) | The element (see below) |
 | `del` | On delete, for EVERY family (`el`/`type`/`node`/`grid`/`mat`/`sheet`/`rev`/`link`) | Id (that family's own id scheme) and numeric ElementId (when still known); `of` names the family, omitted for `el` |
-| `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, and the ids of the revisions it carries |
-| `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued |
+| `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, the ids of the revisions it carries, and `elements` — UniqueIds of every element tagged or dimensioned in a view placed on it (capped at 500) |
+| `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued, `sheets` (sheet numbers carrying it), `clouds` (RevisionCloud UniqueIds tagged with it) |
 | `link` | Snapshot; on change | Linked model instance: the link's model identity and its transform |
 | `chg` | Before the records of one edit | Revit transaction names, the editor, and counts of added/modified/deleted |
 | `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, `modelSaves` (`DocumentVersion.NumberOfSaves` — additive alongside model version, the handoff's "version = GUID + number"), element count, `lastSeq`, `closed` |
@@ -104,8 +104,8 @@ a value.
 | `h` | handle | Mark, Type Mark (via type) |
 | `loc` | location | Containing storey and space as tree node ids |
 | `grid` | handle | Nearest grid intersection ("C/4"), computed from the location point and the `grid` records |
-| `rel` | relation | Host; room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished |
-| `q` | quantity | Length, width, height, area, volume, perimeter (internal units) |
+| `rel` | relation | Host; `hosted` (ids of elements THIS one hosts — the reverse of `host`, e.g. a wall's own hosted doors/windows); room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished. No `rel.link`: this log only ever walks the HOST document's own elements, never a linked document's — a link itself is its own `link` record kind, so there is no "element belongs to a link" membership to report here. |
+| `q` | quantity | Length, width, height, area, volume, perimeter, `thickness` (walls/floors/roofs/ceilings) (internal units) |
 | `bb`, `pt` | quantity | Bounding box; location point or curve ends (internal units) |
 | `mats` | relation | Each material id with its area and volume on this element |
 | `sheets` | sheet | Sheet numbers of every sheet a tag on this element is placed on |
@@ -226,6 +226,13 @@ writing resumes in the next segment immediately, while a background task writes
 only ever sees the complete plain file or the complete `.gz`, never a half-written one of either.
 Never edit a finished segment.
 
+**Retention:** at writer startup (the owning session only), finished (`.gz`) segments older than
+`ConnectorSettings.ModelLogRetentionDays` (default 90; 0 or less disables this) are deleted — never
+the active segment (it's never gzipped), and never the single newest finished segment regardless
+of age, since every segment already starts with its own full header + full state, so that one
+alone is always enough to keep reading the log from. Older ones are redundant history, not a
+correctness requirement.
+
 **Expected size** (estimates at about 0.8 KB per full element and 120 bytes per changed field):
 
 | Model | Model elements | Full state, plain | Full state, gzipped | Changes per busy day, gzipped |
@@ -240,7 +247,11 @@ against this table. Not done in this sandbox (no Revit available).
 
 **Crash safety:**
 
-1. Append one complete line, then flush. A reader ignores a torn last line.
+1. Append complete lines only. A reader ignores a torn last line. **(this repo's choice)** The
+   log is flushed once per idle slice (always before the state journal, so rule 2 holds) and
+   at every checkpoint, rotation and close, not after every line. If Revit dies mid-slice, at
+   most that slice's lines are lost. The next reconcile writes them again, because the state
+   never got ahead of the log.
 2. Update the state only **after** the log line is flushed. If a crash lands in between, the
    next reconcile writes the same state again: a harmless duplicate, never a lost change.
    **(this repo's choice)** The state is a base file plus an append-only journal. Each changed
@@ -471,6 +482,61 @@ deletion check for all eight at the end, in one shared `WriteFamilyDeletions` he
 incremental pass matches deleted ElementIds against node/type/mat directly (`"prefix" +
 ElementId`, `ModelLogWriter.IsKnownId`) and el/grid/sheet/rev/link by their UniqueIds' numeric tail
 (one `Dictionary<long,string>` per family, built once per batch).
+
+## Round 11: measured CPU savings (2026-09-24)
+
+Four changes, each verified with a before/after run of the same scratch benchmark
+(`ModelLogWriter`/`LogSegmentWriter` directly, snapshot then reconcile-with-no-changes, n=33,600,
+a frozen `git worktree` at the prior commit vs. this one):
+
+| | Before | After |
+|---|---:|---:|
+| `snapshot` | 6.10s | 4.57s |
+| `reconcile-nochange` | 4.41s | 3.65s |
+
+- `RecordHash.Of` deep-cloned an entire canonicalized copy of every field-group just to call
+  `ToJsonString()` on it. Rewritten to hash straight off a `Utf8JsonWriter` over a reused buffer
+  — sorted keys, no clone at all (a leaf value's own `WriteTo` produces identical bytes to
+  cloning-then-serializing, since cloning never changes formatting) — verified byte-identical to
+  the old implementation across nested/array/unicode/special-float inputs
+  (`RecordHashCompatTests`, which keeps the old implementation only for that comparison).
+- `ModelLogWriter.Append`/`WithId` deep-cloned every field again when moving it into the appended
+  line. Every caller builds its `JsonObject` fresh and never reads it again afterward, so this now
+  MOVES each field (remove from the source, then assign — satisfies `JsonNode`'s single-parent
+  rule without a clone) via a shared `MoveFieldsInto` helper — a real win for nested subtrees (a
+  `p` object's 40 parameters, a `bb`/`mats` array) that used to be recursively duplicated.
+- `LogSegmentWriter.AppendLine` flushed after every single line. Flushing now happens once per
+  idle slice (`ModelLogWriter.FlushJournalBuffer`, called by `FlushState` — the log first, then
+  the journal, keeping crash-safety rule #2), and before anything that persists state depending on
+  it (a checkpoint, session record, rotation, Dispose). `CurrentSizeBytes` flushes first so a
+  rotation decision is never based on a stale, not-yet-flushed size.
+- `ModelLogService.RefreshIndexCache` re-walked the whole document (node index, grid lines, tag
+  index) right after a full `WalkModel` pass had already built the same structures. `WalkModel`
+  now fills a caller-supplied `IndexCache` in place as it walks; the caller commits it directly
+  (only once its own staleness check confirms the pass actually finished) instead of triggering a
+  second walk. An incremental reconcile still calls the old `RefreshIndexCache` — it only merges
+  in what changed, so a real rebuild is what purges anything deleted.
+
+## Round 12: missing spec fields (2026-09-24)
+
+- Header `coordinates` gained `sharedTransform` (`ActiveProjectLocation.GetTotalTransform()`) —
+  the doc comment already promised it; the code never computed it.
+- `rel.hosted`: the reverse of `rel.host` (ids of elements THIS one hosts), via a reverse index
+  (`RecordBuilder.BuildHostedIndex`) built once per pass, the same shape as the tag-to-sheet index.
+  `rel.link` doesn't apply here: this log only ever walks the host document's own elements, never
+  a linked document's, so there is no "belongs to a link" membership for an element to carry — a
+  link is already its own `link` record kind.
+- `q.thickness` for walls/floors/roofs/ceilings — one more entry in the existing by-name BIP
+  resolution list (`WALL_ATTR_WIDTH_PARAM`/`FLOOR_ATTR_THICKNESS_PARAM`/
+  `ROOF_ATTR_THICKNESS_PARAM`/`CEILING_THICKNESS`), same as every other quantity.
+- `sheet.elements` (tagged or dimensioned elements) and `rev.sheets`/`rev.clouds` — three more
+  once-per-pass reverse indexes (`BuildSheetElementIndex`, `BuildRevisionSheetIndex`,
+  `BuildRevisionCloudIndex`), the tagged half of `sheet.elements` reusing the existing tag index.
+  Capped at 500 elements per sheet. A live/incremental edit to just one sheet or revision reuses
+  its existing value for these fields rather than rebuild a whole-document index for one edit —
+  the next full pass fills them in.
+- Segment retention: `ConnectorSettings.ModelLogRetentionDays` (default 90) — see "Retention"
+  above.
 
 ## Order, verification and done
 
