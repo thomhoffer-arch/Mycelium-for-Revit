@@ -482,6 +482,72 @@ namespace ModelLog.Tests
         }
 
         [Fact]
+        public void BeginNewGeneration_RotatesWhenSegmentHasContent()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" }); // gives segment 1 content
+
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            Assert.True(File.Exists(Path.Combine(_root, "model-a", "000001.jsonl.gz"))); // old segment gzipped
+            Assert.True(File.Exists(Seg(2)));
+        }
+
+        [Fact]
+        public void BeginNewGeneration_EmptySegment_DoesNotRotate()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            Assert.True(File.Exists(Seg(1)));
+            Assert.False(File.Exists(Seg(2)));
+        }
+
+        [Fact]
+        public void BeginNewGeneration_FirstLineOfNewSegmentIsHeader()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" });
+
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            var firstLine = File.ReadAllLines(Seg(2)).First();
+            var parsed = JsonNode.Parse(firstLine)!.AsObject();
+            Assert.Equal("header", parsed["k"]!.GetValue<string>());
+            Assert.Equal("Test.rvt", parsed["title"]!.GetValue<string>());
+        }
+
+        [Fact]
+        public void BeginNewGeneration_PdefAndCatWrittenAgainAfterwards()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            Assert.True(w.WriteIfUnseen(RecordKinds.Pdef, "builtin:FIRE_RATING", new JsonObject { ["name"] = "Fire Rating" }));
+            Assert.True(w.WriteIfUnseen(RecordKinds.Cat, "c:Walls", new JsonObject { ["name"] = "Walls" }));
+            Assert.False(w.WriteIfUnseen(RecordKinds.Pdef, "builtin:FIRE_RATING", new JsonObject { ["name"] = "Fire Rating" }));
+
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            Assert.True(w.WriteIfUnseen(RecordKinds.Pdef, "builtin:FIRE_RATING", new JsonObject { ["name"] = "Fire Rating" }));
+            Assert.True(w.WriteIfUnseen(RecordKinds.Cat, "c:Walls", new JsonObject { ["name"] = "Walls" }));
+        }
+
+        [Fact]
+        public void BeginNewGeneration_ClearedSeenSets_StayClearedAfterReopen()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                w.WriteIfUnseen(RecordKinds.Pdef, "builtin:FIRE_RATING", new JsonObject { ["name"] = "Fire Rating" });
+                w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+            }
+
+            // A reload must not resurrect the cleared set — the compaction BeginNewGeneration
+            // forces bumps the journal generation and drops the old journal, so the old "pd" seen
+            // op (recorded under the previous generation) is never replayed on top of the new base.
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.True(reopened.WriteIfUnseen(RecordKinds.Pdef, "builtin:FIRE_RATING", new JsonObject { ["name"] = "Fire Rating" }));
+        }
+
+        [Fact]
         public void LogSegmentWriter_Rotate_ProducesGzippedFileAndNextSegment()
         {
             var dir = Path.Combine(_root, "segments");

@@ -279,16 +279,19 @@ namespace PDRA.Services.Ai.Tools.Queries
         }
 
         /// <summary>Best-effort Revit-internal-unit label for a Double-storage parameter's raw
-        /// AsDouble() value, via the unit-aware GetUnitTypeId() API (Revit 2021+ — present on both
-        /// this connector's targets, net48/Revit 2024 and net8.0-windows/Revit 2025-26). Only the
-        /// common specs are named (Revit's own documented internal units: feet for length, radians
-        /// for angle, …); anything else — or any throw (a unitless Double parameter has no spec at
-        /// all) — returns null rather than guessing.</summary>
+        /// AsDouble() value, via the parameter's SPEC (<c>Definition.GetDataType()</c> — Revit
+        /// 2021+, present on both this connector's targets, net48/Revit 2024 and
+        /// net8.0-windows/Revit 2025-26; <c>Parameter.GetUnitTypeId()</c> returns the UNIT, e.g.
+        /// millimeters, never equal to a `SpecTypeId.*` constant, which silently made every
+        /// comparison below false). Only the common specs are named (Revit's own documented
+        /// internal units: feet for length, radians for angle, …); anything else — or any throw
+        /// (a unitless Double parameter has no spec at all) — returns null rather than
+        /// guessing.</summary>
         private static string? InternalUnitLabel(Parameter p)
         {
             try
             {
-                var specId = p.GetUnitTypeId();
+                var specId = p.Definition?.GetDataType();
                 if (specId is null || specId.Empty()) return null;
                 if (specId == SpecTypeId.Length) return "ft";
                 if (specId == SpecTypeId.Area) return "ft2";

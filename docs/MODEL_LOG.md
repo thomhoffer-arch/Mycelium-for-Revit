@@ -67,10 +67,10 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 
 | `k` | Written | Carries |
 |---|---|---|
-| `header` | First line of every segment | `schema: "model-log/1"`; model identity (cloud model GUID, or central path + ProjectInformation UniqueId) and title; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north); the field-role map |
+| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north); the field-role map |
 | `session` | Every `DocumentOpened` | `producerVersion`, `revitVersion` (when known) — lets a reader tell exactly which connector version wrote the records that follow, without diffing `header` records across segments. Also drives the connector's own upgrade cleanup: see "When the connector writes" below. |
 | `project` | Snapshot; on change | Project information: number, name, client, address, status, and every other Project Information parameter |
-| `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec, storage, instance or type |
+| `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec (the parameter's `Definition.GetDataType()`, e.g. `autodesk.spec.aec:length-2.0.0` — looked up in `header.units` for the display unit; never the unit itself), storage, instance or type |
 | `cat` | First time a category is seen | Id (`c:<name>`), name, `BuiltInCategory`, discipline |
 | `node` | Snapshot; on change | Spatial tree: `id` (`n:<ElementId>`), `parent`, `level` (`storey`/`building`/`space`/`zone`), name, number, elevation |
 | `grid` | Snapshot; on change | Grid name and line (ends, internal units) |
@@ -141,7 +141,7 @@ every trigger below cheap, and makes the log self-healing.
 |---|---|---|
 | Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
 | Model opened, log exists, same producer version | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. |
-| Model opened, log exists, producer version changed since the last `session` | `DocumentOpened` | Write a `session` record, then a **forced-full-state reconcile**: same walk as above, but every field-group is written in full (not just what differs), so a version that starts logging new fields backfills them onto every existing element; stale-element deletion still runs the same as an ordinary reconcile, so fields/categories a new version stops logging are cleaned up via ordinary `del` records. No fresh log or second snapshot — the existing log just gets one reconcile pass that behaves like a snapshot for state, while keeping its `seq` numbering and history intact. |
+| Model opened, log exists, producer version changed since the last `session` | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. |
 | User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed. |
 | Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile**, then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
 | Model closing | `DocumentClosing` | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed" |
@@ -349,6 +349,30 @@ above exclude Revit's own per-element work, so they isolate the connector's file
 
 **Not yet verified:** the same measurement on a copy of a real log folder, and Revit's
 responsiveness during a snapshot with this change.
+
+## Round 7: parameter unit lookup broken (2026-09-24)
+
+A real log review found 804,597 parameter values whose unit the reader couldn't resolve. Root
+cause: `RecordBuilder.BuildParamDef` wrote `Parameter.GetUnitTypeId()` (the parameter's UNIT, e.g.
+`autodesk.unit.unit:millimeters`) into `pdef.spec`, not its SPEC (`autodesk.spec.aec:length-2.0.0`)
+— `header.units` is keyed by spec, so it could never match. The same mix-up was in
+`Pdra/ElementContextReader.InternalUnitLabel`, comparing `GetUnitTypeId()` against `SpecTypeId.*`
+constants, which is never equal — silently disabling every internal-unit label. Both now read
+`Parameter.Definition.GetDataType()` (the spec) instead.
+
+`BuildDisplayUnits` also only ever populated `header.units` for 4 hard-coded specs
+(length/area/volume/angle), so even a correct `spec` on any other parameter (temperature, cost,
+speed, …) would still fail to resolve. It now fills the header from
+`UnitUtils.GetAllMeasurableSpecs()`.
+
+Fixing the writer alone would never repair an existing log: `pdef`/`cat` records are written once
+per id and never re-checked, and `header` is only written at a segment start. `ModelLogService`
+now starts a **new log generation** on a producer-version change (see "When the connector writes"
+above) instead of the old forced-full-state reconcile, so an upgraded connector re-emits every
+definition with the corrected `spec` — `ModelLogWriter.BeginNewGeneration` clears the pdef/cat
+"seen" sets and forces an immediate (not threshold-gated) compaction so the clear survives a
+crash before the next ordinary one. Producer version bumped to `0.6.0` so upgraded installs
+trigger it.
 
 ## Order, verification and done
 
