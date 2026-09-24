@@ -19,10 +19,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
     /// <item>Model opened, log exists, same producer version → gap (if the previous session
     /// didn't close cleanly), then reconcile (write only what differs from the hash cache,
     /// delete what's gone), then a checkpoint.</item>
-    /// <item>Model opened, log exists, producer version changed → a NEW LOG GENERATION: a fresh
-    /// segment (header, session, project, every definition re-emitted, full state of everything,
-    /// deletion detection), then a checkpoint — see <see cref="SnapshotJob"/>'s
-    /// <c>isUpgrade</c>.</item>
+    /// <item>Model opened, log exists, producer version changed, OR the active segment is due
+    /// for rotation → a NEW LOG GENERATION: a fresh segment (header, session, project, every
+    /// definition re-emitted, full state of everything, deletion detection), then a checkpoint —
+    /// see <see cref="SnapshotJob"/>'s <c>newGeneration</c>. This is the ONLY way a segment ever
+    /// rotates: every segment therefore starts with both a header AND a full state, never a
+    /// header alone (docs/MODEL_LOG.md's rotation rule).</item>
     /// <item>User edits (<c>DocumentChanged</c>) → NEVER processed inline (the handoff's "never
     /// block the user" rule) — only the raw ids/transaction names/editor are recorded; idle time
     /// drains the queue into a <c>chg</c> record plus one record per touched id. Held back
@@ -228,13 +230,25 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             else if (versionChanged)
             {
-                // Tagged in _upgradeOwed too so a sync/reload that interrupts this pass is
+                // Tagged in _newGenerationOwed too so a sync/reload that interrupts this pass is
                 // resumed as the SAME kind of pass (see OnDocumentSyncedOrReloaded), not
                 // downgraded to an ordinary first-time snapshot.
                 _snapshotOwed.Add(doc);
-                _upgradeOwed.Add(doc);
+                _newGenerationOwed.Add(doc);
                 _walkOutstanding.Add(doc);
-                _idle.Enqueue("snapshot-upgrade", SnapshotJob(doc, writer, Generation(doc), isUpgrade: true));
+                _idle.Enqueue("snapshot-upgrade", SnapshotJob(doc, writer, Generation(doc), newGeneration: true));
+            }
+            else if (writer.RotationDue)
+            {
+                // Same producer version, but the active segment is already past the rotation
+                // threshold: a plain reconcile here would rotate it (see the removed
+                // ModelLogWriter.RotateIfNeeded) with only a header, never the full state every
+                // segment must start with. Run the same new-generation pass a version change
+                // gets instead — SnapshotJob's own BeginNewGeneration is what actually rotates.
+                _snapshotOwed.Add(doc);
+                _newGenerationOwed.Add(doc);
+                _walkOutstanding.Add(doc);
+                _idle.Enqueue("snapshot-rotation", SnapshotJob(doc, writer, Generation(doc), newGeneration: true));
             }
             else
             {
@@ -254,14 +268,26 @@ namespace Loam.Revit.Connector.ModelLogCapture
             BumpGeneration(doc);
             if (!_writers.TryGetValue(doc, out var writer)) return;
             _walkOutstanding.Add(doc);
-            // A first snapshot or an upgrade pass the sync interrupted is re-run as the SAME kind
-            // of pass (header, project, session, full state — isUpgrade carried over via
-            // _upgradeOwed), not downgraded to a reconcile or a plain snapshot that would skip
-            // BeginNewGeneration/deletion detection.
+            // A first snapshot or a new-generation pass the sync interrupted is re-run as the
+            // SAME kind of pass (header, project, session, full state — newGeneration carried
+            // over via _newGenerationOwed), not downgraded to a reconcile or a plain snapshot
+            // that would skip BeginNewGeneration/deletion detection.
             if (_snapshotOwed.Contains(doc))
-                _idle.Enqueue("snapshot-after-sync", SnapshotJob(doc, writer, Generation(doc), isUpgrade: _upgradeOwed.Contains(doc)));
+            {
+                _idle.Enqueue("snapshot-after-sync", SnapshotJob(doc, writer, Generation(doc), newGeneration: _newGenerationOwed.Contains(doc)));
+            }
+            else if (writer.RotationDue)
+            {
+                // Same rotation-due rule OnDocumentOpened applies — an ordinary reconcile here
+                // would otherwise rotate the segment with only a header.
+                _snapshotOwed.Add(doc);
+                _newGenerationOwed.Add(doc);
+                _idle.Enqueue("snapshot-rotation-after-sync", SnapshotJob(doc, writer, Generation(doc), newGeneration: true));
+            }
             else
+            {
                 _idle.Enqueue("reconcile-on-sync", ReconcileJob(doc, writer, Generation(doc)));
+            }
         }
 
         public void OnDocumentClosing(Document doc)
@@ -280,7 +306,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _pending.Remove(doc);
             _changeJobQueued.Remove(doc);
             _indexCache.Remove(doc);
-            _upgradeOwed.Remove(doc);
+            _newGenerationOwed.Remove(doc);
             _snapshotOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             _walkCoveredIds.Remove(doc);
@@ -288,10 +314,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // generation 0 and make a job queued at generation 0 look current again.
         }
 
-        // An upgrade (new-generation) snapshot pass that a sync interrupts must not be silently
-        // downgraded to an ordinary snapshot by the replacement snapshot-after-sync — owed until
-        // an upgrade pass actually completes.
-        private readonly HashSet<Document> _upgradeOwed = new();
+        // A new-generation snapshot pass (producer-version change OR rotation due) that a sync
+        // interrupts must not be silently downgraded to an ordinary snapshot by the replacement
+        // snapshot-after-sync — owed until a new-generation pass actually completes.
+        private readonly HashSet<Document> _newGenerationOwed = new();
         private readonly HashSet<Document> _snapshotOwed = new();
         // A snapshot/reconcile is queued or running and hasn't reached its checkpoint yet.
         private readonly HashSet<Document> _walkOutstanding = new();
@@ -375,30 +401,31 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// <param name="gen">The document's generation when the job was QUEUED (not when it
         /// first runs) — a job queued before a sync/reload/close is stale even if it hadn't
         /// started yet.</param>
-        /// <param name="isUpgrade">True only for the producer-version-change pass queued by
-        /// <see cref="OnDocumentOpened"/>: begins a NEW LOG GENERATION (<see
-        /// cref="ModelLogWriter.BeginNewGeneration"/>, rotating first if the active segment has
-        /// content) instead of a plain <see cref="ModelLogWriter.BeginSnapshot"/>, and also runs
-        /// deletion detection (a first-time snapshot has nothing to compare against yet; an
-        /// upgrade's existing log does, so elements the new version no longer logs get
+        /// <param name="newGeneration">True for the pass queued by <see cref="OnDocumentOpened"/>
+        /// or <see cref="OnDocumentSyncedOrReloaded"/> on a producer-version change OR when the
+        /// active segment is already past its rotation threshold: begins a NEW LOG GENERATION
+        /// (<see cref="ModelLogWriter.BeginNewGeneration"/>, rotating first if the active segment
+        /// has content) instead of a plain <see cref="ModelLogWriter.BeginSnapshot"/>, and also
+        /// runs deletion detection (a first-time snapshot has nothing to compare against yet; an
+        /// existing log does, so elements the new segment's version no longer logs get
         /// `del`).</param>
-        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer, int gen, bool isUpgrade = false)
+        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer, int gen, bool newGeneration = false)
         {
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
             var facts = ModelFacts.From(doc);
             var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion, ModelId(doc, facts));
-            if (isUpgrade) writer.BeginNewGeneration(header); else writer.BeginSnapshot(header);
+            if (newGeneration) writer.BeginNewGeneration(header); else writer.BeginSnapshot(header);
             writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
             writer.Append(RecordKinds.Project, RecordBuilder.BuildProject(doc));
             yield return true;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: isUpgrade, IsStale)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: newGeneration, IsStale)) yield return step;
             // Interrupted by a sync/reload/close: never checkpoint a partial walk as complete.
             // After a sync/reload the post-event has already queued this snapshot again.
             if (IsStale()) yield break;
             _snapshotOwed.Remove(doc);
-            _upgradeOwed.Remove(doc);
+            _newGenerationOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             ClearWalkCoveredPending(doc);
             RefreshIndexCache(doc);
@@ -408,19 +435,18 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
         }
 
-        /// <summary>An ordinary reconcile — same producer version as the last session. Only what
-        /// differs from the hash cache is written; deletion detection
-        /// (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) always runs, since that's the
-        /// whole point of a reconcile (catching elements deleted while the connector wasn't
-        /// watching). A producer-version change is handled entirely by <see cref="SnapshotJob"/>'s
-        /// <c>isUpgrade</c> path instead — see <see cref="OnDocumentOpened"/>.</summary>
+        /// <summary>An ordinary reconcile — same producer version as the last session, and the
+        /// active segment isn't due for rotation (both handled by <see cref="SnapshotJob"/>'s
+        /// <c>newGeneration</c> path instead — see <see cref="OnDocumentOpened"/> — so this never
+        /// rotates the segment: rotating here would start one with only a header, never the full
+        /// state every segment must begin with). Only what differs from the hash cache is
+        /// written; deletion detection (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) always
+        /// runs, since that's the whole point of a reconcile (catching elements deleted while the
+        /// connector wasn't watching).</summary>
         private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen)
         {
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
-            var facts = ModelFacts.From(doc);
-            var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion, ModelId(doc, facts));
-            writer.RotateIfNeeded(header);
 
             foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
             if (IsStale()) yield break; // see SnapshotJob

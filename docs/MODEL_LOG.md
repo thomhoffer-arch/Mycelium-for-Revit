@@ -61,7 +61,8 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
      within `p` is a possible follow-up, not required by this format.
 5. **Compressed at rest:** finished segments are gzipped (`.jsonl.gz`); the active segment stays
    plain for appending. Gzip, because Revit 2024 and older run .NET Framework 4.8, which has no
-   Brotli.
+   Brotli. Compression itself runs on a background task, not Revit's UI thread — see "Rotation"
+   below.
 
 **Record kinds:**
 
@@ -140,10 +141,10 @@ every trigger below cheap, and makes the log self-healing.
 | Trigger | Revit hook | What the connector does |
 |---|---|---|
 | Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
-| Model opened, log exists, same producer version | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. |
-| Model opened, log exists, producer version changed since the last `session` | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. |
-| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. |
-| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile**, then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
+| Model opened, log exists, same producer version, segment not due for rotation | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. Never rotates the segment. |
+| Model opened, log exists, producer version changed since the last `session`, OR the active segment is already past 64 MB | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. This is the ONLY way a segment ever rotates, so one never starts with just a header. |
+| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. Never rotates the segment, even past 64 MB — the next open/sync/reconcile does. |
+| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile** (or a new log generation instead, by the same rotation-due rule above), then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
 | Model closing | `DocumentClosing` | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed" |
 
 **Who changed it:** on workshared models, `WorksharingUtils.GetWorksharingTooltipInfo(doc,
@@ -178,10 +179,17 @@ model-logs/<model id>/
   writer.lock       held while a Revit session writes this model
 ```
 
-**Rotation:** start a new segment at 64 MB or when a full snapshot is taken. Each segment starts
-with a `header` and a full state of every definition and element, so it can be read on its own.
-`seq` continues across segments. Gzip a segment once it's finished (`000001.jsonl.gz`). Never
-edit a finished segment.
+**Rotation:** only ever happens as part of a snapshot or a new-log-generation pass (first open,
+producer-version change, or the active segment already past 64 MB at the start of a reconcile —
+see "When the connector writes"); a plain reconcile or live change capture never rotates on its
+own, so the active segment can run slightly over 64 MB between one of those passes and the next.
+Each segment starts with a `header` and a full state of every definition and element, so it can
+be read on its own — there is no code path that starts a segment with only a header. `seq`
+continues across segments. A finished segment is gzipped (`000001.jsonl.gz`) off the UI thread:
+writing resumes in the next segment immediately, while a background task writes
+`000001.jsonl.gz.tmp`, renames it to `.gz`, then deletes the plain file — a reader (or a crash)
+only ever sees the complete plain file or the complete `.gz`, never a half-written one of either.
+Never edit a finished segment.
 
 **Expected size** (estimates at about 0.8 KB per full element and 120 bytes per changed field):
 
@@ -373,6 +381,28 @@ definition with the corrected `spec` — `ModelLogWriter.BeginNewGeneration` cle
 "seen" sets and forces an immediate (not threshold-gated) compaction so the clear survives a
 crash before the next ordinary one. Producer version bumped to `0.6.0` so upgraded installs
 trigger it.
+
+## Round 8: UI-thread gzip, and a rotation that skipped full state (2026-09-24)
+
+Two independent fixes, same review pass:
+
+- `LogSegmentWriter.Rotate` gzipped the finished 64 MB segment synchronously (`CompressionLevel.
+  Optimal`), inside an idle slice — a 1-2s UI freeze. Compression now runs on a background
+  `Task`: the next segment opens immediately, the finished one is written to `.gz.tmp`, renamed
+  to `.gz`, then the plain file is deleted, in that order (a reader always sees a complete plain
+  file or a complete `.gz`, never a partial one of either). Crash/exit safety: the constructor
+  redoes any leftover work (a rotated-away plain segment with no `.gz`, or a stray `.gz.tmp`);
+  `Dispose` waits a bounded few seconds for an in-flight compression so an ordinary close usually
+  leaves nothing to redo.
+- A 64 MB rollover during an ordinary reconcile (`ModelLogWriter.RotateIfNeeded`, called at the
+  start of `ReconcileJob`) rotated with only a `header` — no full state — breaking the rule that
+  every segment can be read on its own. Fixed at the root by removing `RotateIfNeeded` entirely:
+  `ModelLogWriter.RotationDue` now tells `ModelLogService` when the active segment is past
+  threshold, and in that case it runs the same new-log-generation pass a producer-version change
+  gets (`SnapshotJob`'s `isUpgrade` flag renamed to `newGeneration`, `_upgradeOwed` to
+  `_newGenerationOwed`, since it's no longer upgrade-only) instead of a plain reconcile. A plain
+  reconcile and live change capture never rotate now, so the active segment can run slightly over
+  64 MB until the next open/sync/reconcile catches it.
 
 ## Order, verification and done
 

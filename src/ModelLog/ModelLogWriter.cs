@@ -23,7 +23,13 @@ namespace Loam.Revit.Connector.ModelLog
     {
         public const string SchemaVersion = "model-log/1";
 
-        private readonly LogSegmentWriter _segment;
+        // Null exactly when LockHeldElsewhere — a session that doesn't own the lock must never
+        // open, recover or modify this model's segment files at all (the handoff's crash-safety
+        // rule #4: "a second Revit session with the same model open doesn't write, and logs that
+        // it didn't" — opening the file for append alone can already race the owner's handle,
+        // and LogSegmentWriter's own startup recovery would delete/recompress the OWNER's files).
+        // Every method that touches it below is guarded on LockHeldElsewhere first.
+        private readonly LogSegmentWriter? _segment;
         private readonly WriterLock? _lock;
         private readonly string _statePath;
         private readonly ModelLogState _state;
@@ -74,8 +80,10 @@ namespace Loam.Revit.Connector.ModelLog
             LockHeldElsewhere = _lock is null;
 
             _statePath = Path.Combine(LogDirectory, "state.json");
-            _state = StateStore.Load(_statePath);
-            if (!LockHeldElsewhere) StateJournal.DeleteStaleGenerations(_statePath, _state.JournalGeneration);
+            _state = StateStore.Load(_statePath); // read-only — never written back below when LockHeldElsewhere
+            if (LockHeldElsewhere) return; // _segment stays null: no file in this folder is opened, recovered or touched
+
+            StateJournal.DeleteStaleGenerations(_statePath, _state.JournalGeneration);
 
             // state (base+journal) may be behind the log (LastSeq is only journaled at a
             // checkpoint/session/rotation, not per record): never reopen an older segment number,
@@ -105,6 +113,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// handoff's crash-safety rule #2.</summary>
         public long Append(string kind, JsonObject fields)
         {
+            if (LockHeldElsewhere) return _state.LastSeq; // never write when another session owns the lock
             if (_pendingChange is not null && kind != RecordKinds.Chg)
             {
                 var chg = _pendingChange;
@@ -119,7 +128,7 @@ namespace Loam.Revit.Connector.ModelLog
                 ["k"] = kind,
             };
             foreach (var kv in fields) line[kv.Key] = kv.Value?.DeepClone();
-            _segment.AppendLine(line.ToJsonString());
+            _segment!.AppendLine(line.ToJsonString());
             return _state.LastSeq;
         }
 
@@ -150,6 +159,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// A no-op once already written for the current segment.</summary>
         public void WriteHeader(JsonObject headerFields)
         {
+            if (LockHeldElsewhere) return;
             if (_headerWrittenThisSegment) return;
             var fields = new JsonObject { ["schema"] = SchemaVersion };
             foreach (var kv in headerFields) fields[kv.Key] = kv.Value?.DeepClone();
@@ -157,26 +167,31 @@ namespace Loam.Revit.Connector.ModelLog
             _headerWrittenThisSegment = true;
         }
 
+        /// <summary>True once the active segment has grown past the rotation threshold — the
+        /// signal <see cref="ModelLogCapture.ModelLogService"/> uses to run a NEW-GENERATION pass
+        /// (<see cref="BeginNewGeneration"/>) instead of an ordinary reconcile, so a rotated
+        /// segment always starts with a header AND full state. There is no size-triggered
+        /// rotation left inside a plain reconcile — that used to rotate with only a header, the
+        /// bug this property's caller fixes at the root.</summary>
+        public bool RotationDue => !LockHeldElsewhere && _segment!.ShouldRotate();
+
         /// <summary>Call before starting a full snapshot/reconcile pass: rotates first if the
         /// active segment is already past the size threshold, then (re-)writes the header so a
-        /// snapshot always begins a segment a reader can open on its own.</summary>
+        /// snapshot always begins a segment a reader can open on its own. (Only reachable here
+        /// with existing content when a first-time snapshot is resumed after a sync interrupted
+        /// it — the full-state walk that always follows keeps the "header + full state" rule
+        /// either way.)</summary>
         public void BeginSnapshot(JsonObject headerFields)
         {
-            if (_segment.ShouldRotate()) RotateAndReheader(headerFields);
+            if (LockHeldElsewhere) return;
+            if (_segment!.ShouldRotate()) RotateAndReheader(headerFields);
             _headerWrittenThisSegment = false; // a snapshot always re-asserts the header
             WriteHeader(headerFields);
         }
 
-        /// <summary>Call periodically during live change capture (not mid-snapshot) — rotates
-        /// only if the size threshold was crossed since the last check.</summary>
-        public void RotateIfNeeded(JsonObject headerFields)
-        {
-            if (_segment.ShouldRotate()) RotateAndReheader(headerFields);
-        }
-
         private void RotateAndReheader(JsonObject headerFields)
         {
-            _segment.Rotate();
+            _segment!.Rotate();
             _state.CurrentSegment = _segment.SegmentNumber;
             _headerWrittenThisSegment = false;
             WriteHeader(headerFields);
@@ -197,7 +212,8 @@ namespace Loam.Revit.Connector.ModelLog
         /// that never recorded the clear, resurrecting them.</summary>
         public void BeginNewGeneration(JsonObject headerFields)
         {
-            if (_segment.CurrentSizeBytes > 0)
+            if (LockHeldElsewhere) return;
+            if (_segment!.CurrentSizeBytes > 0)
             {
                 _segment.Rotate();
                 _state.CurrentSegment = _segment.SegmentNumber;
@@ -221,6 +237,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// "the connector crashed mid-session".</summary>
         public void WriteCheckpoint(bool complete, string? modelVersion, int? elementCount, bool closed)
         {
+            if (LockHeldElsewhere) return;
             var fields = new JsonObject
             {
                 ["complete"] = complete,
@@ -246,6 +263,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// against.</summary>
         public void RecordSession(string producerVersion, string? revitVersion)
         {
+            if (LockHeldElsewhere) return;
             var fields = new JsonObject { ["producerVersion"] = producerVersion };
             if (revitVersion is not null) fields["revitVersion"] = revitVersion;
             Append(RecordKinds.Session, fields);
@@ -262,6 +280,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// to have a gap in yet) or when the last checkpoint was already closed.</summary>
         public void WriteGapIfNeeded(string reason)
         {
+            if (LockHeldElsewhere) return;
             if (_state.LastCheckpointClosed) return;
             if (_state.LastSeq == 0) return;
             Append(RecordKinds.Gap, new JsonObject
@@ -430,7 +449,8 @@ namespace Loam.Revit.Connector.ModelLog
                 // Always released, even if flushing/compacting the state above threw — an
                 // unreleased lock or an open segment handle would outlive this process for no
                 // benefit (compaction is already best-effort; nothing more is recoverable here).
-                _segment.Dispose();
+                // _segment is null exactly when LockHeldElsewhere (nothing was ever opened).
+                _segment?.Dispose();
                 _lock?.Dispose();
             }
         }

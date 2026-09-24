@@ -482,12 +482,64 @@ namespace ModelLog.Tests
         }
 
         [Fact]
-        public void BeginNewGeneration_RotatesWhenSegmentHasContent()
+        public void SecondWriter_SameModel_NeverTouchesSegmentFiles()
+        {
+            using var w1 = new ModelLogWriter(_root, "model-a");
+            w1.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" });
+            var linesBefore = File.ReadAllLines(Seg(1)).Length;
+
+            // A stray .gz.tmp the OWNER left mid-compression — the second writer's constructor
+            // must not run LogSegmentWriter's startup recovery (which deletes/recompresses) on
+            // files it doesn't own.
+            var tmp = Path.Combine(_root, "model-a", "000001.jsonl.gz.tmp");
+            File.WriteAllText(tmp, "owner's in-flight compression");
+
+            var ex = Record.Exception(() =>
+            {
+                using var w2 = new ModelLogWriter(_root, "model-a");
+                Assert.True(w2.LockHeldElsewhere);
+                w2.Append(RecordKinds.Project, new JsonObject { ["number"] = "2" }); // must no-op
+                w2.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 1, closed: false); // must no-op
+                Assert.False(w2.RotationDue);
+            });
+
+            Assert.Null(ex); // constructor/writes must not throw despite the owner's open handle
+            Assert.True(File.Exists(tmp)); // the owner's in-flight file was left alone
+            Assert.Equal(linesBefore, File.ReadAllLines(Seg(1)).Length); // second writer wrote nothing
+        }
+
+        [Fact]
+        public void RotationDue_TrueOncePastThreshold()
         {
             using var w = new ModelLogWriter(_root, "model-a");
-            w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" }); // gives segment 1 content
+            Assert.False(w.RotationDue);
+
+            var padding = new string('x', 1024 * 1024); // ~1 MiB per record
+            for (var i = 0; i < 65; i++) w.Append(RecordKinds.Project, new JsonObject { ["pad"] = padding });
+
+            Assert.True(w.RotationDue); // past LogSegmentWriter.RotateAtBytes (64 MiB)
+        }
+
+        [Fact]
+        public void RotationDue_FalseAfterBeginNewGenerationRotates()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            var padding = new string('x', 1024 * 1024);
+            for (var i = 0; i < 65; i++) w.Append(RecordKinds.Project, new JsonObject { ["pad"] = padding });
+            Assert.True(w.RotationDue);
 
             w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+
+            Assert.False(w.RotationDue); // the new segment starts empty
+        }
+
+        [Fact]
+        public void BeginNewGeneration_RotatesWhenSegmentHasContent()
+        {
+            var w = new ModelLogWriter(_root, "model-a");
+            w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" }); // gives segment 1 content
+            w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
+            w.Dispose(); // bounded wait for the background gzip the rotation above started
 
             Assert.True(File.Exists(Path.Combine(_root, "model-a", "000001.jsonl.gz"))); // old segment gzipped
             Assert.True(File.Exists(Seg(2)));
@@ -580,6 +632,66 @@ namespace ModelLog.Tests
             // startingSegment <= 0 triggers directory discovery.
             using var resumed = new LogSegmentWriter(dir, 0);
             Assert.Equal(2, resumed.SegmentNumber);
+        }
+
+        private static readonly TimeSpan CompressionWait = TimeSpan.FromSeconds(5);
+
+        [Fact]
+        public void Rotate_NewSegmentWritableBeforeCompressionFinishes()
+        {
+            var dir = Path.Combine(_root, "async-rotate");
+            using var seg = new LogSegmentWriter(dir, 1);
+            seg.AppendLine("{\"seq\":1}");
+            seg.Rotate(); // must not block on gzip — the new segment is already open here
+            seg.AppendLine("{\"seq\":2}");
+
+            Assert.True(seg.WaitForBackgroundCompression(CompressionWait));
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl")));
+            Assert.Equal("{\"seq\":2}", File.ReadAllLines(Path.Combine(dir, "000002.jsonl")).Single());
+        }
+
+        [Fact]
+        public void Recover_PlainSegmentWithNoGz_IsCompressedInBackground()
+        {
+            var dir = Path.Combine(_root, "recover-plain");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "000001.jsonl"), "{\"seq\":1}\n");
+
+            using var seg = new LogSegmentWriter(dir, 2); // simulates resuming after a crash mid-compression
+
+            Assert.True(seg.WaitForBackgroundCompression(CompressionWait));
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl")));
+        }
+
+        [Fact]
+        public void Recover_StaleGzTmp_DeletedBeforeRecompressing()
+        {
+            var dir = Path.Combine(_root, "recover-tmp");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "000001.jsonl"), "{\"seq\":1}\n");
+            File.WriteAllText(Path.Combine(dir, "000001.jsonl.gz.tmp"), "garbage from an interrupted compression");
+
+            using var seg = new LogSegmentWriter(dir, 2);
+
+            Assert.True(seg.WaitForBackgroundCompression(CompressionWait));
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl.gz.tmp")));
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+        }
+
+        [Fact]
+        public void Recover_PlainWithExistingGz_OnlyPlainDeleted_NoBackgroundWork()
+        {
+            var dir = Path.Combine(_root, "recover-both");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "000001.jsonl"), "{\"seq\":1}\n");
+            File.WriteAllText(Path.Combine(dir, "000001.jsonl.gz"), "already compressed");
+
+            using var seg = new LogSegmentWriter(dir, 2); // cleanup here is synchronous — no task to wait for
+
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl")));
+            Assert.Equal("already compressed", File.ReadAllText(Path.Combine(dir, "000001.jsonl.gz")));
         }
     }
 }
