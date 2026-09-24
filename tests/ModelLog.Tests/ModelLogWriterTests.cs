@@ -204,6 +204,37 @@ namespace ModelLog.Tests
         }
 
         [Fact]
+        public void RecordSession_WritesRecordAndPersistsLastProducerVersion()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                Assert.Null(w.LastProducerVersion);
+                w.RecordSession("0.5.0", "2025");
+                Assert.Equal("0.5.0", w.LastProducerVersion);
+
+                var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
+                var parsed = JsonNode.Parse(lastLine)!.AsObject();
+                Assert.Equal("session", parsed["k"]!.GetValue<string>());
+                Assert.Equal("0.5.0", parsed["producerVersion"]!.GetValue<string>());
+                Assert.Equal("2025", parsed["revitVersion"]!.GetValue<string>());
+            }
+
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            Assert.Equal("0.5.0", reopened.LastProducerVersion);
+        }
+
+        [Fact]
+        public void RecordSession_WithoutRevitVersion_OmitsField()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.RecordSession("0.5.0", null);
+
+            var lastLine = File.ReadAllLines(Path.Combine(_root, "model-a", "000001.jsonl")).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.False(parsed.ContainsKey("revitVersion"));
+        }
+
+        [Fact]
         public void SecondWriter_SameModel_LockHeldElsewhere()
         {
             using var w1 = new ModelLogWriter(_root, "model-a");

@@ -38,6 +38,13 @@ namespace Loam.Revit.Connector.ModelLog
         public bool LastCheckpointClosed => _state.LastCheckpointClosed;
         public string LogDirectory { get; }
 
+        /// <summary>The producer (connector) version recorded by the LAST session record this
+        /// log ever got, or null if this log predates the <c>session</c> record kind — the
+        /// signal <see cref="ModelLogCapture.ModelLogService.OnDocumentOpened"/> compares its own
+        /// version against to decide whether an upgrade changed what gets logged and a forced
+        /// full reconcile (with deletion detection) is owed, per docs/MODEL_LOG.md.</summary>
+        public string? LastProducerVersion => _state.LastProducerVersion;
+
         public ModelLogWriter(string modelLogRoot, string modelId)
         {
             LogDirectory = Path.Combine(modelLogRoot, SanitizeForPath(modelId));
@@ -142,6 +149,22 @@ namespace Loam.Revit.Connector.ModelLog
 
             _state.LastCheckpointClosed = closed;
             _state.LastModelVersion = modelVersion;
+            SaveState();
+        }
+
+        /// <summary>Call once per <c>DocumentOpened</c>, right after deciding whether this is a
+        /// fresh log/version change (before the snapshot/reconcile it may have triggered) — a
+        /// reader can then tell, from the <c>session</c> records alone, exactly which producer
+        /// version wrote which records, without having to diff <c>header</c> records across
+        /// segments. Also updates <see cref="LastProducerVersion"/> for the NEXT open to compare
+        /// against.</summary>
+        public void RecordSession(string producerVersion, string? revitVersion)
+        {
+            var fields = new JsonObject { ["producerVersion"] = producerVersion };
+            if (revitVersion is not null) fields["revitVersion"] = revitVersion;
+            Append(RecordKinds.Session, fields);
+
+            _state.LastProducerVersion = producerVersion;
             SaveState();
         }
 

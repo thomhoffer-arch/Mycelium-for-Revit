@@ -13,6 +13,7 @@ namespace Loam.Revit.Connector.ModelLog
         public long CurrentSegment { get; set; } = 1;
         public bool LastCheckpointClosed { get; set; }
         public string? LastModelVersion { get; set; }
+        public string? LastProducerVersion { get; set; }
         public HashCache Cache { get; set; } = new();
     }
 }

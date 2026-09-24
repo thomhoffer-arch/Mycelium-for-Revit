@@ -50,7 +50,7 @@ namespace Loam.Revit.Connector
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Loam", "RevitConnector", "model-logs")
                 : settings.ModelLogRoot!;
-            _modelLog = new ModelLogService(modelLogRoot, "0.4.0");
+            _modelLog = new ModelLogService(modelLogRoot, "0.5.0");
 
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();
@@ -125,6 +125,25 @@ namespace Loam.Revit.Connector
             _events?.TryFlushIfIdle();
 
             try { _modelLog?.OnIdling(); } catch { /* best-effort — never throw out of Idling */ }
+
+            // CRITICAL (live report: a snapshot/reconcile processed ~200 of ~33,600 elements over
+            // two minutes, then stopped almost entirely — matching a burst of mouse movement over
+            // Revit's window, then near-silence once the user stopped interacting with it, not a
+            // steady-but-slow trickle). By default, Revit's Idling event is throttled: it fires
+            // once, then waits for further UI activity (mouse move, keystroke) before firing again
+            // — it is NOT a free-running timer. An add-in that wants Idling to keep firing on its
+            // own, so background work keeps draining while the user does nothing else, MUST call
+            // SetRaiseWithoutDelay() on every tick it still has work left to do; omitting it is
+            // exactly why a large snapshot/reconcile would stall for minutes at a time.
+            //
+            // NOT unconditionally, though — a follow-up live report ("connector blocking/slow for
+            // several seconds after most actions") showed that requesting it on every tick races
+            // to drain an entire large backlog in one uninterrupted burst, starving Revit's own
+            // message pump of the redraw/input processing a user expects to see promptly.
+            // ModelLogService.ShouldRequestContinuousIdling caps each burst to a short window and
+            // then releases control for one natural idle interval, so backlogs still drain
+            // steadily whenever the user does anything, without monopolizing the idle loop.
+            try { if (_modelLog?.ShouldRequestContinuousIdling() == true) e.SetRaiseWithoutDelay(); } catch { }
         }
 
         // A Ctrl+S and a Sync to Central both fire "saved" downstream — older orchestrator
