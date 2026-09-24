@@ -578,7 +578,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 {
                     var systems = new List<string>();
                     var connected = new List<string>();
-                    foreach (Connector c in cm.Connectors)
+                    // Fully qualified: "Connector" is ALSO a namespace somewhere in this
+                    // Revit API version's assembly graph, and the bare name resolves to that
+                    // namespace instead of Autodesk.Revit.DB.Connector — caught by the Build
+                    // workflow's real compile check (net48/Revit 2024 API packages).
+                    foreach (Autodesk.Revit.DB.Connector c in cm.Connectors)
                     {
                         try
                         {
@@ -589,7 +593,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                         catch { }
                         try
                         {
-                            foreach (Connector other in c.AllRefs)
+                            foreach (Autodesk.Revit.DB.Connector other in c.AllRefs)
                             {
                                 if (other?.Owner is null || other.Owner.Id == el.Id) continue;
                                 var uid = other.Owner.UniqueId;
