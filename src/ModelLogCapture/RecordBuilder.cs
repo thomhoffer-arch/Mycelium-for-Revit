@@ -72,12 +72,20 @@ namespace Loam.Revit.Connector.ModelLogCapture
         // ── Header ───────────────────────────────────────────────────────────────
 
         /// <summary>Model identity, producer/version, display units per spec, coordinates, and
-        /// the field-role map — the first line of every segment.</summary>
-        public static JsonObject BuildHeader(Document doc, Loam.Revit.Connector.RevitBridge.ModelFacts facts, string producerVersion)
+        /// the field-role map — the first line of every segment. <paramref name="modelId"/> is
+        /// the STABLE identity the log folder itself is named from
+        /// (<see cref="Loam.Revit.Connector.ModelLogCapture.ModelLogService"/>'s own
+        /// <c>ModelId</c> — the cloud/central-path <c>ModelInstanceId</c> when known, else the
+        /// local file path), never the local file title — <c>facts.Model</c> differs per user
+        /// (it can carry the Windows username) and must not be mistaken for the model's
+        /// identity.</summary>
+        public static JsonObject BuildHeader(
+            Document doc, Loam.Revit.Connector.RevitBridge.ModelFacts facts, string producerVersion, string modelId)
         {
             var header = new JsonObject
             {
-                ["model"] = facts.Model,
+                ["title"] = facts.Model,
+                ["modelId"] = modelId,
                 ["project"] = facts.Project,
                 ["worksharing"] = facts.Worksharing,
             };
@@ -105,29 +113,24 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return header;
         }
 
-        /// <summary>Project display units per spec (length/area/volume/angle at minimum),
-        /// keyed by the <see cref="ForgeTypeId"/> spec string — the header field a reader uses
-        /// to show e.g. "3050 mm" exactly as Revit does, without re-deriving Revit's own unit
-        /// formatting rules.</summary>
+        /// <summary>Every measurable spec's display unit, keyed by the spec's own
+        /// <see cref="ForgeTypeId.TypeId"/> string (<c>UnitUtils.GetAllMeasurableSpecs()</c>) —
+        /// the header field a reader uses to look up e.g. "3050 mm" for a `pdef` whose `spec` is
+        /// `autodesk.spec.aec:length-2.0.0`, exactly as Revit displays it, without re-deriving
+        /// Revit's own unit formatting rules. Was hard-coded to 4 specs; a real log review found
+        /// 804,597 parameter values whose unit the reader couldn't resolve because most
+        /// parameters carry a spec outside that short list.</summary>
         private static JsonObject BuildDisplayUnits(Document doc)
         {
             var units = new JsonObject();
             try
             {
                 var fo = doc.GetUnits();
-                void Add(string key, ForgeTypeId spec)
+                foreach (var spec in UnitUtils.GetAllMeasurableSpecs())
                 {
-                    try
-                    {
-                        var fmt = fo.GetFormatOptions(spec);
-                        units[key] = fmt.GetUnitTypeId().TypeId;
-                    }
+                    try { units[spec.TypeId] = fo.GetFormatOptions(spec).GetUnitTypeId().TypeId; }
                     catch { /* spec not set in this document/Revit version — omit */ }
                 }
-                Add("autodesk.spec.aec:length-2.0.0", SpecTypeId.Length);
-                Add("autodesk.spec.aec:area-2.0.0", SpecTypeId.Area);
-                Add("autodesk.spec.aec:volume-2.0.0", SpecTypeId.Volume);
-                Add("autodesk.spec:angle-2.0.0", SpecTypeId.Angle);
             }
             catch { }
             return units;
@@ -257,9 +260,15 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 ["scope"] = isTypeParam ? "type" : "instance",
             };
             try { fields["group"] = LabelUtils.GetLabelForGroup(p.Definition.GetGroupTypeId()); } catch { }
+            // The parameter's SPEC (e.g. length, area) — not its unit (p.GetUnitTypeId(), e.g.
+            // millimeters). A reader looks the spec up in header.units to find the display unit;
+            // GetUnitTypeId() would never match a header.units key at all (a real log review
+            // found 804,597 param values whose unit the reader couldn't resolve because of this).
+            // Non-measurable specs (strings, yes/no, …) get one too — a reader that doesn't
+            // recognize them just won't find a matching header.units entry, which is correct.
             try
             {
-                var spec = p.GetUnitTypeId();
+                var spec = p.Definition?.GetDataType();
                 if (spec is not null && !spec.Empty()) fields["spec"] = spec.TypeId;
             }
             catch { }

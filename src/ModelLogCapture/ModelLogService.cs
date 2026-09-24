@@ -16,9 +16,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
     /// <list type="bullet">
     /// <item>Model opened, no log yet → full snapshot (definitions, then every element/sheet/
     /// revision/link), then a checkpoint.</item>
-    /// <item>Model opened, log exists → gap (if the previous session didn't close cleanly),
-    /// then reconcile (write only what differs from the hash cache, delete what's gone), then a
-    /// checkpoint.</item>
+    /// <item>Model opened, log exists, same producer version → gap (if the previous session
+    /// didn't close cleanly), then reconcile (write only what differs from the hash cache,
+    /// delete what's gone), then a checkpoint.</item>
+    /// <item>Model opened, log exists, producer version changed → a NEW LOG GENERATION: a fresh
+    /// segment (header, session, project, every definition re-emitted, full state of everything,
+    /// deletion detection), then a checkpoint — see <see cref="SnapshotJob"/>'s
+    /// <c>isUpgrade</c>.</item>
     /// <item>User edits (<c>DocumentChanged</c>) → NEVER processed inline (the handoff's "never
     /// block the user" rule) — only the raw ids/transaction names/editor are recorded; idle time
     /// drains the queue into a <c>chg</c> record plus one record per touched id.</item>
@@ -195,16 +199,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // An existing log whose last session recorded a DIFFERENT producer version means an
             // upgrade happened since the last open — per the developer feedback (github summary):
             // "when an upgrade changes what gets logged, clean up the log ... send delete records
-            // for elements that are now filtered out, plus updates adding the new fields."
-            // Rather than track exactly which fields/filters changed between arbitrary versions,
-            // a full reconcile (every field-group re-written AND stale-element deletion re-run)
-            // gets the same result unconditionally: whatever the new version adds gets written,
-            // and anything the new version filters out that the old one logged gets deleted via
-            // the same KnownElementIdsNotIn comparison an ordinary reconcile already does.
+            // for elements that are now filtered out, plus updates adding the new fields." A
+            // reconcile alone can never fix a definition bug: `pdef`/`cat` records are written
+            // once per id and never re-checked (ModelLogWriter.WriteIfUnseen), and the header is
+            // only written at a segment start — so a stale/wrong pdef or an old header would live
+            // on forever. Instead this starts a NEW LOG GENERATION: a fresh segment with its own
+            // header, session and project records, every definition re-emitted (the pdef/cat seen
+            // sets are cleared — see ModelLogWriter.BeginNewGeneration) and the full state of
+            // everything, same as a first-time snapshot, plus deletion detection so elements the
+            // new version no longer logs get `del` records.
             var versionChanged = !isFreshLog && writer.LastProducerVersion is not null
                 && writer.LastProducerVersion != _producerVersion;
-
-            if (versionChanged) _fullStateOwed.Add(doc);
 
             if (isFreshLog)
             {
@@ -214,12 +219,22 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 _walkOutstanding.Add(doc);
                 _idle.Enqueue("snapshot", SnapshotJob(doc, writer, Generation(doc)));
             }
+            else if (versionChanged)
+            {
+                // Tagged in _upgradeOwed too so a sync/reload that interrupts this pass is
+                // resumed as the SAME kind of pass (see OnDocumentSyncedOrReloaded), not
+                // downgraded to an ordinary first-time snapshot.
+                _snapshotOwed.Add(doc);
+                _upgradeOwed.Add(doc);
+                _walkOutstanding.Add(doc);
+                _idle.Enqueue("snapshot-upgrade", SnapshotJob(doc, writer, Generation(doc), isUpgrade: true));
+            }
             else
             {
                 writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
                 writer.WriteGapIfNeeded("no closed checkpoint from the previous session");
                 _walkOutstanding.Add(doc);
-                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, Generation(doc), forceFullState: versionChanged));
+                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, Generation(doc)));
             }
         }
 
@@ -232,10 +247,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
             BumpGeneration(doc);
             if (!_writers.TryGetValue(doc, out var writer)) return;
             _walkOutstanding.Add(doc);
-            // A first snapshot the sync interrupted is re-run as a snapshot (header, project,
-            // session, full state), not downgraded to a reconcile that would never write them.
+            // A first snapshot or an upgrade pass the sync interrupted is re-run as the SAME kind
+            // of pass (header, project, session, full state — isUpgrade carried over via
+            // _upgradeOwed), not downgraded to a reconcile or a plain snapshot that would skip
+            // BeginNewGeneration/deletion detection.
             if (_snapshotOwed.Contains(doc))
-                _idle.Enqueue("snapshot-after-sync", SnapshotJob(doc, writer, Generation(doc)));
+                _idle.Enqueue("snapshot-after-sync", SnapshotJob(doc, writer, Generation(doc), isUpgrade: _upgradeOwed.Contains(doc)));
             else
                 _idle.Enqueue("reconcile-on-sync", ReconcileJob(doc, writer, Generation(doc)));
         }
@@ -256,17 +273,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _pending.Remove(doc);
             _changeJobQueued.Remove(doc);
             _indexCache.Remove(doc);
-            _fullStateOwed.Remove(doc);
+            _upgradeOwed.Remove(doc);
             _snapshotOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             // _generation keeps its (bumped) entry: removing it would reset this document to
             // generation 0 and make a job queued at generation 0 look current again.
         }
 
-        // An upgrade-triggered full-state reconcile that a sync interrupts must not be silently
-        // downgraded to an ordinary one by the replacement reconcile-on-sync — owed until a
-        // full-state pass actually completes.
-        private readonly HashSet<Document> _fullStateOwed = new();
+        // An upgrade (new-generation) snapshot pass that a sync interrupts must not be silently
+        // downgraded to an ordinary snapshot by the replacement snapshot-after-sync — owed until
+        // an upgrade pass actually completes.
+        private readonly HashSet<Document> _upgradeOwed = new();
         private readonly HashSet<Document> _snapshotOwed = new();
         // A snapshot/reconcile is queued or running and hasn't reached its checkpoint yet.
         private readonly HashSet<Document> _walkOutstanding = new();
@@ -334,22 +351,30 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// <param name="gen">The document's generation when the job was QUEUED (not when it
         /// first runs) — a job queued before a sync/reload/close is stale even if it hadn't
         /// started yet.</param>
-        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer, int gen)
+        /// <param name="isUpgrade">True only for the producer-version-change pass queued by
+        /// <see cref="OnDocumentOpened"/>: begins a NEW LOG GENERATION (<see
+        /// cref="ModelLogWriter.BeginNewGeneration"/>, rotating first if the active segment has
+        /// content) instead of a plain <see cref="ModelLogWriter.BeginSnapshot"/>, and also runs
+        /// deletion detection (a first-time snapshot has nothing to compare against yet; an
+        /// upgrade's existing log does, so elements the new version no longer logs get
+        /// `del`).</param>
+        private IEnumerator<bool> SnapshotJob(Document doc, ModelLogWriter writer, int gen, bool isUpgrade = false)
         {
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
             var facts = ModelFacts.From(doc);
-            var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion);
-            writer.BeginSnapshot(header);
+            var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion, ModelId(doc, facts));
+            if (isUpgrade) writer.BeginNewGeneration(header); else writer.BeginSnapshot(header);
             writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
             writer.Append(RecordKinds.Project, RecordBuilder.BuildProject(doc));
             yield return true;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: false, IsStale)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: isUpgrade, IsStale)) yield return step;
             // Interrupted by a sync/reload/close: never checkpoint a partial walk as complete.
             // After a sync/reload the post-event has already queued this snapshot again.
             if (IsStale()) yield break;
             _snapshotOwed.Remove(doc);
+            _upgradeOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             RefreshIndexCache(doc);
 
@@ -358,25 +383,22 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
         }
 
-        /// <param name="forceFullState">True only right after a producer-version change
-        /// (upgrade) detected in <see cref="OnDocumentOpened"/> — writes every field-group in
-        /// full, same as a snapshot, rather than only what differs from the hash cache, so a
-        /// version that added fields backfills them onto every existing element. Deletion
-        /// detection (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) still always runs on a
-        /// reconcile regardless of this flag — an ordinary reconcile's whole point is catching
-        /// elements deleted while the connector wasn't watching.</param>
-        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen, bool forceFullState = false)
+        /// <summary>An ordinary reconcile — same producer version as the last session. Only what
+        /// differs from the hash cache is written; deletion detection
+        /// (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) always runs, since that's the
+        /// whole point of a reconcile (catching elements deleted while the connector wasn't
+        /// watching). A producer-version change is handled entirely by <see cref="SnapshotJob"/>'s
+        /// <c>isUpgrade</c> path instead — see <see cref="OnDocumentOpened"/>.</summary>
+        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, int gen)
         {
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
             var facts = ModelFacts.From(doc);
-            var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion);
+            var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion, ModelId(doc, facts));
             writer.RotateIfNeeded(header);
-            var fullState = forceFullState || _fullStateOwed.Contains(doc);
 
-            foreach (var step in WalkModel(doc, writer, fullState, detectDeletions: true, IsStale)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
             if (IsStale()) yield break; // see SnapshotJob
-            if (fullState) _fullStateOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
             RefreshIndexCache(doc);
 

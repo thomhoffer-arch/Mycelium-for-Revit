@@ -185,6 +185,34 @@ namespace Loam.Revit.Connector.ModelLog
             MaybeCompact();
         }
 
+        /// <summary>Starts a fresh log generation on a producer-version change: rotates the
+        /// active segment first if it already has content (so the new generation's definitions
+        /// and full state begin a segment of their own, never mixed with the old version's
+        /// records), then writes the header and clears the pdef/cat "seen" sets so the caller's
+        /// upcoming full walk re-emits every definition under the new version (a version can add
+        /// fields to a `pdef`/`cat` record that the old version never wrote). The clear is made
+        /// durable right away (an unconditional compaction, not the usual threshold-gated one) —
+        /// otherwise a crash before the next threshold-triggered compaction would leave the OLD
+        /// base on disk with the seen-sets still populated, and reloading would replay a journal
+        /// that never recorded the clear, resurrecting them.</summary>
+        public void BeginNewGeneration(JsonObject headerFields)
+        {
+            if (_segment.CurrentSizeBytes > 0)
+            {
+                _segment.Rotate();
+                _state.CurrentSegment = _segment.SegmentNumber;
+            }
+            _headerWrittenThisSegment = false;
+            WriteHeader(headerFields);
+
+            _state.Cache.PdefSeen.Clear();
+            _state.Cache.CatSeen.Clear();
+
+            _journalBuffer.Add(StateJournal.MetaOp(_state));
+            FlushJournalBuffer();
+            CompactNow();
+        }
+
         // ── Checkpoints and gaps ──────────────────────────────────────────────────
 
         /// <summary>Checkpoint: end of snapshot/reconcile, after sync, or on close.
@@ -361,7 +389,17 @@ namespace Loam.Revit.Connector.ModelLog
             var threshold = Math.Max(MinCompactionBytes, baseBytes / 4);
             var journalBytes = StateJournal.SizeBytes(_statePath, _state.JournalGeneration);
             if (journalBytes <= threshold) return;
+            CompactNow();
+        }
 
+        /// <summary>Unconditional compaction: rewrites the base, bumps the journal generation,
+        /// and drops the old journal — the body <see cref="MaybeCompact"/> uses once past its
+        /// size threshold, also called directly by <see cref="BeginNewGeneration"/> right after
+        /// clearing the pdef/cat seen-sets, so that clear survives a crash even though the
+        /// journal itself is nowhere near the usual threshold.</summary>
+        private void CompactNow()
+        {
+            if (LockHeldElsewhere) return;
             var oldGeneration = _state.JournalGeneration;
             _state.JournalGeneration = oldGeneration + 1;
             try
