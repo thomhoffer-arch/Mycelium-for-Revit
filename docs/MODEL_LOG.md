@@ -68,6 +68,7 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `k` | Written | Carries |
 |---|---|---|
 | `header` | First line of every segment | `schema: "model-log/1"`; model identity (cloud model GUID, or central path + ProjectInformation UniqueId) and title; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north); the field-role map |
+| `session` | Every `DocumentOpened` | `producerVersion`, `revitVersion` (when known) — lets a reader tell exactly which connector version wrote the records that follow, without diffing `header` records across segments. Also drives the connector's own upgrade cleanup: see "When the connector writes" below. |
 | `project` | Snapshot; on change | Project information: number, name, client, address, status, and every other Project Information parameter |
 | `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec, storage, instance or type |
 | `cat` | First time a category is seen | Id (`c:<name>`), name, `BuiltInCategory`, discipline |
@@ -138,8 +139,9 @@ every trigger below cheap, and makes the log self-healing.
 
 | Trigger | Revit hook | What the connector does |
 |---|---|---|
-| Model opened, no log yet | `DocumentOpened` | Full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
-| Model opened, log exists | `DocumentOpened` | **Reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. |
+| Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
+| Model opened, log exists, same producer version | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. |
+| Model opened, log exists, producer version changed since the last `session` | `DocumentOpened` | Write a `session` record, then a **forced-full-state reconcile**: same walk as above, but every field-group is written in full (not just what differs), so a version that starts logging new fields backfills them onto every existing element; stale-element deletion still runs the same as an ordinary reconcile, so fields/categories a new version stops logging are cleaned up via ordinary `del` records. No fresh log or second snapshot — the existing log just gets one reconcile pass that behaves like a snapshot for state, while keeping its `seq` numbering and history intact. |
 | User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed. |
 | Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile**, then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
 | Model closing | `DocumentClosing` | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed" |
@@ -260,6 +262,38 @@ searches) stays behind the on-demand tools while the model is open.
 mid-snapshot): after these fixes, the element count is building-elements-only; a known door
 shows mark, host wall, from/to room, storey and space; a small edit produces one `chg` plus a
 partial `el` of about 120 bytes; the snapshot reaches a `cp`.
+
+## Round 4: reconcile-on-open stalling (2026-09-24)
+
+After the round-3 release (v1.0.14, producer version `0.4.0`), a live-Revit reopen of the same
+"Horizons" project reported: the connector started, wrote a `header`, and began adding `eid`/`ifc`
+to existing elements — but the bulk update stopped after **~205 of ~33,600 elements**, in a
+~2-minute burst, and never recovered. No checkpoint was ever written, the log kept updating the
+same morning's segment instead of a clean new snapshot, and no record named which producer
+version wrote what.
+
+| # | Symptom reported | Root cause | Fix |
+|---|---|---|---|
+| 1 | Reconcile processes ~200 elements in a 2-minute burst, then drops to 1–3/minute (matching only live edits) | `App.cs`'s `OnIdling` handler never called `IdlingEventArgs.SetRaiseWithoutDelay()`. Revit's `Idling` event fires once and then waits for further UI activity (mouse move, keystroke) before firing again — it is not a free-running timer. Without this call, `IdleSliceRunner`'s slice-based reconcile only progresses while the user is actively moving the mouse over Revit's window, and stalls almost completely the moment they stop. | `App.cs`'s `OnIdling` now calls `e.SetRaiseWithoutDelay()` whenever `ModelLogService.HasPendingWork` is true, so Idling keeps firing back-to-back until the queue drains, then reverts to Revit's normal cadence. |
+| 2 | Log still ~97% noise (sketches/tags/dimensions); no room/MEP/sheet-tag data | Direct consequence of #1 — the reconcile that applies the round-2/round-3 noise filter and relation-building fixes never got far enough to reach most of the model. Not a separate bug. | Same fix — once the reconcile actually completes, the round-2/round-3 fixes (already merged, see the round-2 review above) apply to every element, not just the first ~200. |
+| 3 | No checkpoint ever written | Same root cause — a checkpoint is only written when `ReconcileJob`'s enumerator finishes, which never happened. | Same fix. |
+| 4 | No record of which producer version wrote which records — only that morning's `header` (version `0.4.0`) | The connector had no per-open version record at all. | New `session` record kind, written on every `DocumentOpened` (`RecordKinds.Session`, `ModelLogWriter.RecordSession`), carrying `producerVersion` and `revitVersion`. `ModelLogState.LastProducerVersion` persists the last one across sessions so the connector can detect its own upgrades. |
+
+**Upgrade cleanup** (separate developer feedback, same round): when `OnDocumentOpened` finds an
+existing log whose last `session` recorded a different `producerVersion` than the connector
+running now, it forces the reconcile that follows to write every field-group in full (not only
+what differs from the hash cache) — `ModelLogService.WalkModel`'s `forceFullState` and
+`detectDeletions` parameters were split apart (previously one bool controlled both) so a normal
+reconcile can keep detecting deletions while an upgrade-triggered one does both full-state writes
+and deletion detection in the same pass. This backfills any field a new version starts logging
+(e.g. `eid`/`ifc` for users upgrading from a version that didn't have them) and cleans up, via
+ordinary `del` records, anything a new version stops logging — without a second snapshot or a new
+log file, so `seq` numbering and log history stay intact.
+
+**Not yet verified** (needs a real reopen after this fix ships): that a reconcile on a ~33,600
+element model now actually reaches its checkpoint in one sitting (or several, but without long
+stalls between element ~200 and the rest), and that the `session`/upgrade-reconcile behavior
+produces the expected full-state backfill on the very next open after this version installs.
 
 ## Order, verification and done
 

@@ -61,6 +61,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }));
         }
 
+        /// <summary>True while any document has a queued idle-slice job (a snapshot/reconcile
+        /// still walking the model, or a change-capture batch) OR unflushed <c>DocumentChanged</c>
+        /// data waiting for its own job to be queued on the next tick. The caller (App.cs's
+        /// <c>OnIdling</c>) uses this to call <c>IdlingEventArgs.SetRaiseWithoutDelay()</c> —
+        /// without it, Revit throttles <c>Idling</c> down to firing only on further UI activity,
+        /// so a large snapshot/reconcile would stall for minutes at a time between mouse
+        /// movements instead of draining continuously.</summary>
+        public bool HasPendingWork =>
+            _idle.HasWork ||
+            _pending.Values.Any(p => p.Added.Count > 0 || p.Modified.Count > 0 || p.Deleted.Count > 0);
+
         private sealed class PendingChange
         {
             public readonly HashSet<ElementId> Added = new();
@@ -103,12 +114,28 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             _writers[doc] = writer;
 
-            if (writer.LastSeq == 0)
+            var isFreshLog = writer.LastSeq == 0;
+
+            // An existing log whose last session recorded a DIFFERENT producer version means an
+            // upgrade happened since the last open — per the developer feedback (github summary):
+            // "when an upgrade changes what gets logged, clean up the log ... send delete records
+            // for elements that are now filtered out, plus updates adding the new fields."
+            // Rather than track exactly which fields/filters changed between arbitrary versions,
+            // a full reconcile (every field-group re-written AND stale-element deletion re-run)
+            // gets the same result unconditionally: whatever the new version adds gets written,
+            // and anything the new version filters out that the old one logged gets deleted via
+            // the same KnownElementIdsNotIn comparison an ordinary reconcile already does.
+            var versionChanged = !isFreshLog && writer.LastProducerVersion is not null
+                && writer.LastProducerVersion != _producerVersion;
+
+            writer.RecordSession(_producerVersion, SafeRevitVersion(doc));
+
+            if (isFreshLog)
                 _idle.Enqueue("snapshot", SnapshotJob(doc, writer));
             else
             {
                 writer.WriteGapIfNeeded("no closed checkpoint from the previous session");
-                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer));
+                _idle.Enqueue("reconcile-on-open", ReconcileJob(doc, writer, forceFullState: versionChanged));
             }
         }
 
@@ -183,7 +210,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.Append(RecordKinds.Project, RecordBuilder.BuildProject(doc));
             yield return true;
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: true)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState: true, detectDeletions: false)) yield return step;
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
@@ -191,13 +218,20 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
         }
 
-        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer)
+        /// <param name="forceFullState">True only right after a producer-version change
+        /// (upgrade) detected in <see cref="OnDocumentOpened"/> — writes every field-group in
+        /// full, same as a snapshot, rather than only what differs from the hash cache, so a
+        /// version that added fields backfills them onto every existing element. Deletion
+        /// detection (<see cref="ModelLogWriter.KnownElementIdsNotIn"/>) still always runs on a
+        /// reconcile regardless of this flag — an ordinary reconcile's whole point is catching
+        /// elements deleted while the connector wasn't watching.</param>
+        private IEnumerator<bool> ReconcileJob(Document doc, ModelLogWriter writer, bool forceFullState = false)
         {
             var facts = ModelFacts.From(doc);
             var header = RecordBuilder.BuildHeader(doc, facts, _producerVersion);
             writer.RotateIfNeeded(header);
 
-            foreach (var step in WalkModel(doc, writer, forceFullState: false)) yield return step;
+            foreach (var step in WalkModel(doc, writer, forceFullState, detectDeletions: true)) yield return step;
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
@@ -316,13 +350,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
         }
 
         /// <summary>The full-model walk shared by snapshot and reconcile: definitions,
-        /// spatial tree, grids, materials, types, elements, sheets, revisions, links. On a
-        /// reconcile (<paramref name="forceFullState"/> false), also detects and deletes
-        /// elements that used to be in the log but are gone from the model now — the
-        /// handoff's "self-healing" property: this catches edits made while the connector
+        /// spatial tree, grids, materials, types, elements, sheets, revisions, links.
+        /// <paramref name="forceFullState"/> and <paramref name="detectDeletions"/> are
+        /// independent: a snapshot writes full state but skips deletion detection (nothing to
+        /// compare against yet, and every element is new by definition); an ordinary reconcile
+        /// does the opposite (only diffs changed since the hash cache, but always looks for
+        /// stale elements); a reconcile forced full-state by a producer-version change does
+        /// BOTH — the handoff's "self-healing" property (catches edits made while the connector
         /// wasn't running, or by another user, regardless of whether DocumentChanged ever
-        /// reported them.</summary>
-        private IEnumerable<bool> WalkModel(Document doc, ModelLogWriter writer, bool forceFullState)
+        /// reported them) plus backfilling whatever the new version adds.</summary>
+        private IEnumerable<bool> WalkModel(Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions)
         {
             foreach (Category cat in doc.Settings.Categories)
             {
@@ -398,7 +435,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 yield return true;
             }
 
-            if (!forceFullState)
+            if (detectDeletions)
             {
                 foreach (var staleUid in writer.KnownElementIdsNotIn(currentIds))
                 {
@@ -464,6 +501,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
         private static string? SafeVersionGuid(Document doc)
         {
             try { return Document.GetDocumentVersion(doc)?.VersionGUID.ToString(); }
+            catch { return null; }
+        }
+
+        private static string? SafeRevitVersion(Document doc)
+        {
+            try { return doc.Application.VersionNumber; }
             catch { return null; }
         }
 

@@ -58,6 +58,21 @@ log instead. Loam reads the log; nobody calls anyone.
         element. Unit-tested against golden values computed directly from SRM's own Python
         implementation (`tests/ModelLog.Tests/IfcGuidTests.cs`).
 
+- [x] **Round 4 — reconcile-on-open stall (docs/MODEL_LOG.md's "Round 4" review section):** a
+      live-Revit reopen of "Horizons" on the round-3 release (v1.0.14, producer version `0.4.0`)
+      reported the reconcile processing only ~205 of ~33,600 elements in a 2-minute burst, then
+      almost fully stalling — no checkpoint, no cleaned-up noise, no room/MEP/sheet-tag data. Root
+      cause: `App.cs`'s `OnIdling` never called `IdlingEventArgs.SetRaiseWithoutDelay()`, so
+      Revit's `Idling` event stopped firing continuously the moment the user stopped moving the
+      mouse over its window — not a per-element slowness, an event-throttling bug. Fixed by
+      calling it whenever `ModelLogService.HasPendingWork` is true. Same round, separate developer
+      feedback ("write a session record every time the connector starts"; "when an upgrade changes
+      what gets logged, clean up the log"): added a `session` record kind
+      (`ModelLogWriter.RecordSession`, written on every `DocumentOpened`) and producer-version-
+      change detection that forces the next reconcile to write every field-group in full (not only
+      what differs) while still running deletion detection, so an upgrade backfills new fields and
+      cleans up dropped ones without a second snapshot or a new log file.
+
 **Not done — needs an actual Revit session (tracked, not forgotten):**
 - [ ] Verify the derived IFC GlobalId against a real IFC export (docs/MODEL_LOG.md's verification
       checklist, item 8).

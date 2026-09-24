@@ -8,6 +8,7 @@ namespace Loam.Revit.Connector.ModelLog
     public static class RecordKinds
     {
         public const string Header = "header";
+        public const string Session = "session";
         public const string Project = "project";
         public const string Pdef = "pdef";
         public const string Cat = "cat";
