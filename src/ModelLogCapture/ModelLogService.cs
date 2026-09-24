@@ -121,6 +121,26 @@ namespace Loam.Revit.Connector.ModelLogCapture
             else _busy[doc] = n - 1;
         }
 
+        /// <summary>True while ANY document is paused for a sync/reload/save pre-event (see
+        /// <see cref="BeginDocumentBusy"/>). Read-only signal for OTHER idle-time work that also
+        /// touches the Revit API and must not run mid-sync — <c>App.cs</c>'s own idle-time
+        /// resolution of a Loam "changed" push (UniqueId lookups, <c>WorksharingUtils</c>) checks
+        /// this before calling <c>doc.GetElement</c>, the same crash <see cref="_busy"/> itself
+        /// exists to prevent.</summary>
+        public bool IsBusy => _busy.Count > 0;
+
+        /// <summary>Sets the LastChangedBy for <paramref name="doc"/>'s currently-accumulating
+        /// change batch, if one still exists (a no-op once it's already been drained into a
+        /// <c>chg</c> record, or if nothing is pending yet). Lets a caller resolve
+        /// <c>WorksharingUtils.GetWorksharingTooltipInfo</c> lazily during idle time instead of
+        /// synchronously inside <c>DocumentChanged</c> — see <c>App.cs</c>'s own idle-time
+        /// resolution — without losing the model log's own `chg.by` field.</summary>
+        public void SetPendingLastChangedBy(Document doc, string? lastChangedBy)
+        {
+            if (string.IsNullOrEmpty(lastChangedBy)) return;
+            if (_pending.TryGetValue(doc, out var p)) p.LastChangedBy = lastChangedBy;
+        }
+
         /// <summary>True while any document has a queued idle-slice job (a snapshot/reconcile
         /// still walking the model, or a change-capture batch) OR unflushed <c>DocumentChanged</c>
         /// data waiting for its own job to be queued on the next tick.</summary>
@@ -375,10 +395,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // touch any document then (see the crash note above _busy).
             if (_busy.Count > 0) return;
 
-            foreach (var kv in _pending)
+            // Snapshotted first: assigning _pending[doc] = new PendingChange() for a KEY ALREADY
+            // IN the dictionary, while enumerating that SAME dictionary, bumps its version on
+            // .NET Framework 4.8 (net48 — Revit 2024) the same as an Add/Remove would, so the
+            // next MoveNext throws InvalidOperationException — caught by OnIdling's own callers
+            // and silently swallowed, meaning the drain below never completes. A plain list of
+            // keys, iterated separately, sidesteps that entirely.
+            foreach (var doc in new List<Document>(_pending.Keys))
             {
-                var doc = kv.Key;
-                if (kv.Value.Added.Count == 0 && kv.Value.Modified.Count == 0 && kv.Value.Deleted.Count == 0) continue;
+                var change = _pending[doc];
+                if (change.Added.Count == 0 && change.Modified.Count == 0 && change.Deleted.Count == 0) continue;
                 if (_changeJobQueued.Contains(doc)) continue;
                 // A snapshot/reconcile for this document is already queued or running — it will
                 // walk (and, for a modified element, re-read) every element anyway, so a
@@ -387,7 +413,6 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 if (_walkOutstanding.Contains(doc)) continue;
                 if (!_writers.TryGetValue(doc, out var writer)) continue;
 
-                var change = kv.Value;
                 _pending[doc] = new PendingChange(); // fresh accumulator for what happens next
                 _changeJobQueued.Add(doc);
                 var gen = Generation(doc);
@@ -464,7 +489,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
             bool IsStale() => Generation(doc) != gen || !IsDocumentValid(doc);
             if (IsStale()) yield break;
 
-            var incremental = allowIncremental && TryGetIncrementalDiff(doc, writer, out var diff) && !RequiresFullReconcile(doc, diff!);
+            // `diff` is used in a LATER statement (inside `if (incremental)`), not within this
+            // same boolean expression, so its `out` assignment through the `&&` chain isn't
+            // "definitely assigned" from the compiler's perspective there (CS0165) — pre-declared
+            // and assigned via a plain `out diff` instead of `out var diff`.
+            DocumentDifference? diff = null;
+            var incremental = allowIncremental && TryGetIncrementalDiff(doc, writer, out diff) && !RequiresFullReconcile(doc, diff!);
             if (incremental)
             {
                 foreach (var step in IncrementalReconcile(doc, writer, diff!, IsStale)) yield return step;
@@ -526,11 +556,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// exact per-id logic <see cref="ChangeCaptureJob"/>'s edit loop uses, so there is no
         /// second copy of "how to turn one Revit element into a record". A created/modified
         /// <see cref="IndependentTag"/> in the diff also refreshes the tag-per-sheet index once
-        /// (so `sheets` catches up on every element it tags). Deleted ids are matched against the
-        /// hash cache's own known `el` UniqueIds by their numeric tail (<see
+        /// (so `sheets` catches up on every element it tags). Deleted ids are matched against
+        /// every non-write-once family: node/type/mat directly (their own id is already
+        /// <c>"prefix" + ElementId</c>, no UniqueId involved — <see cref="ModelLogWriter.IsKnownId"/>),
+        /// el/grid/sheet/rev/link by their known UniqueIds' numeric tail (<see
         /// cref="UniqueIdElementId"/>) — <c>GetDeletedElementIds()</c> only ever gives numbers,
-        /// never resolvable to a live Element or UniqueId any more; an id with no match simply
-        /// isn't in the log.</summary>
+        /// never resolvable to a live Element or UniqueId any more; an id with no match in any
+        /// family simply isn't in the log.</summary>
         private IEnumerable<bool> IncrementalReconcile(
             Document doc, ModelLogWriter writer, DocumentDifference diff, Func<bool> isStale)
         {
@@ -599,19 +631,55 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var deletedIds = diff.GetDeletedElementIds();
             if (deletedIds.Count == 0) yield break;
 
-            // Built ONCE for the whole batch, not per deleted id — a per-id linear scan over a
-            // large model's known ids would make a big deletion batch quadratic.
-            var knownByTail = new Dictionary<long, string>();
-            foreach (var uid in writer.KnownElementUniqueIds())
-                if (UniqueIdElementId.TryGetElementIdTail(uid, out var tail))
-                    knownByTail[tail] = uid;
+            // UniqueId-keyed families: built ONCE for the whole batch, not per deleted id — a
+            // per-id linear scan over a large model's known ids would make a big deletion batch
+            // quadratic. Same trick `el` deletion matching uses (UniqueIdElementId) — a numeric
+            // ElementId never resolves to anything after deletion, so it's matched against the
+            // hash cache's own known UniqueIds by their numeric tail instead of asking Revit.
+            Dictionary<long, string> TailMap(string family)
+            {
+                var map = new Dictionary<long, string>();
+                foreach (var uid in writer.KnownIds(family))
+                    if (UniqueIdElementId.TryGetElementIdTail(uid, out var tail))
+                        map[tail] = uid;
+                return map;
+            }
+            var elByTail = TailMap(RecordKinds.El);
+            var gridByTail = TailMap(RecordKinds.Grid);
+            var sheetByTail = TailMap(RecordKinds.Sheet);
+            var revByTail = TailMap(RecordKinds.Rev);
+            var linkByTail = TailMap(RecordKinds.Link);
             yield return true;
 
             foreach (var deletedId in deletedIds)
             {
                 if (isStale()) yield break;
-                if (knownByTail.TryGetValue(deletedId.Value, out var uid))
-                    writer.WriteDelete(uid, deletedId.Value);
+
+                // node/type/mat are never keyed by UniqueId ("n:"/"t:"/"m:" + ElementId directly
+                // — see RecordBuilder.NodeId/TypeId/MaterialId), so the candidate id is already
+                // known; IsKnownId just confirms the log actually has it before writing a `del`.
+                var nodeId = RecordBuilder.NodeId(deletedId);
+                var typeId = RecordBuilder.TypeId(deletedId);
+                var matId = RecordBuilder.MaterialId(deletedId);
+
+                if (elByTail.TryGetValue(deletedId.Value, out var elUid))
+                    writer.WriteDelete(elUid, deletedId.Value);
+                else if (writer.IsKnownId(RecordKinds.Node, nodeId))
+                    writer.WriteDelete(nodeId, deletedId.Value, family: RecordKinds.Node);
+                else if (writer.IsKnownId(RecordKinds.Type, typeId))
+                    writer.WriteDelete(typeId, deletedId.Value, family: RecordKinds.Type);
+                else if (writer.IsKnownId(RecordKinds.Mat, matId))
+                    writer.WriteDelete(matId, deletedId.Value, family: RecordKinds.Mat);
+                else if (gridByTail.TryGetValue(deletedId.Value, out var gridUid))
+                    writer.WriteDelete(gridUid, deletedId.Value, family: RecordKinds.Grid);
+                else if (sheetByTail.TryGetValue(deletedId.Value, out var sheetUid))
+                    writer.WriteDelete(sheetUid, deletedId.Value, family: RecordKinds.Sheet);
+                else if (revByTail.TryGetValue(deletedId.Value, out var revUid))
+                    writer.WriteDelete(revUid, deletedId.Value, family: RecordKinds.Rev);
+                else if (linkByTail.TryGetValue(deletedId.Value, out var linkUid))
+                    writer.WriteDelete(linkUid, deletedId.Value, family: RecordKinds.Link);
+                // else: not in the log at all (never-logged noise element) — nothing to delete.
+
                 yield return true;
             }
         }
@@ -882,22 +950,29 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
 
             var gridLines = new List<(string, Line)>();
+            var seenGridIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Grid))))
             {
                 if (isStale()) yield break;
                 if (doc.GetElement(id) is Grid g)
                 {
+                    seenGridIds.Add(g.UniqueId);
                     writer.WriteIfChanged(RecordKinds.Grid, g.UniqueId, RecordBuilder.BuildGrid(g), forceFullState);
                     if (g.Curve is Line line) gridLines.Add((g.Name, line));
                 }
                 yield return true;
             }
 
+            var seenMatIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Material))))
             {
                 if (isStale()) yield break;
                 if (doc.GetElement(id) is Material mat)
-                    writer.WriteIfChanged(RecordKinds.Mat, RecordBuilder.MaterialId(mat.Id), RecordBuilder.BuildMaterial(mat), forceFullState);
+                {
+                    var mid = RecordBuilder.MaterialId(mat.Id);
+                    seenMatIds.Add(mid);
+                    writer.WriteIfChanged(RecordKinds.Mat, mid, RecordBuilder.BuildMaterial(mat), forceFullState);
+                }
                 yield return true;
             }
 
@@ -936,42 +1011,88 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 yield return true;
             }
 
-            if (detectDeletions)
-            {
-                foreach (var staleUid in writer.KnownElementIdsNotIn(currentIds))
-                {
-                    if (isStale()) yield break;
-                    // The numeric ElementId no longer resolves (the element is gone) and wasn't
-                    // tracked separately from its UniqueId — WriteDelete omits it rather than
-                    // fabricate one.
-                    writer.WriteDelete(staleUid);
-                    yield return true;
-                }
-            }
-
+            var seenSheetIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(ViewSheet))))
             {
                 if (isStale()) yield break;
                 if (doc.GetElement(id) is ViewSheet sheet)
+                {
+                    seenSheetIds.Add(sheet.UniqueId);
                     writer.WriteIfChanged(RecordKinds.Sheet, sheet.UniqueId, RecordBuilder.BuildSheet(sheet), forceFullState);
+                }
                 yield return true;
             }
+            var seenRevIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(Revision))))
             {
                 if (isStale()) yield break;
                 if (doc.GetElement(id) is Revision rev)
+                {
+                    seenRevIds.Add(rev.UniqueId);
                     writer.WriteIfChanged(RecordKinds.Rev, rev.UniqueId, RecordBuilder.BuildRevision(rev), forceFullState);
+                }
                 yield return true;
             }
+            var seenLinkIds = new HashSet<string>();
             foreach (var id in Ids(new FilteredElementCollector(doc).OfClass(typeof(RevitLinkInstance))))
             {
                 if (isStale()) yield break;
                 if (doc.GetElement(id) is RevitLinkInstance link)
                 {
+                    seenLinkIds.Add(link.UniqueId);
                     ModelFacts? linkedFacts = null;
                     try { var linkDoc = link.GetLinkDocument(); if (linkDoc is not null) linkedFacts = ModelFacts.From(linkDoc); } catch { }
                     writer.WriteIfChanged(RecordKinds.Link, link.UniqueId, RecordBuilder.BuildLink(link, linkedFacts), forceFullState);
                 }
+                yield return true;
+            }
+
+            if (!detectDeletions) yield break;
+
+            // Every non-write-once family, not just `el` — a deleted type/level/room/grid/
+            // material/sheet/revision/link used to stay in the log forever. `type` is special:
+            // it counts as "gone from the logged state" once no logged element still uses it any
+            // more (typeIds collects every type id an element this walk actually referenced,
+            // whether or not that element itself was newly written) — that can happen because the
+            // ElementType was deleted, OR simply because every element that used to reference it
+            // was itself deleted/retyped this walk. Either way a `type` record nothing points at
+            // is dead weight, so it's deleted too; this is intentional, not a gap.
+            var seenTypeIds = new HashSet<string>();
+            foreach (var tid in typeIds) seenTypeIds.Add(RecordBuilder.TypeId(tid));
+
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.El, currentIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Type, seenTypeIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Node, new HashSet<string>(nodeIdByLevelOrSpace.Values), isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Grid, seenGridIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Mat, seenMatIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Sheet, seenSheetIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Rev, seenRevIds, isStale)) yield return step;
+            if (isStale()) yield break;
+            foreach (var step in WriteFamilyDeletions(writer, RecordKinds.Link, seenLinkIds, isStale)) yield return step;
+        }
+
+        /// <summary>Writes a `del` record (with an `of` field naming the family, EXCEPT for
+        /// <c>el</c> — existing readers already expect its `del` records to carry no `of`) for
+        /// every id <paramref name="family"/>'s hash cache still knows that isn't in <paramref
+        /// name="seenIds"/> (the ids this walk actually found still present). Shared by every
+        /// family's deletion detection in <see cref="WalkModel"/> so the "compare cache to what
+        /// was actually seen, delete the rest" logic exists exactly once.</summary>
+        private static IEnumerable<bool> WriteFamilyDeletions(
+            ModelLogWriter writer, string family, ISet<string> seenIds, Func<bool> isStale)
+        {
+            foreach (var staleId in writer.KnownIdsNotIn(family, seenIds))
+            {
+                if (isStale()) yield break;
+                // No numeric id: for `el` it never resolves any more (the element is gone); for
+                // every other family, that family's own id already encodes what's needed (or, for
+                // grid/sheet/rev/link, is itself a UniqueId with nothing further to add).
+                writer.WriteDelete(staleId, family: family);
                 yield return true;
             }
         }

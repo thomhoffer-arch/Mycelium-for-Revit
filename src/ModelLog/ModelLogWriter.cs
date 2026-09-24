@@ -77,12 +77,23 @@ namespace Loam.Revit.Connector.ModelLog
         /// <c>Document.GetChangedElements</c> for an incremental reconcile.</summary>
         public string? LastCompleteModelVersion => _state.LastCompleteModelVersion;
 
-        /// <summary>Every UniqueId this log's hash cache currently knows for the <c>el</c>
-        /// family — the set an incremental reconcile's deletion matching builds its numeric-
-        /// ElementId reverse map from (<c>DocumentDifference.GetDeletedElementIds()</c> only ever
-        /// gives numbers, never resolvable to a UniqueId any more — see
-        /// <see cref="UniqueIdElementId"/>).</summary>
-        public IEnumerable<string> KnownElementUniqueIds() => _state.Cache.KnownIds(RecordKinds.El);
+        /// <summary>Every id this log's hash cache currently knows for <paramref name="family"/>
+        /// — for a UniqueId-keyed family (el/grid/sheet/rev/link), the set an incremental
+        /// reconcile's deletion matching builds its numeric-ElementId reverse map from
+        /// (<c>DocumentDifference.GetDeletedElementIds()</c> only ever gives numbers, never
+        /// resolvable to a UniqueId any more — see <see cref="UniqueIdElementId"/>).</summary>
+        public IEnumerable<string> KnownIds(string family) => _state.Cache.KnownIds(family);
+
+        /// <summary>Back-compat convenience for the <c>el</c>-family case — equivalent to
+        /// <c>KnownIds(RecordKinds.El)</c>.</summary>
+        public IEnumerable<string> KnownElementUniqueIds() => KnownIds(RecordKinds.El);
+
+        /// <summary>Whether <paramref name="id"/> is currently known for <paramref
+        /// name="family"/> — an incremental reconcile's direct-id families (node/type/mat, keyed
+        /// by <c>"prefix" + ElementId</c>, never a UniqueId) use this instead of the
+        /// UniqueId-tail trick to confirm a deleted ElementId's candidate id was actually
+        /// logged before writing a `del` for it.</summary>
+        public bool IsKnownId(string family, string id) => _state.Cache.Get(family, id) is not null;
 
         public ModelLogWriter(string modelLogRoot, string modelId)
         {
@@ -388,28 +399,38 @@ namespace Loam.Revit.Connector.ModelLog
             return withId;
         }
 
-        /// <summary>Element ids known from a previous session/segment but absent from the
-        /// current walk — the reconcile's deletion candidates. Compares against the
-        /// <c>el</c> family only (a deleted element's type record, if any, is left for the
-        /// reconcile to independently decide is still referenced or not).</summary>
-        public IReadOnlyList<string> KnownElementIdsNotIn(ISet<string> currentIds)
+        /// <summary>Ids known from a previous session/segment for <paramref name="family"/> but
+        /// absent from <paramref name="currentIds"/> — a reconcile's deletion candidates. Works
+        /// for any non-write-once family (el/type/node/grid/mat/sheet/rev/link) — pdef/cat are
+        /// never deleted (see <see cref="RecordKinds.IsWriteOnce"/>).</summary>
+        public IReadOnlyList<string> KnownIdsNotIn(string family, ISet<string> currentIds)
         {
             var stale = new List<string>();
-            foreach (var id in _state.Cache.KnownIds(RecordKinds.El))
+            foreach (var id in _state.Cache.KnownIds(family))
                 if (!currentIds.Contains(id)) stale.Add(id);
             return stale;
         }
 
+        /// <summary>Back-compat convenience for the (still common) <c>el</c>-family case —
+        /// equivalent to <c>KnownIdsNotIn(RecordKinds.El, currentIds)</c>.</summary>
+        public IReadOnlyList<string> KnownElementIdsNotIn(ISet<string> currentIds) =>
+            KnownIdsNotIn(RecordKinds.El, currentIds);
+
         /// <summary><paramref name="elementId"/> is omitted (never a fabricated 0) when the
-        /// caller doesn't have it any more — a reconcile detects a deletion purely from the
-        /// UniqueId disappearing from a fresh walk, with no numeric id available at all.</summary>
-        public void WriteDelete(string uniqueId, long? elementId = null)
+        /// caller doesn't have it any more — a reconcile detects a deletion purely from an id
+        /// disappearing from a fresh walk, with no numeric id available at all (true for every
+        /// family: a deleted ElementId never resolves back to one). <paramref name="family"/>
+        /// defaults to <c>el</c> (the original, still most common case) and is written as the
+        /// `del` record's own `of` field for every OTHER family — omitted for `el` so existing
+        /// readers, which only ever saw `el` deletions, are unaffected.</summary>
+        public void WriteDelete(string uniqueId, long? elementId = null, string family = RecordKinds.El)
         {
             var fields = new JsonObject { ["id"] = uniqueId };
             if (elementId is not null) fields["eid"] = elementId.Value;
+            if (family != RecordKinds.El) fields["of"] = family;
             Append(RecordKinds.Del, fields);
-            _state.Cache.Remove(RecordKinds.El, uniqueId);
-            _journalBuffer.Add(StateJournal.HashRemoveOp(RecordKinds.El, uniqueId));
+            _state.Cache.Remove(family, uniqueId);
+            _journalBuffer.Add(StateJournal.HashRemoveOp(family, uniqueId));
         }
 
         private void FlushJournalBuffer()

@@ -78,7 +78,7 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `mat` | Snapshot; on change | Material: id (`m:<ElementId>`), name, class, and all its parameters |
 | `type` | Snapshot; on change | Id (`t:<ElementId>`), category, family, type name, all type parameters |
 | `el` | Snapshot (full); on change (partial) | The element (see below) |
-| `del` | On delete | UniqueId and numeric ElementId (when still known) |
+| `del` | On delete, for EVERY family (`el`/`type`/`node`/`grid`/`mat`/`sheet`/`rev`/`link`) | Id (that family's own id scheme) and numeric ElementId (when still known); `of` names the family, omitted for `el` |
 | `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, and the ids of the revisions it carries |
 | `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued |
 | `link` | Snapshot; on change | Linked model instance: the link's model identity and its transform |
@@ -111,9 +111,16 @@ a value.
 | `sheets` | sheet | Sheet numbers of every sheet a tag on this element is placed on |
 | `p` | param | Every instance parameter with a value: `[pdef id, value]` pairs. Element-id values are written as the referenced element's UniqueId. |
 
-`del` (deletion) records carry `id` (UniqueId) always, `eid` only when the caller still had the
-numeric ElementId at the time — a reconcile-detected deletion (an id that vanished from a fresh
-walk) never has one, since `Element.Id` isn't resolvable off a UniqueId that no longer exists.
+`del` (deletion) records carry `id` (that family's own id — a UniqueId for el/grid/sheet/rev/link,
+`"prefix" + ElementId` for type/node/mat) always, `eid` only when the caller still had the numeric
+ElementId at the time — a reconcile-detected deletion (an id that vanished from a fresh walk)
+never has one for `el`, since `Element.Id` isn't resolvable off a UniqueId that no longer exists,
+but does for every other family (their id already carries the ElementId, plainly recovered).
+`of` names the family (`type`, `node`, `grid`, `mat`, `sheet`, `rev`, `link`) and is omitted only
+for `el`, so a reader that only ever expected `el` deletions is unaffected. A `type` counts as
+deleted once no logged element references it any more — not necessarily because the `ElementType`
+itself was removed, also when every element that used it was itself deleted/retyped — this is
+intended: a `type` record nothing points at is dead weight either way.
 
 Rooms/spaces/areas are **never** `el` records — they're the spatial tree, logged as `node`
 records only (see `RecordBuilder.IsLoggableModelElement`); `h`'s own room/space number-and-name
@@ -451,6 +458,19 @@ looking it up against the hash cache's own known `el` ids — never asking Revit
 longer resolve a deleted id to anything. `cp` records also gained `modelSaves`
 (`DocumentVersion.NumberOfSaves`) alongside `modelVersion`, per the handoff's "version = GUID +
 number".
+
+## Round 10: deletions for every family (2026-09-24)
+
+Deletion detection only ever compared the `el` family — a deleted type, level/room/space, grid,
+material, sheet, revision or link stayed in the log forever. `ModelLogWriter.KnownElementIdsNotIn`
+generalized to `KnownIdsNotIn(family, seenIds)`; `WriteDelete` gained a `family` parameter (default
+`el`, unchanged behavior) that both selects which hash-cache family to remove from and, for every
+OTHER family, adds the `del` record's new `of` field. `WalkModel` now collects a seen-id set per
+family as it walks (node's is free — `nodeIdByLevelOrSpace`'s own values) and runs the same
+deletion check for all eight at the end, in one shared `WriteFamilyDeletions` helper. The
+incremental pass matches deleted ElementIds against node/type/mat directly (`"prefix" +
+ElementId`, `ModelLogWriter.IsKnownId`) and el/grid/sheet/rev/link by their UniqueIds' numeric tail
+(one `Dictionary<long,string>` per family, built once per batch).
 
 ## Order, verification and done
 

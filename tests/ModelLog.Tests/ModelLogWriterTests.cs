@@ -149,6 +149,73 @@ namespace ModelLog.Tests
         }
 
         [Fact]
+        public void KnownIdsNotIn_WorksForAnyFamily()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.Node, "n:1", new JsonObject { ["level"] = "storey", ["name"] = "L1" });
+            w.WriteIfChanged(RecordKinds.Node, "n:2", new JsonObject { ["level"] = "storey", ["name"] = "L2" });
+            w.WriteIfChanged(RecordKinds.Grid, "grid-guid-1", new JsonObject { ["name"] = "A" });
+
+            Assert.Equal(new[] { "n:2" }, w.KnownIdsNotIn(RecordKinds.Node, new HashSet<string> { "n:1" }));
+            Assert.Equal(new[] { "grid-guid-1" }, w.KnownIdsNotIn(RecordKinds.Grid, new HashSet<string>()));
+            Assert.Empty(w.KnownIdsNotIn(RecordKinds.Mat, new HashSet<string>())); // family never seen — nothing stale
+        }
+
+        [Fact]
+        public void WriteDelete_ElFamily_OmitsOfField()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+            w.WriteDelete("guid-1"); // default family: el
+
+            var lastLine = File.ReadAllLines(Seg(1)).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.False(parsed.ContainsKey("of"));
+        }
+
+        [Theory]
+        [InlineData(RecordKinds.Type)]
+        [InlineData(RecordKinds.Node)]
+        [InlineData(RecordKinds.Grid)]
+        [InlineData(RecordKinds.Mat)]
+        [InlineData(RecordKinds.Sheet)]
+        [InlineData(RecordKinds.Rev)]
+        [InlineData(RecordKinds.Link)]
+        public void WriteDelete_NonElFamily_IncludesOfField(string family)
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteDelete("some-id", family: family);
+
+            var lastLine = File.ReadAllLines(Seg(1)).Last();
+            var parsed = JsonNode.Parse(lastLine)!.AsObject();
+            Assert.Equal(family, parsed["of"]!.GetValue<string>());
+        }
+
+        [Fact]
+        public void IsKnownId_ReflectsFamilyMembership()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.Node, "n:5", new JsonObject { ["level"] = "storey", ["name"] = "L1" });
+
+            Assert.True(w.IsKnownId(RecordKinds.Node, "n:5"));
+            Assert.False(w.IsKnownId(RecordKinds.Node, "n:6"));
+            Assert.False(w.IsKnownId(RecordKinds.Mat, "n:5")); // right id, wrong family
+        }
+
+        [Fact]
+        public void WriteDelete_RemovesFromCorrectFamilyOnly()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.Node, "n:1", new JsonObject { ["level"] = "storey", ["name"] = "L1" });
+            w.WriteIfChanged(RecordKinds.El, "n:1", El(1, 1, "W")); // same string id, different family — must not collide
+
+            w.WriteDelete("n:1", family: RecordKinds.Node);
+
+            Assert.Empty(w.KnownIdsNotIn(RecordKinds.Node, new HashSet<string>()));
+            Assert.Equal(new[] { "n:1" }, w.KnownIdsNotIn(RecordKinds.El, new HashSet<string>())); // el family untouched
+        }
+
+        [Fact]
         public void WriteIfUnseen_WritesOnceThenNeverAgain()
         {
             using var w = new ModelLogWriter(_root, "model-a");
