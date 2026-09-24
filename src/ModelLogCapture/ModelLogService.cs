@@ -39,6 +39,20 @@ namespace Loam.Revit.Connector.ModelLogCapture
         private readonly Dictionary<Document, ModelLogWriter> _writers = new();
         private readonly Dictionary<Document, PendingChange> _pending = new();
         private readonly HashSet<Document> _changeJobQueued = new();
+        private readonly Dictionary<Document, IndexCache> _indexCache = new();
+
+        /// <summary>Node/grid/tagged-sheet indexes are whole-document walks — expensive to
+        /// rebuild, but stable between edits. Built once by the last snapshot/reconcile pass and
+        /// reused by every change-capture batch after that (mutated in place as levels/spaces/
+        /// grids change); rebuilding one of these on every ordinary edit — the bug this cache
+        /// fixes — meant even a single parameter change on one wall re-walked every sheet, tag,
+        /// room, space, level and grid in the document before touching the wall itself.</summary>
+        private sealed class IndexCache
+        {
+            public Dictionary<ElementId, string> NodeIndex = new();
+            public List<(string Name, Line Line)> GridLines = new();
+            public Dictionary<ElementId, List<string>> TaggedSheets = new();
+        }
 
         public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null)
         {
@@ -113,6 +127,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _writers.Remove(doc);
             _pending.Remove(doc);
             _changeJobQueued.Remove(doc);
+            _indexCache.Remove(doc);
         }
 
         /// <summary>Called from <c>DocumentChanged</c> — records ONLY the raw ids/names, never
@@ -169,6 +184,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             yield return true;
 
             foreach (var step in WalkModel(doc, writer, forceFullState: true)) yield return step;
+            RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
@@ -182,10 +198,24 @@ namespace Loam.Revit.Connector.ModelLogCapture
             writer.RotateIfNeeded(header);
 
             foreach (var step in WalkModel(doc, writer, forceFullState: false)) yield return step;
+            RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
             writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
+        }
+
+        /// <summary>Rebuilds the whole-document node/grid/tagged-sheet indexes ONCE, right after
+        /// a snapshot or reconcile finishes walking the same data anyway — the one place this
+        /// cost is expected and paid rarely (model open, sync, reload), never per edit.</summary>
+        private void RefreshIndexCache(Document doc)
+        {
+            _indexCache[doc] = new IndexCache
+            {
+                NodeIndex = BuildNodeIndex(doc),
+                GridLines = BuildGridLines(doc),
+                TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc),
+            };
         }
 
         private IEnumerator<bool> ChangeCaptureJob(
@@ -196,10 +226,31 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 added: change.Added.Count, modified: change.Modified.Count, deleted: change.Deleted.Count));
             yield return true;
 
-            var nodeIdByLevelOrSpace = BuildNodeIndex(doc);
-            var gridLines = BuildGridLines(doc);
+            // Reuse the whole-document indexes the last snapshot/reconcile built, instead of
+            // re-walking every sheet/tag/room/space/level/grid in the document for THIS one
+            // batch of changes — the fix for a real stall: an ordinary one-element edit used to
+            // pay that whole-document cost every time. Only rebuilt here if no snapshot/
+            // reconcile has run yet in this session (shouldn't normally happen — OnDocumentOpened
+            // always queues one first) or if this batch touched a tag/sheet (rare; see below).
+            if (!_indexCache.TryGetValue(doc, out var cache))
+                _indexCache[doc] = cache = new IndexCache
+                {
+                    NodeIndex = BuildNodeIndex(doc),
+                    GridLines = BuildGridLines(doc),
+                    TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc),
+                };
+            yield return true;
+
+            if (TouchesTagOrSheet(doc, change.AddedOrModified))
+            {
+                cache.TaggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
+                yield return true;
+            }
+
+            var nodeIdByLevelOrSpace = cache.NodeIndex;
+            var gridLines = cache.GridLines;
             var defaultPhase = ElementContextReader.DefaultPhase(doc, null);
-            var taggedSheets = RecordBuilder.BuildTaggedSheetIndex(doc);
+            var taggedSheets = cache.TaggedSheets;
             var typeIds = new HashSet<ElementId>();
             void OnParamDef(Parameter p, bool isType)
             {
@@ -376,6 +427,19 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 writer.WriteIfChanged(RecordKinds.Link, link.UniqueId, RecordBuilder.BuildLink(link, linkedFacts), forceFullState);
                 yield return true;
             }
+        }
+
+        /// <summary>Cheap, per-changed-id check (never a document walk) for whether this batch
+        /// needs the tagged-sheet index rebuilt — true only when a tag or sheet itself was
+        /// touched, which is rare compared to ordinary model edits.</summary>
+        private static bool TouchesTagOrSheet(Document doc, IEnumerable<ElementId> ids)
+        {
+            foreach (var id in ids)
+            {
+                var el = doc.GetElement(id);
+                if (el is IndependentTag or ViewSheet) return true;
+            }
+            return false;
         }
 
         private static Dictionary<ElementId, string> BuildNodeIndex(Document doc)

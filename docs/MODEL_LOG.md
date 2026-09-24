@@ -96,6 +96,7 @@ a value.
 | Field | Role | Source in Revit |
 |---|---|---|
 | `id`, `eid` | identity | `UniqueId`; numeric `ElementId` |
+| `ifc` | identity | IFC GlobalId: `{guid}` from the stored `IFC_GUID` parameter when present (authoritative — what Revit's own IFC exporter wrote), else `{guid, derived: true}` computed from `UniqueId` (`ModelLog/IfcGuid.cs`, ported from SRM's `srm/ifcguid.py`) — an extra identifier so Loam can link ClashControl/BCF/IFC-export/email references straight to the Revit element, never a model→IFC conversion |
 | `cat`, `fam` | param | Category id (a `cat` record), family name |
 | `type` | type | `GetTypeId()` → a `type` record |
 | `h` | handle | Mark, Type Mark (via type) |
@@ -292,7 +293,11 @@ follow-up.
 6. **Size:** measure both fixture models against the size table and record the real numbers here.
 7. `RecordBuilder`'s per-category quantity/grid-intersection heuristics (marked `NEEDS
    LIVE-REVIT CHECK` in that file's own comments) match what a drafter would actually expect.
+8. **IFC GlobalId:** export a small model to IFC from Revit with "Store IFC GUID" enabled, then
+   confirm the `ifc.guid` this connector computed for those elements *before* that export (when
+   `IFC_GUID` was still empty, so the logged value was `derived: true`) matches the GlobalId the
+   export actually assigned.
 
-**Done** = all seven steps merged; the two recorded fixtures checked in; the six Revit checks
+**Done** = all seven steps merged; the two recorded fixtures checked in; the eight Revit checks
 passed and written up; the add-in rebuilt and installed on the office machines. This repo has
-merged all seven steps' code; the fixtures and the six Revit checks are the open item.
+merged all seven steps' code; the fixtures and the eight Revit checks are the open item.

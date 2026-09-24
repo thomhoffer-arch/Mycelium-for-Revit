@@ -41,8 +41,26 @@ log instead. Loam reads the log; nobody calls anyone.
       connected elements in `rel`; `el.sheets` via a tag reverse index
       (`BuildTaggedSheetIndex`); a room/space/grid edit now updates its own `node`/`grid` record
       live in `ChangeCaptureJob`, not just on the next reconcile.
+- [x] **Round 3 — perceived UI stalls + IFC GlobalId:**
+      - **Performance regression fix**: round 2's `el.sheets`/node-index/grid-lines support had
+        `ChangeCaptureJob` rebuild the WHOLE document's tag/sheet/room/space/level/grid indexes
+        on every single edit batch, even a one-parameter change on one wall — a live report of
+        Revit "stuck for a second or a few" during ordinary editing. Fixed with `IndexCache`: the
+        indexes are built once per snapshot/reconcile and reused across all change-capture
+        batches until something that actually invalidates them changes (a tag/sheet edit rebuilds
+        just the tag index; a level/space/grid edit updates its own cache entry in place).
+      - **IFC GlobalId** (`ifc` field on `el`): the stored `IFC_GUID` parameter when present, else
+        computed from `UniqueId` and marked `derived: true` — `src/ModelLog/IfcGuid.cs`, ported
+        from SRM's `srm/ifcguid.py` (thomhoffer-arch/SRM), verified there against
+        `ifcopenshell.guid`. An extra identifier, never a model→IFC conversion — the identity role
+        already named "IFC GUID parameter when present"; this fills it in for every element so
+        Loam can link ClashControl/BCF/IFC-export/email GlobalId references to the right Revit
+        element. Unit-tested against golden values computed directly from SRM's own Python
+        implementation (`tests/ModelLog.Tests/IfcGuidTests.cs`).
 
 **Not done — needs an actual Revit session (tracked, not forgotten):**
+- [ ] Verify the derived IFC GlobalId against a real IFC export (docs/MODEL_LOG.md's verification
+      checklist, item 8).
 - [ ] Record two real fixture logs (one workshared, one with MEP) and check them in as test data.
 - [ ] Re-verify `h`/`pdef.spec`/host-relation population now that noise is filtered out — round 2
       couldn't confirm whether those were genuine bugs or just diluted by the noise the round 1
