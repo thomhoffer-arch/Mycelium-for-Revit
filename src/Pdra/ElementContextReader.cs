@@ -173,6 +173,29 @@ namespace PDRA.Services.Ai.Tools.Queries
             };
         }
 
+        /// <summary>Lean variant of <see cref="ResolveRoom"/> for the model-log path (
+        /// <c>RecordBuilder.BuildLocationRef</c>), which only ever uses the room's id — never its
+        /// name/number/level, which <see cref="ResolveRoom"/> reads just to discard here. Also
+        /// takes the element's bounding box from the caller instead of computing its own (the
+        /// model-log path already computes one bbox per element for <c>BuildGeometryRef</c>).
+        /// Same phase/point/GetRoomAtPoint logic as <see cref="ResolveRoom"/>, kept as a separate
+        /// method so ResolveRoom's own output (used by the frozen MCP tools) never changes.</summary>
+        public static ElementId? ResolveRoomId(Element el, Phase? phase, BoundingBoxXYZ? bbox)
+        {
+            if (phase is null) return null;
+
+            var pt = (el.Location as LocationPoint)?.Point;
+            if (pt is null)
+            {
+                if (bbox is null) return null;
+                pt = (bbox.Min + bbox.Max).Multiply(0.5);
+            }
+
+            Room? room;
+            try { room = el.Document.GetRoomAtPoint(pt, phase) as Room; } catch { return null; }
+            return room?.Id;
+        }
+
         /// <summary>Best-effort default Phase for room resolution when the caller has none of its
         /// own — the active view's phase, else the document's last phase, else null. Mirrors
         /// GetDoorRoomsTool.ResolvePhase's own default-selection fallback so a second caller doesn't

@@ -489,7 +489,12 @@ namespace Loam.Revit.Connector.ModelLogCapture
             catch { }
             if (h.Count > 0) fields["h"] = h;
 
-            var loc = BuildLocationRef(el, nodeIdByLevelOrSpace, defaultPhase);
+            // Computed once and reused below (room lookup's curve/point-less fallback, and the
+            // element's own `bb` field) — get_BoundingBox(null) used to run twice per element.
+            BoundingBoxXYZ? bb;
+            try { bb = el.get_BoundingBox(null); } catch { bb = null; }
+
+            var loc = BuildLocationRef(el, nodeIdByLevelOrSpace, defaultPhase, bb);
             if (loc is not null) fields["loc"] = loc;
 
             try
@@ -509,7 +514,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var q = BuildQuantities(el);
             if (q is not null) fields["q"] = q;
 
-            var bbOrPt = BuildGeometryRef(el);
+            var bbOrPt = BuildGeometryRef(el, bb);
             if (bbOrPt is not null)
                 foreach (var kv in bbOrPt) fields[kv.Key] = kv.Value?.DeepClone();
 
@@ -557,7 +562,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
         }
 
         private static JsonObject? BuildLocationRef(
-            Element el, IReadOnlyDictionary<ElementId, string> nodeIdByLevelOrSpace, Phase? defaultPhase)
+            Element el, IReadOnlyDictionary<ElementId, string> nodeIdByLevelOrSpace, Phase? defaultPhase, BoundingBoxXYZ? bb)
         {
             var loc = new JsonObject();
             try
@@ -568,13 +573,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             catch { }
 
-            var room = ElementContextReader.ResolveRoom(el, defaultPhase);
-            if (room?["id"] is not null)
-            {
-                var roomElId = new ElementId(room["id"]!.GetValue<long>());
-                if (nodeIdByLevelOrSpace.TryGetValue(roomElId, out var spaceNode))
-                    loc["space"] = spaceNode;
-            }
+            // Only the room's id is needed here (to look up its own `node` record) — the lean
+            // ResolveRoomId, not ResolveRoom's full name/number/level (built only to be thrown
+            // away here), and reuses the caller's already-computed bbox instead of a second
+            // get_BoundingBox(null) for a curve-based/no-location element.
+            var roomElId = ElementContextReader.ResolveRoomId(el, defaultPhase, bb);
+            if (roomElId is not null && nodeIdByLevelOrSpace.TryGetValue(roomElId, out var spaceNode))
+                loc["space"] = spaceNode;
 
             return loc.Count > 0 ? loc : null;
         }
@@ -749,16 +754,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return null;
         }
 
-        private static Dictionary<string, JsonNode?>? BuildGeometryRef(Element el)
+        private static Dictionary<string, JsonNode?>? BuildGeometryRef(Element el, BoundingBoxXYZ? bb)
         {
             var result = new Dictionary<string, JsonNode?>();
-            try
-            {
-                var bb = el.get_BoundingBox(null);
-                if (bb is not null)
-                    result["bb"] = new JsonArray { ToArray(bb.Min), ToArray(bb.Max) };
-            }
-            catch { }
+            if (bb is not null)
+                result["bb"] = new JsonArray { ToArray(bb.Min), ToArray(bb.Max) };
 
             try
             {

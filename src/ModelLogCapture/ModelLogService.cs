@@ -25,7 +25,9 @@ namespace Loam.Revit.Connector.ModelLogCapture
     /// <c>isUpgrade</c>.</item>
     /// <item>User edits (<c>DocumentChanged</c>) → NEVER processed inline (the handoff's "never
     /// block the user" rule) — only the raw ids/transaction names/editor are recorded; idle time
-    /// drains the queue into a <c>chg</c> record plus one record per touched id.</item>
+    /// drains the queue into a <c>chg</c> record plus one record per touched id. Held back
+    /// entirely while a snapshot/reconcile for that document is outstanding, since the walk
+    /// covers every element anyway — see <see cref="MarkWalkElementSnapshot"/>.</item>
     /// <item>Sync/reload-latest → reconcile (catches other users' changes even if
     /// <c>DocumentChanged</c> didn't report them).</item>
     /// <item>Closing → a final checkpoint with <c>closed: true</c>.</item>
@@ -44,6 +46,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
         private readonly Dictionary<Document, PendingChange> _pending = new();
         private readonly HashSet<Document> _changeJobQueued = new();
         private readonly Dictionary<Document, IndexCache> _indexCache = new();
+        // Ids pending for a document at the instant its currently-running walk (snapshot/
+        // reconcile) started — see MarkWalkElementSnapshot. An id changed AGAIN after that
+        // instant is removed from here by OnDocumentChanged, so it isn't wrongly treated as
+        // covered by a walk that read the model before that later edit happened.
+        private readonly Dictionary<Document, HashSet<ElementId>> _walkCoveredIds = new();
 
         /// <summary>Node/grid/tagged-sheet indexes are whole-document walks — expensive to
         /// rebuild, but stable between edits. Built once by the last snapshot/reconcile pass and
@@ -276,6 +283,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _upgradeOwed.Remove(doc);
             _snapshotOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
+            _walkCoveredIds.Remove(doc);
             // _generation keeps its (bumped) entry: removing it would reset this document to
             // generation 0 and make a job queued at generation 0 look current again.
         }
@@ -308,6 +316,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             foreach (var tn in transactionNames)
                 if (!p.TransactionNames.Contains(tn)) p.TransactionNames.Add(tn);
             if (!string.IsNullOrEmpty(lastChangedBy)) p.LastChangedBy = lastChangedBy;
+
+            // An edit landing AFTER an in-progress walk already took its covered-ids snapshot
+            // (MarkWalkElementSnapshot) un-covers this id: the walk read the model before this
+            // edit happened, so it must still get its own change-capture pass once the walk
+            // finishes, even though it was already in `p` (a HashSet.Add of an id already
+            // present is a no-op, so without this the edit would otherwise go unrecorded).
+            if (_walkCoveredIds.TryGetValue(doc, out var covered))
+            {
+                foreach (var id in added) covered.Remove(id);
+                foreach (var id in modified) covered.Remove(id);
+            }
         }
 
         /// <summary>Call on every Idling tick: runs one slice of whatever job is at the front of
@@ -324,6 +343,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 var doc = kv.Key;
                 if (kv.Value.Added.Count == 0 && kv.Value.Modified.Count == 0 && kv.Value.Deleted.Count == 0) continue;
                 if (_changeJobQueued.Contains(doc)) continue;
+                // A snapshot/reconcile for this document is already queued or running — it will
+                // walk (and, for a modified element, re-read) every element anyway, so a
+                // change-capture job here would just duplicate that work. Keep accumulating
+                // instead: nothing is lost — see MarkWalkElementSnapshot/ClearWalkCoveredPending.
+                if (_walkOutstanding.Contains(doc)) continue;
                 if (!_writers.TryGetValue(doc, out var writer)) continue;
 
                 var change = kv.Value;
@@ -376,6 +400,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             _snapshotOwed.Remove(doc);
             _upgradeOwed.Remove(doc);
             _walkOutstanding.Remove(doc);
+            ClearWalkCoveredPending(doc);
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
@@ -400,11 +425,52 @@ namespace Loam.Revit.Connector.ModelLogCapture
             foreach (var step in WalkModel(doc, writer, forceFullState: false, detectDeletions: true, IsStale)) yield return step;
             if (IsStale()) yield break; // see SnapshotJob
             _walkOutstanding.Remove(doc);
+            ClearWalkCoveredPending(doc);
             RefreshIndexCache(doc);
 
             var version = SafeVersionGuid(doc);
             var count = CountElements(doc);
             writer.WriteCheckpoint(complete: true, modelVersion: version, elementCount: count, closed: false);
+        }
+
+        /// <summary>Called as the very FIRST step of <see cref="WalkModel"/>, before any section
+        /// (levels/rooms/grids are walked before the element section, so the snapshot can't wait
+        /// for that). Records which of this document's currently-pending ids are covered:
+        /// everything the walk goes on to write is read fresh from the model, i.e. AFTER every
+        /// edit pending at this instant already happened, so those ids need no change-capture job
+        /// to redo the same work once the walk finishes (see <see cref="ClearWalkCoveredPending"/>).
+        /// An id changed again after this instant is removed from the covered set by
+        /// <see cref="OnDocumentChanged"/>, so a walk that already read its old state doesn't
+        /// wrongly swallow the later edit.</summary>
+        private void MarkWalkElementSnapshot(Document doc)
+        {
+            if (_pending.TryGetValue(doc, out var p) && (p.Added.Count > 0 || p.Modified.Count > 0))
+                _walkCoveredIds[doc] = new HashSet<ElementId>(p.Added.Concat(p.Modified));
+            else
+                _walkCoveredIds.Remove(doc);
+        }
+
+        /// <summary>Call once a snapshot/reconcile actually finishes (not on an abandoned/stale
+        /// walk — an interrupted walk never wrote anything for the ids it would have covered, so
+        /// nothing here may be discarded). Drops exactly the ids still recorded as covered (an id
+        /// changed again after the snapshot was already removed from that set by
+        /// <see cref="OnDocumentChanged"/>, so it survives here); anything else left in
+        /// <c>_pending</c> gets a change-capture job as usual once <c>_walkOutstanding</c> no
+        /// longer contains this document — the hash compare makes that a no-op wherever the walk
+        /// already wrote the latest state.</summary>
+        private void ClearWalkCoveredPending(Document doc)
+        {
+            // Dictionary.Remove(key, out value) is .NET Core-only — net48 (Revit 2024) has no
+            // overload taking `out`, so TryGetValue then Remove instead.
+            if (_walkCoveredIds.TryGetValue(doc, out var covered))
+            {
+                _walkCoveredIds.Remove(doc);
+                if (_pending.TryGetValue(doc, out var p))
+                {
+                    p.Added.ExceptWith(covered);
+                    p.Modified.ExceptWith(covered);
+                }
+            }
         }
 
         /// <summary>Rebuilds the whole-document node/grid/tagged-sheet indexes ONCE, right after
@@ -545,6 +611,11 @@ namespace Loam.Revit.Connector.ModelLogCapture
         private IEnumerable<bool> WalkModel(
             Document doc, ModelLogWriter writer, bool forceFullState, bool detectDeletions, Func<bool> isStale)
         {
+            // Snapshot taken before ANY section below (levels/rooms/grids are walked before the
+            // element section) — see MarkWalkElementSnapshot's own doc comment for why this must
+            // be the walk's very first step.
+            MarkWalkElementSnapshot(doc);
+
             // Every section below takes its list of ids (or, for categories, objects) in ONE step
             // with no `yield` inside, then walks that plain list, looking each element up fresh and
             // skipping any that no longer exist. A `foreach` over a live FilteredElementCollector
