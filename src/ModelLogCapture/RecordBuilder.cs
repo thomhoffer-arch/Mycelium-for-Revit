@@ -1,4 +1,5 @@
 using Autodesk.Revit.DB;
+using Autodesk.Revit.DB.Architecture;
 using PDRA.Services.Ai.Tools.Queries;
 using System;
 using System.Collections.Generic;
@@ -26,6 +27,47 @@ namespace Loam.Revit.Connector.ModelLogCapture
     /// </summary>
     public static class RecordBuilder
     {
+        // ── Element filter (which elements get an `el` record at all) ──────────────
+
+        // Category names confirmed as noise by the first real-model test (docs/MODEL_LOG.md's
+        // "Review of the first real log" section): area boundaries, sun path, and a few others
+        // whose CategoryType.Model + bracket/type filtering below might not catch on every Revit
+        // language/version. Display names, so this is best-effort across locales — the type
+        // checks below are the real defense (locale-independent).
+        private static readonly HashSet<string> NoiseCategoryNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Area Boundary", "Sun Path", "Cameras", "Legend Components",
+            "Work Plane Grid", "Space Type Settings",
+        };
+
+        /// <summary>Whether an element belongs in the log's `el` family at all — the fix for
+        /// the first real-model test's #1 finding: a raw whole-document walk logged 838 area
+        /// boundaries, 410 sketches, 243 sun path, 198 automatic dimensions and 158 views
+        /// against only 121 actual walls. Filters to genuine building/MEP/furnishing elements:
+        /// <see cref="CategoryType.Model"/> categories, never Revit's own bracketed internal
+        /// categories (<c>"&lt;Sketch&gt;"</c> etc.), never rooms/spaces/areas (those are the
+        /// spatial tree — logged as <c>node</c> records instead, by the caller's own separate
+        /// pass), and never annotation/view/schedule objects that occasionally carry a
+        /// CategoryType.Model category as a Revit quirk (checked by TYPE, not just category, so
+        /// that quirk can't let noise back in).</summary>
+        public static bool IsLoggableModelElement(Element el)
+        {
+            var cat = el.Category;
+            if (cat is null) return false;
+            if (string.IsNullOrEmpty(cat.Name) || cat.Name.StartsWith("<", StringComparison.Ordinal)) return false;
+            if (cat.CategoryType != CategoryType.Model) return false;
+            if (NoiseCategoryNames.Contains(cat.Name)) return false;
+
+            if (el is SpatialElement) return false; // Room, Space, Area — belongs in `node`, not `el`
+
+            if (el is View || el is ViewSheet || el is Viewport || el is Sketch || el is SketchPlane ||
+                el is Dimension || el is IndependentTag || el is ScheduleSheetInstance ||
+                el is AreaScheme || el is Material)
+                return false;
+
+            return true;
+        }
+
         // ── Header ───────────────────────────────────────────────────────────────
 
         /// <summary>Model identity, producer/version, display units per spec, coordinates, and
@@ -55,7 +97,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 ["location"] = new JsonArray { "loc", "bb", "pt" },
                 ["type"] = new JsonArray { "type" },
                 ["relation"] = new JsonArray { "rel", "mats" },
-                ["sheet"] = new JsonArray { "sheet" },
+                ["sheet"] = new JsonArray { "sheet", "sheets" },
                 ["quantity"] = new JsonArray { "q", "bb", "pt" },
                 ["param"] = new JsonArray { "p" },
             };
@@ -350,21 +392,62 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return fields;
         }
 
+        // ── Sheets: which sheets show/tag each element ──────────────────────────
+
+        /// <summary>Element id → the sheet numbers of every sheet a tag on that element is
+        /// placed on, built once per snapshot/reconcile pass (a reverse index over every
+        /// <see cref="IndependentTag"/> in the document is far cheaper than checking, per
+        /// element, which of the document's views/sheets shows it). The first real-model test's
+        /// fix #7: "which sheets show or tag the element".</summary>
+        public static Dictionary<ElementId, List<string>> BuildTaggedSheetIndex(Document doc)
+        {
+            var viewToSheet = new Dictionary<ElementId, string>();
+            foreach (ViewSheet sheet in new FilteredElementCollector(doc).OfClass(typeof(ViewSheet)))
+            {
+                try
+                {
+                    foreach (var vid in sheet.GetAllPlacedViews()) viewToSheet[vid] = sheet.SheetNumber;
+                }
+                catch { }
+            }
+
+            var index = new Dictionary<ElementId, List<string>>();
+            foreach (IndependentTag tag in new FilteredElementCollector(doc).OfClass(typeof(IndependentTag)))
+            {
+                ElementId viewId;
+                try { viewId = tag.OwnerViewId; } catch { continue; }
+                if (!viewToSheet.TryGetValue(viewId, out var sheetNum)) continue;
+
+                IEnumerable<ElementId> taggedIds;
+                try { taggedIds = tag.GetTaggedLocalElementIds(); } catch { continue; }
+                foreach (var tid in taggedIds)
+                {
+                    if (!index.TryGetValue(tid, out var list)) index[tid] = list = new List<string>();
+                    if (!list.Contains(sheetNum)) list.Add(sheetNum);
+                }
+            }
+            return index;
+        }
+
         // ── Elements (el) ────────────────────────────────────────────────────────
 
         /// <summary>Builds the full field-group set for one element (docs/MODEL_LOG.md's
         /// "What goes into each element record" table). <paramref name="onParamDef"/> is called
         /// once per instance parameter encountered (param, isTypeParam: false) so the caller can
         /// lazily emit a <c>pdef</c> record the first time each parameter id is seen, without
-        /// this method knowing anything about the writer/hash-cache.</summary>
+        /// this method knowing anything about the writer/hash-cache. <paramref
+        /// name="taggedSheets"/> (optional — see <see cref="BuildTaggedSheetIndex"/>) supplies
+        /// <c>sheets</c>: the sheet numbers of every sheet a tag on this element is placed
+        /// on.</summary>
         public static JsonObject BuildElementFields(
             Element el,
             IReadOnlyDictionary<ElementId, string> nodeIdByLevelOrSpace,
             IReadOnlyList<(string Name, Line Line)> grids,
             Phase? defaultPhase,
-            Action<Parameter, bool> onParamDef)
+            Action<Parameter, bool> onParamDef,
+            IReadOnlyDictionary<ElementId, List<string>>? taggedSheets = null)
         {
-            var fields = new JsonObject();
+            var fields = new JsonObject { ["eid"] = el.Id.Value };
 
             if (el.Category is not null) fields["cat"] = CategoryId(el.Category);
             try { if (el is FamilyInstance fi && !string.IsNullOrEmpty(fi.Symbol?.FamilyName)) fields["fam"] = fi.Symbol.FamilyName; } catch { }
@@ -407,7 +490,7 @@ namespace Loam.Revit.Connector.ModelLogCapture
             }
             catch { }
 
-            var rel = BuildRelations(el);
+            var rel = BuildRelations(el, defaultPhase);
             if (rel is not null) fields["rel"] = rel;
 
             var q = BuildQuantities(el);
@@ -419,6 +502,13 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
             var mats = BuildMaterials(el);
             if (mats is not null) fields["mats"] = mats;
+
+            if (taggedSheets is not null && taggedSheets.TryGetValue(el.Id, out var sheetNums) && sheetNums.Count > 0)
+            {
+                var arr = new JsonArray();
+                foreach (var s in sheetNums) arr.Add(s);
+                fields["sheets"] = arr;
+            }
 
             var p = BuildInstanceParams(el, onParamDef);
             if (p is not null) fields["p"] = p;
@@ -449,13 +539,82 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return loc.Count > 0 ? loc : null;
         }
 
-        private static JsonObject? BuildRelations(Element el)
+        private static JsonObject? BuildRelations(Element el, Phase? phase)
         {
             var rel = new JsonObject();
             try
             {
                 if (el is FamilyInstance fi && fi.Host is not null)
                     rel["host"] = fi.Host.UniqueId;
+            }
+            catch { }
+
+            // Room from/to — "anything between two spaces" (the first real-model test's fix
+            // #3): doors are the common case, but get_FromRoom/get_ToRoom apply to any
+            // FamilyInstance Revit considers room-bounding-adjacent. Referenced by NODE id (the
+            // room is logged as a `node` record, never as `el` — see IsLoggableModelElement),
+            // matching `loc.storey`/`loc.space`'s own reference convention.
+            try
+            {
+                if (el is FamilyInstance fi2 && phase is not null)
+                {
+                    Room? from = null, to = null;
+                    try { from = fi2.get_FromRoom(phase); } catch { }
+                    try { to = fi2.get_ToRoom(phase); } catch { }
+                    if (from is not null) rel["roomFrom"] = NodeId(from.Id);
+                    if (to is not null) rel["roomTo"] = NodeId(to.Id);
+                }
+            }
+            catch { }
+
+            // MEP system membership and connected elements — via the element's own connectors
+            // (ducts/pipes/cable trays/conduits expose ConnectorManager directly; equipment/
+            // fittings/fixtures expose it through FamilyInstance.MEPModel).
+            try
+            {
+                ConnectorManager? cm = el is MEPCurve mc ? mc.ConnectorManager
+                    : (el as FamilyInstance)?.MEPModel?.ConnectorManager;
+                if (cm is not null)
+                {
+                    var systems = new List<string>();
+                    var connected = new List<string>();
+                    // Fully qualified: "Connector" is ALSO a namespace somewhere in this
+                    // Revit API version's assembly graph, and the bare name resolves to that
+                    // namespace instead of Autodesk.Revit.DB.Connector — caught by the Build
+                    // workflow's real compile check (net48/Revit 2024 API packages).
+                    foreach (Autodesk.Revit.DB.Connector c in cm.Connectors)
+                    {
+                        try
+                        {
+                            var sys = c.MEPSystem;
+                            if (sys is not null && !string.IsNullOrEmpty(sys.Name) && !systems.Contains(sys.Name))
+                                systems.Add(sys.Name);
+                        }
+                        catch { }
+                        try
+                        {
+                            foreach (Autodesk.Revit.DB.Connector other in c.AllRefs)
+                            {
+                                if (other?.Owner is null || other.Owner.Id == el.Id) continue;
+                                var uid = other.Owner.UniqueId;
+                                if (!connected.Contains(uid)) connected.Add(uid);
+                            }
+                        }
+                        catch { }
+                    }
+                    if (systems.Count > 0)
+                    {
+                        var arr = new JsonArray();
+                        foreach (var s in systems) arr.Add(s);
+                        rel["mepSystems"] = arr;
+                    }
+                    if (connected.Count > 0)
+                    {
+                        var arr = new JsonArray();
+                        foreach (var c in connected) arr.Add(c);
+                        rel["connected"] = arr;
+                    }
+                }
             }
             catch { }
 
