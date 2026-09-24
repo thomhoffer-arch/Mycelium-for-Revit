@@ -32,6 +32,13 @@ namespace Loam.Revit.Connector.RevitBridge
         public string? Token { get; set; }
         public string? ModelLogRoot { get; set; }
 
+        /// <summary>How long a finished (gzipped) model-log segment is kept before the writer
+        /// deletes it at startup — never the active segment, and never the newest finished
+        /// segment (every segment already starts with its own full state, so that one alone is
+        /// enough to keep the log usable). 0 or negative disables retention entirely (keep
+        /// everything).</summary>
+        public int ModelLogRetentionDays { get; set; } = 90;
+
         /// <summary>True when this settings file exists but explicitly carries an empty/blank
         /// token (or failed to parse) — the caller must refuse to start the MCP server in this
         /// case, never fall back to running unauthenticated.</summary>

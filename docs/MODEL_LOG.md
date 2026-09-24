@@ -61,13 +61,14 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
      within `p` is a possible follow-up, not required by this format.
 5. **Compressed at rest:** finished segments are gzipped (`.jsonl.gz`); the active segment stays
    plain for appending. Gzip, because Revit 2024 and older run .NET Framework 4.8, which has no
-   Brotli.
+   Brotli. Compression itself runs on a background task, not Revit's UI thread — see "Rotation"
+   below.
 
 **Record kinds:**
 
 | `k` | Written | Carries |
 |---|---|---|
-| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north); the field-role map |
+| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north angle, and `sharedTransform` — `ActiveProjectLocation.GetTotalTransform()`'s origin/basisX/basisY/basisZ, mapping this model's internal coordinates into shared coordinates); the field-role map |
 | `session` | Every `DocumentOpened` | `producerVersion`, `revitVersion` (when known) — lets a reader tell exactly which connector version wrote the records that follow, without diffing `header` records across segments. Also drives the connector's own upgrade cleanup: see "When the connector writes" below. |
 | `project` | Snapshot; on change | Project information: number, name, client, address, status, and every other Project Information parameter |
 | `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec (the parameter's `Definition.GetDataType()`, e.g. `autodesk.spec.aec:length-2.0.0` — looked up in `header.units` for the display unit; never the unit itself), storage, instance or type |
@@ -77,12 +78,12 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `mat` | Snapshot; on change | Material: id (`m:<ElementId>`), name, class, and all its parameters |
 | `type` | Snapshot; on change | Id (`t:<ElementId>`), category, family, type name, all type parameters |
 | `el` | Snapshot (full); on change (partial) | The element (see below) |
-| `del` | On delete | UniqueId and numeric ElementId (when still known) |
-| `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, and the ids of the revisions it carries |
-| `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued |
+| `del` | On delete, for EVERY family (`el`/`type`/`node`/`grid`/`mat`/`sheet`/`rev`/`link`) | Id (that family's own id scheme) and numeric ElementId (when still known); `of` names the family, omitted for `el` |
+| `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, the ids of the revisions it carries, and `elements` — UniqueIds of every element tagged or dimensioned in a view placed on it (capped at 500) |
+| `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued, `sheets` (sheet numbers carrying it), `clouds` (RevisionCloud UniqueIds tagged with it) |
 | `link` | Snapshot; on change | Linked model instance: the link's model identity and its transform |
 | `chg` | Before the records of one edit | Revit transaction names, the editor, and counts of added/modified/deleted |
-| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, element count, `lastSeq`, `closed` |
+| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, `modelSaves` (`DocumentVersion.NumberOfSaves` — additive alongside model version, the handoff's "version = GUID + number"), element count, `lastSeq`, `closed` |
 | `gap` | When the connector knows it missed events | `fromSeq`, reason; closed by the next checkpoint |
 
 **Field roles** are declared once in the header (`identity`, `handle`, `location`, `type`,
@@ -103,16 +104,23 @@ a value.
 | `h` | handle | Mark, Type Mark (via type) |
 | `loc` | location | Containing storey and space as tree node ids |
 | `grid` | handle | Nearest grid intersection ("C/4"), computed from the location point and the `grid` records |
-| `rel` | relation | Host; room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished |
-| `q` | quantity | Length, width, height, area, volume, perimeter (internal units) |
+| `rel` | relation | Host; `hosted` (ids of elements THIS one hosts — the reverse of `host`, e.g. a wall's own hosted doors/windows); room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished. No `rel.link`: this log only ever walks the HOST document's own elements, never a linked document's — a link itself is its own `link` record kind, so there is no "element belongs to a link" membership to report here. |
+| `q` | quantity | Length, width, height, area, volume, perimeter, `thickness` (walls/floors/roofs/ceilings) (internal units) |
 | `bb`, `pt` | quantity | Bounding box; location point or curve ends (internal units) |
 | `mats` | relation | Each material id with its area and volume on this element |
 | `sheets` | sheet | Sheet numbers of every sheet a tag on this element is placed on |
 | `p` | param | Every instance parameter with a value: `[pdef id, value]` pairs. Element-id values are written as the referenced element's UniqueId. |
 
-`del` (deletion) records carry `id` (UniqueId) always, `eid` only when the caller still had the
-numeric ElementId at the time — a reconcile-detected deletion (an id that vanished from a fresh
-walk) never has one, since `Element.Id` isn't resolvable off a UniqueId that no longer exists.
+`del` (deletion) records carry `id` (that family's own id — a UniqueId for el/grid/sheet/rev/link,
+`"prefix" + ElementId` for type/node/mat) always, `eid` only when the caller still had the numeric
+ElementId at the time — a reconcile-detected deletion (an id that vanished from a fresh walk)
+never has one for `el`, since `Element.Id` isn't resolvable off a UniqueId that no longer exists,
+but does for every other family (their id already carries the ElementId, plainly recovered).
+`of` names the family (`type`, `node`, `grid`, `mat`, `sheet`, `rev`, `link`) and is omitted only
+for `el`, so a reader that only ever expected `el` deletions is unaffected. A `type` counts as
+deleted once no logged element references it any more — not necessarily because the `ElementType`
+itself was removed, also when every element that used it was itself deleted/retyped — this is
+intended: a `type` record nothing points at is dead weight either way.
 
 Rooms/spaces/areas are **never** `el` records — they're the spatial tree, logged as `node`
 records only (see `RecordBuilder.IsLoggableModelElement`); `h`'s own room/space number-and-name
@@ -140,15 +148,43 @@ every trigger below cheap, and makes the log self-healing.
 | Trigger | Revit hook | What the connector does |
 |---|---|---|
 | Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
-| Model opened, log exists, same producer version | `DocumentOpened` | Write a `session` record, then **reconcile:** walk everything, write only what differs from the hash cache (partial states), `del` for ids that no longer exist, then a `cp`. This catches edits made while the connector wasn't running. |
-| Model opened, log exists, producer version changed since the last `session` | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. |
-| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed. |
-| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile**, then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
+| Model opened, log exists, same producer version, segment not due for rotation | `DocumentOpened` | Write a `session` record, then **reconcile.** Incremental when possible: if the last `cp` set a trusted baseline (see "Incremental reconcile" below), `Document.GetChangedElements` gives exactly what changed and only those ids (plus `del` for real deletions) are written. Otherwise (no baseline, the baseline GUID is rejected, or the diff touches something whose change can silently affect OTHER elements — a Grid, Level, Room/Space/Area, ViewSheet, Viewport, Phase or DesignOption) falls back to the FULL walk: write only what differs from the hash cache (partial states), `del` for every id that no longer exists, same as before. Either way ends in a `cp`. This catches edits made while the connector wasn't running. Never rotates the segment. |
+| Model opened, log exists, producer version changed since the last `session`, OR the active segment is already past 64 MB | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. This is the ONLY way a segment ever rotates, so one never starts with just a header. |
+| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. Never rotates the segment, even past 64 MB — the next open/sync/reconcile does. |
+| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile** (or a new log generation instead, by the same rotation-due rule above), then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
 | Model closing | `DocumentClosing` | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed" |
 
 **Who changed it:** on workshared models, `WorksharingUtils.GetWorksharingTooltipInfo(doc,
 id).LastChangedBy` after a sync; for local edits, `Application.Username`. Leave `by` out when
 unknown.
+
+**Incremental reconcile:** a full reconcile re-reads every element just to compare hashes —
+wasteful once the model is large and only a handful of elements changed since the last open or
+sync. `ModelLogWriter.LastCompleteModelVersion` tracks the one thing that makes a shortcut safe:
+a model version (`cp.modelVersion`) a checkpoint confirmed the log matches EXACTLY — set only
+when that checkpoint was both `complete` and the document had no unsaved changes at that moment
+(`doc.IsModified == false`), and cleared on anything else (an interrupted pass, an edit made
+since, or a new log generation) — otherwise a user could edit, close without saving, and reopening
+would wrongly trust a log that already contains changes the saved file doesn't have.
+`ReconcileJob` hands that GUID to `Document.GetChangedElements`; on success (it throws for a GUID
+this document doesn't recognize — a different local copy, most likely — caught, not propagated)
+the diff's created/modified ids are each processed exactly as `ChangeCaptureJob` processes a live
+edit (same shared per-id write path, `ModelLogService.WriteOneElement`), and deleted ids are
+matched against the hash cache's own known `el` UniqueIds by their numeric tail (a UniqueId's hex
+after its last `-` — `src/ModelLog/UniqueIdElementId.cs`), since a deleted ElementId never
+resolves to anything Revit will hand back a UniqueId for. Falls back to the full walk whenever no
+baseline exists, the GUID is rejected, the diff touches a Grid, Level, Room/Space/Area,
+ViewSheet, Viewport, Phase or DesignOption (any of those can silently change OTHER, untouched
+elements' own derived fields without touching their own hash), OR — on the very first reconcile
+after an open — the PREVIOUS session didn't close cleanly (no closed `cp`, the same case that
+already writes a `gap`): a crash can leave live-edit records in the log that were never followed
+by a checkpoint, so the baseline's `modelVersion` is still the one from BEFORE those edits while
+`GetChangedElements` would report nothing changed — only a full reconcile re-derives the truth
+then. A later, in-session reconcile (after a sync) is unaffected by this last rule; only that
+first post-open one is ever gated by it. **NEEDS LIVE-REVIT CHECK:** whether
+a local copy's (as opposed to the central/cloud model's) own version history survives closing and
+reopening Revit at all — if it doesn't, `GetChangedElements` simply throws every time and every
+reconcile falls back to full, which is still correct, just not faster.
 
 **Keeping Revit responsive:**
 
@@ -178,10 +214,24 @@ model-logs/<model id>/
   writer.lock       held while a Revit session writes this model
 ```
 
-**Rotation:** start a new segment at 64 MB or when a full snapshot is taken. Each segment starts
-with a `header` and a full state of every definition and element, so it can be read on its own.
-`seq` continues across segments. Gzip a segment once it's finished (`000001.jsonl.gz`). Never
-edit a finished segment.
+**Rotation:** only ever happens as part of a snapshot or a new-log-generation pass (first open,
+producer-version change, or the active segment already past 64 MB at the start of a reconcile —
+see "When the connector writes"); a plain reconcile or live change capture never rotates on its
+own, so the active segment can run slightly over 64 MB between one of those passes and the next.
+Each segment starts with a `header` and a full state of every definition and element, so it can
+be read on its own — there is no code path that starts a segment with only a header. `seq`
+continues across segments. A finished segment is gzipped (`000001.jsonl.gz`) off the UI thread:
+writing resumes in the next segment immediately, while a background task writes
+`000001.jsonl.gz.tmp`, renames it to `.gz`, then deletes the plain file — a reader (or a crash)
+only ever sees the complete plain file or the complete `.gz`, never a half-written one of either.
+Never edit a finished segment.
+
+**Retention:** at writer startup (the owning session only), finished (`.gz`) segments older than
+`ConnectorSettings.ModelLogRetentionDays` (default 90; 0 or less disables this) are deleted — never
+the active segment (it's never gzipped), and never the single newest finished segment regardless
+of age, since every segment already starts with its own full header + full state, so that one
+alone is always enough to keep reading the log from. Older ones are redundant history, not a
+correctness requirement.
 
 **Expected size** (estimates at about 0.8 KB per full element and 120 bytes per changed field):
 
@@ -197,7 +247,11 @@ against this table. Not done in this sandbox (no Revit available).
 
 **Crash safety:**
 
-1. Append one complete line, then flush. A reader ignores a torn last line.
+1. Append complete lines only. A reader ignores a torn last line. **(this repo's choice)** The
+   log is flushed once per idle slice (always before the state journal, so rule 2 holds) and
+   at every checkpoint, rotation and close, not after every line. If Revit dies mid-slice, at
+   most that slice's lines are lost. The next reconcile writes them again, because the state
+   never got ahead of the log.
 2. Update the state only **after** the log line is flushed. If a crash lands in between, the
    next reconcile writes the same state again: a harmless duplicate, never a lost change.
    **(this repo's choice)** The state is a base file plus an append-only journal. Each changed
@@ -373,6 +427,116 @@ definition with the corrected `spec` — `ModelLogWriter.BeginNewGeneration` cle
 "seen" sets and forces an immediate (not threshold-gated) compaction so the clear survives a
 crash before the next ordinary one. Producer version bumped to `0.6.0` so upgraded installs
 trigger it.
+
+## Round 8: UI-thread gzip, and a rotation that skipped full state (2026-09-24)
+
+Two independent fixes, same review pass:
+
+- `LogSegmentWriter.Rotate` gzipped the finished 64 MB segment synchronously (`CompressionLevel.
+  Optimal`), inside an idle slice — a 1-2s UI freeze. Compression now runs on a background
+  `Task`: the next segment opens immediately, the finished one is written to `.gz.tmp`, renamed
+  to `.gz`, then the plain file is deleted, in that order (a reader always sees a complete plain
+  file or a complete `.gz`, never a partial one of either). Crash/exit safety: the constructor
+  redoes any leftover work (a rotated-away plain segment with no `.gz`, or a stray `.gz.tmp`);
+  `Dispose` waits a bounded few seconds for an in-flight compression so an ordinary close usually
+  leaves nothing to redo.
+- A 64 MB rollover during an ordinary reconcile (`ModelLogWriter.RotateIfNeeded`, called at the
+  start of `ReconcileJob`) rotated with only a `header` — no full state — breaking the rule that
+  every segment can be read on its own. Fixed at the root by removing `RotateIfNeeded` entirely:
+  `ModelLogWriter.RotationDue` now tells `ModelLogService` when the active segment is past
+  threshold, and in that case it runs the same new-log-generation pass a producer-version change
+  gets (`SnapshotJob`'s `isUpgrade` flag renamed to `newGeneration`, `_upgradeOwed` to
+  `_newGenerationOwed`, since it's no longer upgrade-only) instead of a plain reconcile. A plain
+  reconcile and live change capture never rotate now, so the active segment can run slightly over
+  64 MB until the next open/sync/reconcile catches it.
+
+## Round 9: incremental reconcile (2026-09-24)
+
+Every reconcile (open with an existing log, and after every sync/reload) re-walked and re-hashed
+every element just to find the handful that actually changed. Revit 2024+'s
+`Document.GetChangedElements(Guid baseVersion)` names exactly what changed since a prior version,
+so `ReconcileJob` now uses it when a trusted baseline exists (see "Incremental reconcile" above):
+`ModelLogState.LastCompleteModelVersion` (persisted, journaled like the other scalar fields),
+set only by a checkpoint that was both `complete` and caught the document unmodified
+(`ModelLogWriter.WriteCheckpoint`'s new `documentUnmodified` parameter, from `!doc.IsModified`),
+cleared by anything else and by `BeginNewGeneration`. The per-id write path is shared with live
+change capture (`ModelLogService.WriteOneElement`, extracted from `ChangeCaptureJob`'s own loop,
+which now also covers sheet/revision/material/link edits it previously left for the next full
+reconcile) so there is exactly one "how to turn one Revit element into a record". Deletions are
+matched by parsing the numeric ElementId out of a UniqueId's hex tail
+(`src/ModelLog/UniqueIdElementId.cs`, unit-tested, including a 64-bit id and malformed input) and
+looking it up against the hash cache's own known `el` ids — never asking Revit, which can no
+longer resolve a deleted id to anything. `cp` records also gained `modelSaves`
+(`DocumentVersion.NumberOfSaves`) alongside `modelVersion`, per the handoff's "version = GUID +
+number".
+
+## Round 10: deletions for every family (2026-09-24)
+
+Deletion detection only ever compared the `el` family — a deleted type, level/room/space, grid,
+material, sheet, revision or link stayed in the log forever. `ModelLogWriter.KnownElementIdsNotIn`
+generalized to `KnownIdsNotIn(family, seenIds)`; `WriteDelete` gained a `family` parameter (default
+`el`, unchanged behavior) that both selects which hash-cache family to remove from and, for every
+OTHER family, adds the `del` record's new `of` field. `WalkModel` now collects a seen-id set per
+family as it walks (node's is free — `nodeIdByLevelOrSpace`'s own values) and runs the same
+deletion check for all eight at the end, in one shared `WriteFamilyDeletions` helper. The
+incremental pass matches deleted ElementIds against node/type/mat directly (`"prefix" +
+ElementId`, `ModelLogWriter.IsKnownId`) and el/grid/sheet/rev/link by their UniqueIds' numeric tail
+(one `Dictionary<long,string>` per family, built once per batch).
+
+## Round 11: measured CPU savings (2026-09-24)
+
+Four changes, each verified with a before/after run of the same scratch benchmark
+(`ModelLogWriter`/`LogSegmentWriter` directly, snapshot then reconcile-with-no-changes, n=33,600,
+a frozen `git worktree` at the prior commit vs. this one):
+
+| | Before | After |
+|---|---:|---:|
+| `snapshot` | 6.10s | 4.57s |
+| `reconcile-nochange` | 4.41s | 3.65s |
+
+- `RecordHash.Of` deep-cloned an entire canonicalized copy of every field-group just to call
+  `ToJsonString()` on it. Rewritten to hash straight off a `Utf8JsonWriter` over a reused buffer
+  — sorted keys, no clone at all (a leaf value's own `WriteTo` produces identical bytes to
+  cloning-then-serializing, since cloning never changes formatting) — verified byte-identical to
+  the old implementation across nested/array/unicode/special-float inputs
+  (`RecordHashCompatTests`, which keeps the old implementation only for that comparison).
+- `ModelLogWriter.Append`/`WithId` deep-cloned every field again when moving it into the appended
+  line. Every caller builds its `JsonObject` fresh and never reads it again afterward, so this now
+  MOVES each field (remove from the source, then assign — satisfies `JsonNode`'s single-parent
+  rule without a clone) via a shared `MoveFieldsInto` helper — a real win for nested subtrees (a
+  `p` object's 40 parameters, a `bb`/`mats` array) that used to be recursively duplicated.
+- `LogSegmentWriter.AppendLine` flushed after every single line. Flushing now happens once per
+  idle slice (`ModelLogWriter.FlushJournalBuffer`, called by `FlushState` — the log first, then
+  the journal, keeping crash-safety rule #2), and before anything that persists state depending on
+  it (a checkpoint, session record, rotation, Dispose). `CurrentSizeBytes` flushes first so a
+  rotation decision is never based on a stale, not-yet-flushed size.
+- `ModelLogService.RefreshIndexCache` re-walked the whole document (node index, grid lines, tag
+  index) right after a full `WalkModel` pass had already built the same structures. `WalkModel`
+  now fills a caller-supplied `IndexCache` in place as it walks; the caller commits it directly
+  (only once its own staleness check confirms the pass actually finished) instead of triggering a
+  second walk. An incremental reconcile still calls the old `RefreshIndexCache` — it only merges
+  in what changed, so a real rebuild is what purges anything deleted.
+
+## Round 12: missing spec fields (2026-09-24)
+
+- Header `coordinates` gained `sharedTransform` (`ActiveProjectLocation.GetTotalTransform()`) —
+  the doc comment already promised it; the code never computed it.
+- `rel.hosted`: the reverse of `rel.host` (ids of elements THIS one hosts), via a reverse index
+  (`RecordBuilder.BuildHostedIndex`) built once per pass, the same shape as the tag-to-sheet index.
+  `rel.link` doesn't apply here: this log only ever walks the host document's own elements, never
+  a linked document's, so there is no "belongs to a link" membership for an element to carry — a
+  link is already its own `link` record kind.
+- `q.thickness` for walls/floors/roofs/ceilings — one more entry in the existing by-name BIP
+  resolution list (`WALL_ATTR_WIDTH_PARAM`/`FLOOR_ATTR_THICKNESS_PARAM`/
+  `ROOF_ATTR_THICKNESS_PARAM`/`CEILING_THICKNESS`), same as every other quantity.
+- `sheet.elements` (tagged or dimensioned elements) and `rev.sheets`/`rev.clouds` — three more
+  once-per-pass reverse indexes (`BuildSheetElementIndex`, `BuildRevisionSheetIndex`,
+  `BuildRevisionCloudIndex`), the tagged half of `sheet.elements` reusing the existing tag index.
+  Capped at 500 elements per sheet. A live/incremental edit to just one sheet or revision reuses
+  its existing value for these fields rather than rebuild a whole-document index for one edit —
+  the next full pass fills them in.
+- Segment retention: `ConnectorSettings.ModelLogRetentionDays` (default 90) — see "Retention"
+  above.
 
 ## Order, verification and done
 

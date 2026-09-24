@@ -23,7 +23,13 @@ namespace Loam.Revit.Connector.ModelLog
     {
         public const string SchemaVersion = "model-log/1";
 
-        private readonly LogSegmentWriter _segment;
+        // Null exactly when LockHeldElsewhere — a session that doesn't own the lock must never
+        // open, recover or modify this model's segment files at all (the handoff's crash-safety
+        // rule #4: "a second Revit session with the same model open doesn't write, and logs that
+        // it didn't" — opening the file for append alone can already race the owner's handle,
+        // and LogSegmentWriter's own startup recovery would delete/recompress the OWNER's files).
+        // Every method that touches it below is guarded on LockHeldElsewhere first.
+        private readonly LogSegmentWriter? _segment;
         private readonly WriterLock? _lock;
         private readonly string _statePath;
         private readonly ModelLogState _state;
@@ -65,7 +71,31 @@ namespace Loam.Revit.Connector.ModelLog
         /// full reconcile (with deletion detection) is owed, per docs/MODEL_LOG.md.</summary>
         public string? LastProducerVersion => _state.LastProducerVersion;
 
-        public ModelLogWriter(string modelLogRoot, string modelId)
+        /// <summary>The model version a checkpoint last confirmed the log matched EXACTLY — see
+        /// <see cref="ModelLogState.LastCompleteModelVersion"/>'s own doc comment. The only
+        /// baseline <see cref="ModelLogCapture.ModelLogService.ReconcileJob"/> may hand to
+        /// <c>Document.GetChangedElements</c> for an incremental reconcile.</summary>
+        public string? LastCompleteModelVersion => _state.LastCompleteModelVersion;
+
+        /// <summary>Every id this log's hash cache currently knows for <paramref name="family"/>
+        /// — for a UniqueId-keyed family (el/grid/sheet/rev/link), the set an incremental
+        /// reconcile's deletion matching builds its numeric-ElementId reverse map from
+        /// (<c>DocumentDifference.GetDeletedElementIds()</c> only ever gives numbers, never
+        /// resolvable to a UniqueId any more — see <see cref="UniqueIdElementId"/>).</summary>
+        public IEnumerable<string> KnownIds(string family) => _state.Cache.KnownIds(family);
+
+        /// <summary>Back-compat convenience for the <c>el</c>-family case — equivalent to
+        /// <c>KnownIds(RecordKinds.El)</c>.</summary>
+        public IEnumerable<string> KnownElementUniqueIds() => KnownIds(RecordKinds.El);
+
+        /// <summary>Whether <paramref name="id"/> is currently known for <paramref
+        /// name="family"/> — an incremental reconcile's direct-id families (node/type/mat, keyed
+        /// by <c>"prefix" + ElementId</c>, never a UniqueId) use this instead of the
+        /// UniqueId-tail trick to confirm a deleted ElementId's candidate id was actually
+        /// logged before writing a `del` for it.</summary>
+        public bool IsKnownId(string family, string id) => _state.Cache.Get(family, id) is not null;
+
+        public ModelLogWriter(string modelLogRoot, string modelId, int retentionDays = 90)
         {
             LogDirectory = Path.Combine(modelLogRoot, SanitizeForPath(modelId));
             Directory.CreateDirectory(LogDirectory);
@@ -74,8 +104,10 @@ namespace Loam.Revit.Connector.ModelLog
             LockHeldElsewhere = _lock is null;
 
             _statePath = Path.Combine(LogDirectory, "state.json");
-            _state = StateStore.Load(_statePath);
-            if (!LockHeldElsewhere) StateJournal.DeleteStaleGenerations(_statePath, _state.JournalGeneration);
+            _state = StateStore.Load(_statePath); // read-only — never written back below when LockHeldElsewhere
+            if (LockHeldElsewhere) return; // _segment stays null: no file in this folder is opened, recovered or touched
+
+            StateJournal.DeleteStaleGenerations(_statePath, _state.JournalGeneration);
 
             // state (base+journal) may be behind the log (LastSeq is only journaled at a
             // checkpoint/session/rotation, not per record): never reopen an older segment number,
@@ -86,6 +118,43 @@ namespace Loam.Revit.Connector.ModelLog
 
             _segment = new LogSegmentWriter(LogDirectory, segment);
             _state.CurrentSegment = _segment.SegmentNumber;
+
+            ApplyRetentionPolicy(retentionDays);
+        }
+
+        /// <summary>Deletes finished (gzipped) segments older than <paramref
+        /// name="retentionDays"/> — owner only (we already returned above when
+        /// <see cref="LockHeldElsewhere"/>), and never the active segment (never gzipped anyway,
+        /// so <c>*.jsonl.gz</c> can't match it) or the single most-recently-finished one: every
+        /// segment starts with its own full header + full state (see
+        /// <see cref="BeginNewGeneration"/>/the rotation rule), so that one alone is always
+        /// enough to keep reading the log from; anything older is redundant history, not a
+        /// requirement for correctness. <paramref name="retentionDays"/> &lt;= 0 disables this
+        /// (keep everything). Best-effort: a delete failure (file in use, permissions) is simply
+        /// retried at the next startup.</summary>
+        private void ApplyRetentionPolicy(int retentionDays)
+        {
+            if (retentionDays <= 0) return;
+            try
+            {
+                long newestFinished = -1;
+                foreach (var f in Directory.EnumerateFiles(LogDirectory, "*.jsonl.gz"))
+                {
+                    var stem = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(f));
+                    if (long.TryParse(stem, out var n) && n > newestFinished) newestFinished = n;
+                }
+                if (newestFinished < 0) return; // nothing finished yet — never delete the only history there is
+
+                var cutoff = DateTime.UtcNow.AddDays(-retentionDays);
+                foreach (var f in Directory.EnumerateFiles(LogDirectory, "*.jsonl.gz"))
+                {
+                    var stem = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(f));
+                    if (!long.TryParse(stem, out var n) || n == newestFinished) continue;
+                    try { if (File.GetLastWriteTimeUtc(f) < cutoff) File.Delete(f); }
+                    catch { /* best-effort — retried next startup */ }
+                }
+            }
+            catch { /* best-effort — retention is a housekeeping nicety, never worth failing startup over */ }
         }
 
         private static string SanitizeForPath(string id)
@@ -102,9 +171,16 @@ namespace Loam.Revit.Connector.ModelLog
         /// stamping <c>seq</c>/<c>ts</c>. Flushes the line, THEN (at the callers that buffer a
         /// journal op alongside it) persists state — never the other order: a crash between the
         /// two just re-writes the same state on the next reconcile, a harmless duplicate, per the
-        /// handoff's crash-safety rule #2.</summary>
+        /// handoff's crash-safety rule #2.
+        ///
+        /// <paramref name="fields"/> is MOVED into the appended line (see <see
+        /// cref="MoveFieldsInto"/>), not deep-cloned — every current caller builds it fresh and
+        /// never reads it again afterward. A caller that needs to keep using its own
+        /// <see cref="JsonObject"/> after calling this must pass a clone of it in, never the
+        /// original.</summary>
         public long Append(string kind, JsonObject fields)
         {
+            if (LockHeldElsewhere) return _state.LastSeq; // never write when another session owns the lock
             if (_pendingChange is not null && kind != RecordKinds.Chg)
             {
                 var chg = _pendingChange;
@@ -118,9 +194,32 @@ namespace Loam.Revit.Connector.ModelLog
                 ["ts"] = Timestamp(),
                 ["k"] = kind,
             };
-            foreach (var kv in fields) line[kv.Key] = kv.Value?.DeepClone();
-            _segment.AppendLine(line.ToJsonString());
+            MoveFieldsInto(line, fields);
+            _segment!.AppendLine(line.ToJsonString());
             return _state.LastSeq;
+        }
+
+        /// <summary>Moves every field from <paramref name="src"/> into <paramref name="dst"/>:
+        /// removed from <paramref name="src"/> first (a <see cref="JsonNode"/> can only ever have
+        /// ONE parent — assigning it straight into <paramref name="dst"/> while still attached to
+        /// <paramref name="src"/> would throw), THEN assigned into <paramref name="dst"/>, so
+        /// nothing is cloned even though whole nested subtrees (a `p` object's 40 parameters, a
+        /// `bb`/`mats` array, …) move across — a DeepClone here used to recreate every one of
+        /// those nested nodes just to satisfy the same-object-two-parents rule, on every single
+        /// record. <paramref name="src"/> is left EMPTY; only safe when nothing reads it again
+        /// afterward (true of every field-group builder in this codebase — each builds its
+        /// <see cref="JsonObject"/> fresh, on the spot, and hands it straight to
+        /// <see cref="Append"/>/<see cref="WithId"/>).</summary>
+        private static void MoveFieldsInto(JsonObject dst, JsonObject src)
+        {
+            var keys = new List<string>(src.Count);
+            foreach (var kv in src) keys.Add(kv.Key);
+            foreach (var key in keys)
+            {
+                var value = src[key];
+                src.Remove(key);
+                dst[key] = value;
+            }
         }
 
         /// <summary>Starts one live-edit batch. Its <c>chg</c> record is written just before
@@ -138,8 +237,10 @@ namespace Loam.Revit.Connector.ModelLog
         /// <c>chg</c> record if nothing was written.</summary>
         public void EndChange() => _pendingChange = null;
 
-        /// <summary>Appends whatever's buffered (hash-cache/pdef/cat/meta deltas) to the
-        /// journal and flushes. Cheap — never rewrites the base. Call after each idle slice.</summary>
+        /// <summary>Flushes the active segment (durable on disk — the log is no longer flushed
+        /// per line, see <see cref="LogSegmentWriter.AppendLine"/>) and appends whatever's
+        /// buffered (hash-cache/pdef/cat/meta deltas) to the journal. Cheap — never rewrites the
+        /// base. Call after each idle slice.</summary>
         public void FlushState() => FlushJournalBuffer();
 
         // ── Header / segment rotation ────────────────────────────────────────────
@@ -150,6 +251,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// A no-op once already written for the current segment.</summary>
         public void WriteHeader(JsonObject headerFields)
         {
+            if (LockHeldElsewhere) return;
             if (_headerWrittenThisSegment) return;
             var fields = new JsonObject { ["schema"] = SchemaVersion };
             foreach (var kv in headerFields) fields[kv.Key] = kv.Value?.DeepClone();
@@ -157,26 +259,31 @@ namespace Loam.Revit.Connector.ModelLog
             _headerWrittenThisSegment = true;
         }
 
+        /// <summary>True once the active segment has grown past the rotation threshold — the
+        /// signal <see cref="ModelLogCapture.ModelLogService"/> uses to run a NEW-GENERATION pass
+        /// (<see cref="BeginNewGeneration"/>) instead of an ordinary reconcile, so a rotated
+        /// segment always starts with a header AND full state. There is no size-triggered
+        /// rotation left inside a plain reconcile — that used to rotate with only a header, the
+        /// bug this property's caller fixes at the root.</summary>
+        public bool RotationDue => !LockHeldElsewhere && _segment!.ShouldRotate();
+
         /// <summary>Call before starting a full snapshot/reconcile pass: rotates first if the
         /// active segment is already past the size threshold, then (re-)writes the header so a
-        /// snapshot always begins a segment a reader can open on its own.</summary>
+        /// snapshot always begins a segment a reader can open on its own. (Only reachable here
+        /// with existing content when a first-time snapshot is resumed after a sync interrupted
+        /// it — the full-state walk that always follows keeps the "header + full state" rule
+        /// either way.)</summary>
         public void BeginSnapshot(JsonObject headerFields)
         {
-            if (_segment.ShouldRotate()) RotateAndReheader(headerFields);
+            if (LockHeldElsewhere) return;
+            if (_segment!.ShouldRotate()) RotateAndReheader(headerFields);
             _headerWrittenThisSegment = false; // a snapshot always re-asserts the header
             WriteHeader(headerFields);
         }
 
-        /// <summary>Call periodically during live change capture (not mid-snapshot) — rotates
-        /// only if the size threshold was crossed since the last check.</summary>
-        public void RotateIfNeeded(JsonObject headerFields)
-        {
-            if (_segment.ShouldRotate()) RotateAndReheader(headerFields);
-        }
-
         private void RotateAndReheader(JsonObject headerFields)
         {
-            _segment.Rotate();
+            _segment!.Rotate();
             _state.CurrentSegment = _segment.SegmentNumber;
             _headerWrittenThisSegment = false;
             WriteHeader(headerFields);
@@ -197,7 +304,8 @@ namespace Loam.Revit.Connector.ModelLog
         /// that never recorded the clear, resurrecting them.</summary>
         public void BeginNewGeneration(JsonObject headerFields)
         {
-            if (_segment.CurrentSizeBytes > 0)
+            if (LockHeldElsewhere) return;
+            if (_segment!.CurrentSizeBytes > 0)
             {
                 _segment.Rotate();
                 _state.CurrentSegment = _segment.SegmentNumber;
@@ -207,6 +315,10 @@ namespace Loam.Revit.Connector.ModelLog
 
             _state.Cache.PdefSeen.Clear();
             _state.Cache.CatSeen.Clear();
+            // A new generation's records may differ from whatever an incremental reconcile would
+            // assume still holds (e.g. a corrected `spec`) — never trust a pre-generation
+            // baseline for GetChangedElements after this.
+            _state.LastCompleteModelVersion = null;
 
             _journalBuffer.Add(StateJournal.MetaOp(_state));
             FlushJournalBuffer();
@@ -218,9 +330,21 @@ namespace Loam.Revit.Connector.ModelLog
         /// <summary>Checkpoint: end of snapshot/reconcile, after sync, or on close.
         /// <paramref name="closed"/> true only on <c>DocumentClosing</c> — its presence (or
         /// absence, checked on the NEXT open) is what tells a reader "Revit closed cleanly" from
-        /// "the connector crashed mid-session".</summary>
-        public void WriteCheckpoint(bool complete, string? modelVersion, int? elementCount, bool closed)
+        /// "the connector crashed mid-session". <paramref name="modelSaves"/> is
+        /// <c>DocumentVersion.NumberOfSaves</c> when known — an additive field alongside
+        /// <paramref name="modelVersion"/> (the handoff's "version = GUID + number"), never a
+        /// replacement for it. <paramref name="documentUnmodified"/> — pass <c>!doc.IsModified</c>
+        /// — is what makes <paramref name="modelVersion"/> trustworthy as the NEXT reconcile's
+        /// incremental baseline: only a checkpoint that is both <paramref name="complete"/> and
+        /// caught the document with no unsaved changes proves the log exactly matches that SAVED
+        /// version (see <see cref="ModelLogState.LastCompleteModelVersion"/>); anything else
+        /// clears the baseline rather than risk it being wrong (e.g. edits made, then the model
+        /// closed without saving — reopening must not skip re-checking those edits).</summary>
+        public void WriteCheckpoint(
+            bool complete, string? modelVersion, int? elementCount, bool closed,
+            int? modelSaves = null, bool documentUnmodified = false)
         {
+            if (LockHeldElsewhere) return;
             var fields = new JsonObject
             {
                 ["complete"] = complete,
@@ -229,10 +353,12 @@ namespace Loam.Revit.Connector.ModelLog
             };
             if (modelVersion is not null) fields["modelVersion"] = modelVersion;
             if (elementCount is not null) fields["elementCount"] = elementCount.Value;
+            if (modelSaves is not null) fields["modelSaves"] = modelSaves.Value;
             Append(RecordKinds.Checkpoint, fields);
 
             _state.LastCheckpointClosed = closed;
             _state.LastModelVersion = modelVersion;
+            _state.LastCompleteModelVersion = (complete && documentUnmodified) ? modelVersion : null;
             _journalBuffer.Add(StateJournal.MetaOp(_state));
             FlushJournalBuffer();
             MaybeCompact();
@@ -246,6 +372,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// against.</summary>
         public void RecordSession(string producerVersion, string? revitVersion)
         {
+            if (LockHeldElsewhere) return;
             var fields = new JsonObject { ["producerVersion"] = producerVersion };
             if (revitVersion is not null) fields["revitVersion"] = revitVersion;
             Append(RecordKinds.Session, fields);
@@ -262,6 +389,7 @@ namespace Loam.Revit.Connector.ModelLog
         /// to have a gap in yet) or when the last checkpoint was already closed.</summary>
         public void WriteGapIfNeeded(string reason)
         {
+            if (LockHeldElsewhere) return;
             if (_state.LastCheckpointClosed) return;
             if (_state.LastSeq == 0) return;
             Append(RecordKinds.Gap, new JsonObject
@@ -335,36 +463,53 @@ namespace Loam.Revit.Connector.ModelLog
         {
             if (fields["id"] is not null) return fields;
             var withId = new JsonObject { ["id"] = id };
-            foreach (var kv in fields) withId[kv.Key] = kv.Value?.DeepClone();
+            MoveFieldsInto(withId, fields); // see MoveFieldsInto's own doc comment
             return withId;
         }
 
-        /// <summary>Element ids known from a previous session/segment but absent from the
-        /// current walk — the reconcile's deletion candidates. Compares against the
-        /// <c>el</c> family only (a deleted element's type record, if any, is left for the
-        /// reconcile to independently decide is still referenced or not).</summary>
-        public IReadOnlyList<string> KnownElementIdsNotIn(ISet<string> currentIds)
+        /// <summary>Ids known from a previous session/segment for <paramref name="family"/> but
+        /// absent from <paramref name="currentIds"/> — a reconcile's deletion candidates. Works
+        /// for any non-write-once family (el/type/node/grid/mat/sheet/rev/link) — pdef/cat are
+        /// never deleted (see <see cref="RecordKinds.IsWriteOnce"/>).</summary>
+        public IReadOnlyList<string> KnownIdsNotIn(string family, ISet<string> currentIds)
         {
             var stale = new List<string>();
-            foreach (var id in _state.Cache.KnownIds(RecordKinds.El))
+            foreach (var id in _state.Cache.KnownIds(family))
                 if (!currentIds.Contains(id)) stale.Add(id);
             return stale;
         }
 
+        /// <summary>Back-compat convenience for the (still common) <c>el</c>-family case —
+        /// equivalent to <c>KnownIdsNotIn(RecordKinds.El, currentIds)</c>.</summary>
+        public IReadOnlyList<string> KnownElementIdsNotIn(ISet<string> currentIds) =>
+            KnownIdsNotIn(RecordKinds.El, currentIds);
+
         /// <summary><paramref name="elementId"/> is omitted (never a fabricated 0) when the
-        /// caller doesn't have it any more — a reconcile detects a deletion purely from the
-        /// UniqueId disappearing from a fresh walk, with no numeric id available at all.</summary>
-        public void WriteDelete(string uniqueId, long? elementId = null)
+        /// caller doesn't have it any more — a reconcile detects a deletion purely from an id
+        /// disappearing from a fresh walk, with no numeric id available at all (true for every
+        /// family: a deleted ElementId never resolves back to one). <paramref name="family"/>
+        /// defaults to <c>el</c> (the original, still most common case) and is written as the
+        /// `del` record's own `of` field for every OTHER family — omitted for `el` so existing
+        /// readers, which only ever saw `el` deletions, are unaffected.</summary>
+        public void WriteDelete(string uniqueId, long? elementId = null, string family = RecordKinds.El)
         {
             var fields = new JsonObject { ["id"] = uniqueId };
             if (elementId is not null) fields["eid"] = elementId.Value;
+            if (family != RecordKinds.El) fields["of"] = family;
             Append(RecordKinds.Del, fields);
-            _state.Cache.Remove(RecordKinds.El, uniqueId);
-            _journalBuffer.Add(StateJournal.HashRemoveOp(RecordKinds.El, uniqueId));
+            _state.Cache.Remove(family, uniqueId);
+            _journalBuffer.Add(StateJournal.HashRemoveOp(family, uniqueId));
         }
 
+        /// <summary>Flushes the SEGMENT first (durable on disk before anything below persists
+        /// state that depends on it — crash-safety rule #2), then appends whatever's buffered to
+        /// the journal. Called once per idle slice via <see cref="FlushState"/> — the log itself
+        /// is no longer flushed per line (see <see cref="LogSegmentWriter.AppendLine"/>) — and by
+        /// every other state-persisting call (checkpoint, session record, rotation, Dispose), so
+        /// the same ordering holds everywhere, not just on the idle-tick path.</summary>
         private void FlushJournalBuffer()
         {
+            _segment?.Flush();
             if (_journalBuffer.Count == 0) return;
             if (LockHeldElsewhere) { _journalBuffer.Clear(); return; } // never write the owning session's state
             StateJournal.Append(_statePath, _state.JournalGeneration, _journalBuffer);
@@ -430,7 +575,8 @@ namespace Loam.Revit.Connector.ModelLog
                 // Always released, even if flushing/compacting the state above threw — an
                 // unreleased lock or an open segment handle would outlive this process for no
                 // benefit (compaction is already best-effort; nothing more is recoverable here).
-                _segment.Dispose();
+                // _segment is null exactly when LockHeldElsewhere (nothing was ever opened).
+                _segment?.Dispose();
                 _lock?.Dispose();
             }
         }
