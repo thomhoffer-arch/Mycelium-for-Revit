@@ -80,6 +80,35 @@ namespace ModelLog.Tests
             Assert.Equal("hog", overBudgetName);
         }
 
+        private static IEnumerator<bool> ThrowsAfter(int steps)
+        {
+            for (var i = 0; i < steps; i++) yield return true;
+            throw new System.InvalidOperationException("boom");
+        }
+
+        [Fact]
+        public void ThrowingJob_IsDroppedAndReported_NextJobStillRuns()
+        {
+            string? failedName = null;
+            System.Exception? failure = null;
+            var finished = new List<string>();
+            var runner = new IdleSliceRunner(
+                (name, __, ___) => finished.Add(name),
+                onJobFailed: (name, ex) => { failedName = name; failure = ex; });
+            runner.Enqueue("bad", ThrowsAfter(2));
+            runner.Enqueue("good", CountTo(1, new List<int>()));
+
+            runner.RunSlice(); // must not throw
+            Assert.Equal("bad", failedName);
+            Assert.IsType<System.InvalidOperationException>(failure);
+            Assert.Empty(finished);
+            Assert.Equal(1, runner.QueueDepth);
+
+            runner.RunSlice();
+            Assert.Equal(new List<string> { "good" }, finished);
+            Assert.False(runner.HasWork);
+        }
+
         [Fact]
         public void MultipleJobs_RunFifo()
         {

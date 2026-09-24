@@ -296,6 +296,29 @@ stalls between element ~200 and the rest), that ordinary editing no longer stall
 time now that continuous idling is burst-capped, and that the `session`/upgrade-reconcile behavior
 produces the expected full-state backfill on the very next open after this version installs.
 
+## Round 5: Revit crash during Save to Central (2026-09-24)
+
+Windows' crash log for a Revit crash during a Synchronize with Central ("Save to Central" step)
+named the connector: an `AccessViolationException` (reading memory that was no longer valid) with
+the stack `App.OnIdling → ModelLogService.OnIdling → IdleSliceRunner.RunSlice →
+ModelLogService.ReconcileJob → ModelLogService.WalkModel → FilteredElementIterator.MoveNext`. No
+other add-in was in the chain. Revit can't catch that kind of error, so the whole program closed.
+
+| # | Cause | Fix |
+|---|---|---|
+| 1 | `WalkModel` looped `foreach` over live `FilteredElementCollector`s with a `yield` inside the loop, so a walk paused between idle ticks kept Revit's native element iterator open while the document changed underneath it. | Each section takes its id list in one call (`ToElementIds()`, no `yield` in between), then walks the plain list, looking each element up fresh with `doc.GetElement` and skipping any that no longer exist. |
+| 2 | `Idling` fires **during** Save to Central (the earlier assumption that it can't fire mid-command was wrong), so the paused walk was resumed while the sync was rebuilding the model. | `App.cs` now handles the pre-events `DocumentSynchronizingWithCentral`, `DocumentReloadingLatest`, `DocumentSaving` and `DocumentSavingAs`: all model-log work pauses (`ModelLogService.BeginDocumentBusy`, a nesting count) until the matching post-event. A sync, reload or close also bumps a per-document generation. Every job carries the generation it was queued at and checks it, plus `Document.IsValidObject`, before each step, stopping without a checkpoint if either changed. The sync/reload post-event queues a fresh reconcile, or re-runs the snapshot if a brand-new log's first snapshot was the one interrupted. |
+| 3 | An exception from any job propagated out of `IdleSliceRunner.RunSlice`. | `RunSlice` catches it, drops the job and reports it (`onJobFailed`, unit-tested); `App.OnIdling` and the document-event handlers are wrapped too. This covers ordinary exceptions only: .NET 8 never lets managed code catch an `AccessViolationException`, and .NET Framework 4.8 doesn't by default. Fixes 1 and 2 prevent the crash itself. |
+
+Found while re-checking this fix:
+
+- `ChangeCaptureJob` cleared its "queued" flag only at the very end, so a job that stopped early or threw would have stopped live-edit capture for that document for the rest of the session. The flag is now cleared in a `finally`.
+- An upgrade's full-state reconcile, or a new log's first snapshot, that a sync interrupted was replaced by an ordinary reconcile. That would skip the backfill, or leave a new log with no `header`/`project` records. Both are now carried over until they actually finish.
+- A brand-new log's first line was the `session` record, not the `header` (a round-4 slip). The session record is now written right after the snapshot's header.
+- Closing the model while a snapshot or reconcile was unfinished wrote `complete: true`. It now writes `complete: false`.
+
+**Not yet verified:** checks 9 and 10 below.
+
 ## Order, verification and done
 
 | Order | Work | Why this order | Status |
@@ -332,7 +355,16 @@ follow-up.
    confirm the `ifc.guid` this connector computed for those elements *before* that export (when
    `IFC_GUID` was still empty, so the logged value was `derived: true`) matches the GlobalId the
    export actually assigned.
+9. **Sync safety:** start a Synchronize with Central while a reconcile is visibly in progress
+   (right after opening a large model). Revit must not crash. The log must show no records
+   between the sync starting and finishing, then a fresh reconcile ending in a `cp`. Repeat with
+   Reload Latest and with closing the model mid-reconcile (its closing `cp` should read
+   `complete: false`).
+10. **Post-event pairing:** confirm Revit raises `DocumentSynchronizedWithCentral`,
+   `DocumentReloadedLatest` and `DocumentSaved` even when the operation fails or is cancelled
+   (e.g. cancel a sync). If one is skipped, model logging stays paused until that document closes.
+   That's safe but silent, so the pause would need a fallback.
 
-**Done** = all seven steps merged; the two recorded fixtures checked in; the eight Revit checks
+**Done** = all seven steps merged; the two recorded fixtures checked in; the ten Revit checks
 passed and written up; the add-in rebuilt and installed on the office machines. This repo has
-merged all seven steps' code; the fixtures and the eight Revit checks are the open item.
+merged all seven steps' code; the fixtures and the ten Revit checks are the open item.
