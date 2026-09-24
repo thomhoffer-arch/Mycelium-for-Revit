@@ -63,14 +63,46 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
         /// <summary>True while any document has a queued idle-slice job (a snapshot/reconcile
         /// still walking the model, or a change-capture batch) OR unflushed <c>DocumentChanged</c>
-        /// data waiting for its own job to be queued on the next tick. The caller (App.cs's
-        /// <c>OnIdling</c>) uses this to call <c>IdlingEventArgs.SetRaiseWithoutDelay()</c> —
-        /// without it, Revit throttles <c>Idling</c> down to firing only on further UI activity,
-        /// so a large snapshot/reconcile would stall for minutes at a time between mouse
-        /// movements instead of draining continuously.</summary>
+        /// data waiting for its own job to be queued on the next tick.</summary>
         public bool HasPendingWork =>
             _idle.HasWork ||
             _pending.Values.Any(p => p.Added.Count > 0 || p.Modified.Count > 0 || p.Deleted.Count > 0);
+
+        private readonly System.Diagnostics.Stopwatch _continuousBurst = new();
+        private static readonly TimeSpan MaxContinuousBurst = TimeSpan.FromMilliseconds(250);
+
+        /// <summary>Call once per Idling tick (App.cs's <c>OnIdling</c>) to decide whether to ask
+        /// Revit to keep firing <c>Idling</c> back-to-back (<c>IdlingEventArgs.SetRaiseWithoutDelay()</c>)
+        /// — NOT the same as unconditionally requesting it whenever <see cref="HasPendingWork"/>
+        /// is true. A live report ("connector blocking/slow for several seconds after most
+        /// actions") showed why: once continuous firing actually started draining a large backlog
+        /// (a 33,600-element reconcile, or a big edit batch after a regen touched many hosted/
+        /// joined elements), it raced to drain the ENTIRE thing in one uninterrupted burst,
+        /// starving Revit's own message pump of the redraw/input messages a user expects to see
+        /// promptly — the previous bug (Idling barely firing at all) had at least left long
+        /// natural gaps between slices; this fix's first cut removed the gaps entirely instead of
+        /// just shortening them enough to still make progress.
+        ///
+        /// Capped to a short continuous burst (<see cref="MaxContinuousBurst"/>) instead: once a
+        /// burst has been running continuously for that long, this returns false for one tick,
+        /// letting <c>Idling</c> revert to Revit's own throttled cadence (which still fires
+        /// again the moment the user does anything — mouse move, keystroke — nearly continuous
+        /// during active editing) before starting a fresh burst. Forward progress on a large
+        /// backlog stays steady as long as the user is doing ANYTHING; the idle loop just no
+        /// longer monopolizes it for one long uninterrupted stretch.</summary>
+        public bool ShouldRequestContinuousIdling()
+        {
+            if (!HasPendingWork)
+            {
+                _continuousBurst.Reset();
+                return false;
+            }
+            if (!_continuousBurst.IsRunning) _continuousBurst.Restart();
+            if (_continuousBurst.Elapsed < MaxContinuousBurst) return true;
+
+            _continuousBurst.Reset(); // release control for one natural idle interval
+            return false;
+        }
 
         private sealed class PendingChange
         {

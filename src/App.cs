@@ -134,10 +134,16 @@ namespace Loam.Revit.Connector
             // — it is NOT a free-running timer. An add-in that wants Idling to keep firing on its
             // own, so background work keeps draining while the user does nothing else, MUST call
             // SetRaiseWithoutDelay() on every tick it still has work left to do; omitting it is
-            // exactly why a large snapshot/reconcile would stall for minutes at a time. Only
-            // requested while there's still queued work — once drained, Idling reverts to Revit's
-            // normal (power-saving) cadence.
-            try { if (_modelLog?.HasPendingWork == true) e.SetRaiseWithoutDelay(); } catch { }
+            // exactly why a large snapshot/reconcile would stall for minutes at a time.
+            //
+            // NOT unconditionally, though — a follow-up live report ("connector blocking/slow for
+            // several seconds after most actions") showed that requesting it on every tick races
+            // to drain an entire large backlog in one uninterrupted burst, starving Revit's own
+            // message pump of the redraw/input processing a user expects to see promptly.
+            // ModelLogService.ShouldRequestContinuousIdling caps each burst to a short window and
+            // then releases control for one natural idle interval, so backlogs still drain
+            // steadily whenever the user does anything, without monopolizing the idle loop.
+            try { if (_modelLog?.ShouldRequestContinuousIdling() == true) e.SetRaiseWithoutDelay(); } catch { }
         }
 
         // A Ctrl+S and a Sync to Central both fire "saved" downstream — older orchestrator
