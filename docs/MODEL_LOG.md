@@ -52,8 +52,9 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
    on the type record.
 4. **Changes as partial states.** A modified element is written with only the field-groups whose
    value changed (new values) plus `unset` for field-groups that disappeared entirely. Still
-   states, never before/after. Every segment begins with a full state of everything, so a reader
-   never needs more than one segment.
+   states, never before/after. Every log GENERATION begins with a full state of everything; a
+   generation may continue over further size-rotated segments (see "Rotation"), so a reader
+   rebuilds the current state from the newest generation's first segment forward.
    - **(this repo's choice)** "Field-group" means one of `el`'s own top-level keys (`h`, `loc`,
      `grid`, `rel`, `q`, `bb`/`pt`, `mats`, `p`) — see `ModelLogWriter.WriteIfChanged`. The hash
      cache is keyed per field-group, not per individual parameter inside `p`, so a single changed
@@ -68,7 +69,7 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 
 | `k` | Written | Carries |
 |---|---|---|
-| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north angle, and `sharedTransform` — `ActiveProjectLocation.GetTotalTransform()`'s origin/basisX/basisY/basisZ, mapping this model's internal coordinates into shared coordinates); the field-role map |
+| `header` | First line of every segment | `schema: "model-log/1"`; `modelId` (the STABLE identity: cloud project+model GUID or central path — same value the log folder is named from), `title` (the local file title, display only — differs per user, e.g. carries a Windows username, never used as identity), plus `cloudProjectGuid`/`cloudModelGuid`/`centralModelPath`/`modelInstanceId` when known; producer and Revit version; display units per spec; coordinates (project base point, survey point, true north angle, and `sharedTransform` — `ActiveProjectLocation.GetTotalTransform()`'s origin/basisX/basisY/basisZ, mapping this model's internal coordinates into shared coordinates); the field-role map; `segment` (this segment's own number), `generationStart` (the segment holding this log generation's full state) and — on a size-rotated continuation segment only — `continuation: true` (see "Rotation") |
 | `session` | Every `DocumentOpened` | `producerVersion`, `revitVersion` (when known) — lets a reader tell exactly which connector version wrote the records that follow, without diffing `header` records across segments. Also drives the connector's own upgrade cleanup: see "When the connector writes" below. |
 | `project` | Snapshot; on change | Project information: number, name, client, address, status, and every other Project Information parameter |
 | `pdef` | First time a parameter is seen | `id` (`builtin:<BuiltInParameter>`, `shared:<GUID>`, or `project:<id>`), name, group, spec (the parameter's `Definition.GetDataType()`, e.g. `autodesk.spec.aec:length-2.0.0` — looked up in `header.units` for the display unit; never the unit itself), storage, instance or type |
@@ -78,12 +79,12 @@ reused), `ts` (UTC, when the connector wrote it) and `k` (the record kind).
 | `mat` | Snapshot; on change | Material: id (`m:<ElementId>`), name, class, and all its parameters |
 | `type` | Snapshot; on change | Id (`t:<ElementId>`), category, family, type name, all type parameters |
 | `el` | Snapshot (full); on change (partial) | The element (see below) |
-| `del` | On delete, for EVERY family (`el`/`type`/`node`/`grid`/`mat`/`sheet`/`rev`/`link`) | Id (that family's own id scheme) and numeric ElementId (when still known); `of` names the family, omitted for `el` |
+| `del` | On delete, for EVERY family (`el`/`type`/`node`/`grid`/`mat`/`sheet`/`rev`/`link`) | Id (that family's own id scheme) and numeric ElementId (when still known); `of` names the family, omitted for `el`; `reason`: `deleted` (gone from the model — a real deletion), `filtered` (still in the model, no longer logged in this family — e.g. an upgrade's noise filter), `unreferenced` (a `type` still in the model that no logged element uses). Only `deleted` is a deletion in the model. |
 | `sheet` | Snapshot; on change | Sheet number, name, current revision, the views placed on it, the ids of the revisions it carries, and `elements` — UniqueIds of every element tagged or dimensioned in a view placed on it (capped at 500) |
 | `rev` | Snapshot; on change | Revision: sequence, number, date, description, issued, `sheets` (sheet numbers carrying it), `clouds` (RevisionCloud UniqueIds tagged with it) |
 | `link` | Snapshot; on change | Linked model instance: the link's model identity and its transform |
 | `chg` | Before the records of one edit | Revit transaction names, the editor, and counts of added/modified/deleted |
-| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, `modelSaves` (`DocumentVersion.NumberOfSaves` — additive alongside model version, the handoff's "version = GUID + number"), element count, `lastSeq`, `closed` |
+| `cp` | End of snapshot/reconcile; after sync; on close | Checkpoint: `complete`, model version, `modelSaves` (`DocumentVersion.NumberOfSaves` — additive alongside model version, the handoff's "version = GUID + number"), element count, `lastSeq`, `closed`; `errors` (only when above 0: records the pass skipped because Revit threw while reading them) |
 | `gap` | When the connector knows it missed events | `fromSeq`, reason; closed by the next checkpoint |
 
 **Field roles** are declared once in the header (`identity`, `handle`, `location`, `type`,
@@ -104,11 +105,11 @@ a value.
 | `h` | handle | Mark, Type Mark (via type) |
 | `loc` | location | Containing storey and space as tree node ids |
 | `grid` | handle | Nearest grid intersection ("C/4"), computed from the location point and the `grid` records |
-| `rel` | relation | Host; `hosted` (ids of elements THIS one hosts — the reverse of `host`, e.g. a wall's own hosted doors/windows); room from/to (anything between two spaces); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished. No `rel.link`: this log only ever walks the HOST document's own elements, never a linked document's — a link itself is its own `link` record kind, so there is no "element belongs to a link" membership to report here. |
+| `rel` | relation | Host; `hosted` (ids of elements THIS one hosts — the reverse of `host`, e.g. a wall's own hosted doors/windows); room from/to (`roomFrom`/`roomTo`, anything between two spaces: Revit's own From/To Room in the last phase; for doors and windows also the instance's own created phase and then every other phase, and as a last resort a point sampled just beyond each face, marked `roomSource: "geometric"`); MEP system membership and connected elements; group; assembly; design option; workset; phase created/demolished. No `rel.link`: this log only ever walks the HOST document's own elements, never a linked document's — a link itself is its own `link` record kind, so there is no "element belongs to a link" membership to report here. |
 | `q` | quantity | Length, width, height, area, volume, perimeter, `thickness` (walls/floors/roofs/ceilings) (internal units) |
 | `bb`, `pt` | quantity | Bounding box; location point or curve ends (internal units) |
 | `mats` | relation | Each material id with its area and volume on this element |
-| `sheets` | sheet | Sheet numbers of every sheet a tag on this element is placed on |
+| `sheets` | sheet | Sheet numbers of every sheet this element appears on: a model view placed on the sheet (plan, ceiling plan, section, elevation, callout, 3D) shows it — Revit's own per-view visibility, `FilteredElementCollector(doc, viewId)` — or a tag on it is placed on the sheet. The visibility part is rebuilt only by a full walk (open/sync without an incremental baseline, new generation); between those, `sheets` is left as last written, never recomputed from tags alone |
 | `p` | param | Every instance parameter with a value: `[pdef id, value]` pairs. Element-id values are written as the referenced element's UniqueId. |
 
 `del` (deletion) records carry `id` (that family's own id — a UniqueId for el/grid/sheet/rev/link,
@@ -148,11 +149,11 @@ every trigger below cheap, and makes the log self-healing.
 | Trigger | Revit hook | What the connector does |
 |---|---|---|
 | Model opened, no log yet | `DocumentOpened` | Write a `session` record, then a full snapshot: `project`, `pdef`, `cat`, `node`, `grid`, `mat`, `type`, `el`, `sheet`, `rev`, `link`, then a `cp` |
-| Model opened, log exists, same producer version, segment not due for rotation | `DocumentOpened` | Write a `session` record, then **reconcile.** Incremental when possible: if the last `cp` set a trusted baseline (see "Incremental reconcile" below), `Document.GetChangedElements` gives exactly what changed and only those ids (plus `del` for real deletions) are written. Otherwise (no baseline, the baseline GUID is rejected, or the diff touches something whose change can silently affect OTHER elements — a Grid, Level, Room/Space/Area, ViewSheet, Viewport, Phase or DesignOption) falls back to the FULL walk: write only what differs from the hash cache (partial states), `del` for every id that no longer exists, same as before. Either way ends in a `cp`. This catches edits made while the connector wasn't running. Never rotates the segment. |
-| Model opened, log exists, producer version changed since the last `session`, OR the active segment is already past 64 MB | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. This is the ONLY way a segment ever rotates, so one never starts with just a header. |
-| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. Never rotates the segment, even past 64 MB — the next open/sync/reconcile does. |
-| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile** (or a new log generation instead, by the same rotation-due rule above), then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. |
-| Model closing | `DocumentClosing` | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed" |
+| Model opened, log exists, same producer version, generation not due for renewal | `DocumentOpened` | If the active segment is past 64 MB, a size-based continuation rotation first (see "Rotation"). Write a `session` record, then **reconcile.** Incremental when possible: if the last `cp` set a trusted baseline (see "Incremental reconcile" below), `Document.GetChangedElements` gives exactly what changed and only those ids (plus `del` for real deletions) are written. Otherwise (no baseline, the baseline GUID is rejected, or the diff touches something whose change can silently affect OTHER elements — a Grid, Level, Room/Space/Area, ViewSheet, Viewport, Phase or DesignOption) falls back to the FULL walk: write only what differs from the hash cache (partial states), `del` for every id that no longer exists, same as before. Either way ends in a `cp`. This catches edits made while the connector wasn't running. |
+| Model opened, log exists, producer version changed since the last `session`, OR the current generation already spans its maximum number of continuation segments (`ModelLogWriter.MaxContinuationSegments`, 4) and the last one is full | `DocumentOpened` | Start a **new log generation**: rotate to a fresh segment (if the active one has content), write a `header`, `session` and `project` record, re-emit every `pdef`/`cat` definition (their "seen" sets are cleared — a stale/wrong definition can otherwise never be corrected, since they're normally written once and never re-checked), then the full state of everything (same as a first-time snapshot) plus deletion detection, then a `cp`. `seq` numbering and history are kept intact — this is a new segment, not a new log folder. Deletion detection's `del` records carry a `reason` — after an upgrade most are `filtered`/`unreferenced` cleanup, not deletions. |
+| User edits | `DocumentChanged` | Queue added/modified/deleted ids and transaction names/editor. During idle time write one `chg`, then a record for each id whose hash changed — held back entirely while a snapshot/reconcile for that document is still running (it reads every element fresh anyway); an id already covered by the walk is dropped once it finishes, unless it was edited again after the walk started, in which case it's kept and still change-captured. After each batch, a size-based continuation rotation if the segment is past 64 MB. |
+| Sync with central / reload latest | `DocumentSynchronizedWithCentral`, `DocumentReloadedLatest` | **Reconcile** (or a new log generation instead, by the same rule above), then a `cp` with the new model version. This picks up other people's changes even if `DocumentChanged` did not report them. A snapshot/reconcile already running is **not restarted**: it pauses for the sync, resumes, ends in a `cp` with `complete: false` (part of it was read before the sync), and queues a follow-up reconcile whose `cp` is `complete: true`. |
+| Model closing | `DocumentClosing` (and, as a safety net, add-in shutdown for any model still open) | A final `cp` with `closed: true`, so a quiet log reads as "closed", not "connector crashed". `state.json` is compacted at that point, so the file itself (not only its journal) reads `LastCheckpointClosed: true`. |
 
 **Who changed it:** on workshared models, `WorksharingUtils.GetWorksharingTooltipInfo(doc,
 id).LastChangedBy` after a sync; for local edits, `Application.Username`. Leave `by` out when
@@ -214,13 +215,25 @@ model-logs/<model id>/
   writer.lock       held while a Revit session writes this model
 ```
 
-**Rotation:** only ever happens as part of a snapshot or a new-log-generation pass (first open,
-producer-version change, or the active segment already past 64 MB at the start of a reconcile —
-see "When the connector writes"); a plain reconcile or live change capture never rotates on its
-own, so the active segment can run slightly over 64 MB between one of those passes and the next.
-Each segment starts with a `header` and a full state of every definition and element, so it can
-be read on its own — there is no code path that starts a segment with only a header. `seq`
-continues across segments. A finished segment is gzipped (`000001.jsonl.gz`) off the UI thread:
+**Rotation:** two kinds, both starting the new segment with a `header`. `seq` continues across
+segments.
+
+- **New generation** (first open, producer-version change, or the current generation has reached
+  `ModelLogWriter.MaxContinuationSegments` continuation segments — checked at open/sync): the
+  new segment carries a full state of every definition and element; `header.generationStart`
+  equals its own `segment`.
+- **Continuation** (size-based, **(this repo's choice)** since v0.6.1): once the active segment
+  is past 64 MB, at the next record boundary between passes — after a live-edit batch, after a
+  snapshot/reconcile checkpoint, or at open/sync before the session's records — the segment is
+  closed (gzipped) and the next one starts with a `header` carrying `continuation: true` and
+  `generationStart`, followed simply by the next records. No full state is re-written: doing so
+  on every rotation would multiply the log's size, the opposite of what rotation is for. Never in
+  the middle of a snapshot/reconcile walk, so a very large model's full state can still run past
+  64 MB within its own segment.
+
+A reader rebuilds the current state by reading from the newest header's `generationStart`
+forward. (Before v0.6.1 the only rotation was a new generation, at open/sync; a heavy session
+could grow the live segment well past 64 MB — 72 MB+ in the 25 Sep review.) A finished segment is gzipped (`000001.jsonl.gz`) off the UI thread:
 writing resumes in the next segment immediately, while a background task writes
 `000001.jsonl.gz.tmp`, renames it to `.gz`, then deletes the plain file — a reader (or a crash)
 only ever sees the complete plain file or the complete `.gz`, never a half-written one of either.
@@ -228,10 +241,11 @@ Never edit a finished segment.
 
 **Retention:** at writer startup (the owning session only), finished (`.gz`) segments older than
 `ConnectorSettings.ModelLogRetentionDays` (default 90; 0 or less disables this) are deleted — never
-the active segment (it's never gzipped), and never the single newest finished segment regardless
-of age, since every segment already starts with its own full header + full state, so that one
-alone is always enough to keep reading the log from. Older ones are redundant history, not a
-correctness requirement.
+the active segment (it's never gzipped), and never any segment of the current generation
+(`state.json`'s `GenerationSegment` onward — the generation's full state and every continuation a
+reader replays on top of it), regardless of age. When the generation start isn't known yet (a
+`state.json` from before v0.6.1), nothing is deleted until the next generation records it. Older
+segments are redundant history, not a correctness requirement.
 
 **Expected size** (estimates at about 0.8 KB per full element and 120 bytes per changed field):
 
@@ -368,7 +382,7 @@ other add-in was in the chain. Revit can't catch that kind of error, so the whol
 | # | Cause | Fix |
 |---|---|---|
 | 1 | `WalkModel` looped `foreach` over live `FilteredElementCollector`s with a `yield` inside the loop, so a walk paused between idle ticks kept Revit's native element iterator open while the document changed underneath it. | Each section takes its id list in one call (`ToElementIds()`, no `yield` in between), then walks the plain list, looking each element up fresh with `doc.GetElement` and skipping any that no longer exist. |
-| 2 | `Idling` fires **during** Save to Central (the earlier assumption that it can't fire mid-command was wrong), so the paused walk was resumed while the sync was rebuilding the model. | `App.cs` now handles the pre-events `DocumentSynchronizingWithCentral`, `DocumentReloadingLatest`, `DocumentSaving` and `DocumentSavingAs`: all model-log work pauses (`ModelLogService.BeginDocumentBusy`, a nesting count) until the matching post-event. A sync, reload or close also bumps a per-document generation. Every job carries the generation it was queued at and checks it, plus `Document.IsValidObject`, before each step, stopping without a checkpoint if either changed. The sync/reload post-event queues a fresh reconcile, or re-runs the snapshot if a brand-new log's first snapshot was the one interrupted. |
+| 2 | `Idling` fires **during** Save to Central (the earlier assumption that it can't fire mid-command was wrong), so the paused walk was resumed while the sync was rebuilding the model. | `App.cs` now handles the pre-events `DocumentSynchronizingWithCentral`, `DocumentReloadingLatest`, `DocumentSaving` and `DocumentSavingAs`: all model-log work pauses (`ModelLogService.BeginDocumentBusy`, a nesting count) until the matching post-event. A sync, reload or close also bumps a per-document generation. Every job carries the generation it was queued at and checks it, plus `Document.IsValidObject`, before each step, stopping without a checkpoint if either changed. The sync/reload post-event queues a fresh reconcile, or re-runs the snapshot if a brand-new log's first snapshot was the one interrupted. *(Changed in Round 13: only a close bumps the generation now; a sync/reload pauses the in-flight pass and it resumes afterwards — restarting it on every sync meant a busy model's pass never reached its `cp`.)* |
 | 3 | An exception from any job propagated out of `IdleSliceRunner.RunSlice`. | `RunSlice` catches it, drops the job and reports it (`onJobFailed`, unit-tested); `App.OnIdling` and the document-event handlers are wrapped too. This covers ordinary exceptions only: .NET 8 never lets managed code catch an `AccessViolationException`, and .NET Framework 4.8 doesn't by default. Fixes 1 and 2 prevent the crash itself. |
 
 Found while re-checking this fix:
@@ -538,6 +552,30 @@ a frozen `git worktree` at the prior commit vs. this one):
 - Segment retention: `ConnectorSettings.ModelLogRetentionDays` (default 90) — see "Retention"
   above.
 
+## Round 13: v0.6.0 real-model review (2026-09-25)
+
+Session of 25 Sep on `PDR_Horizons_BWK_R25` (v0.6.0): header + session + full snapshot + `cp
+complete: true` (189,136 elements in the model, 42,923 `el` records, written 09:41–09:47); `eid`
+100%, `loc` 95%, `type` 83%, `pdef` spec 93%, `mats` 63% (504 `mat`), 322 `sheet` records. Producer
+version bumped to `0.6.1`, so the next open starts a new log generation that applies all of this
+to the existing log (the lines/detail items already logged get `del` with `reason: "filtered"`).
+
+| # | Finding | Cause | Fix |
+|---|---|---|---|
+| 1 | Noise filter not working: 6,275 Lines and 5,116 Detail Items among 42,923 `el` (~27%) | Revit files `OST_Lines` (model + detail lines) and `OST_DetailComponents` under `CategoryType.Model`, and the type checks didn't cover curve elements or view-owned elements | `RecordBuilder.IsLoggableModelElement` now also excludes view-specific elements (`Element.ViewSpecific`), every `CurveElement`, element types, reference planes, and a `BuiltInCategory` list (lines, detail items, detail groups, separation/boundary/sketch/insulation lines, sun path, cameras, legend components, work plane grid, raster images, match lines, reference planes), resolved by name so a name missing from one API target can't break the build |
+| 2 | No closing `cp`: yesterday's segment has no `cp` at all; `state.json` says `LastCheckpointClosed: false` | Not provable from the log alone (no Revit here). Found in code, each able to produce exactly that: (a) every sync ABANDONED the running snapshot/reconcile and restarted it from scratch, so on a model synced more often than one pass takes (~6 min here) no pass ever reached its `cp`; (b) any exception escaping a pass dropped the job silently — no `cp`, and live change capture held back for the rest of the session; (c) `state.json` is only a base file: `LastCheckpointClosed` lives in its journal (`state.<gen>.jsonl`) until the next compaction, so the base can read `false` after a clean close; (d) the closing `cp` ran after a slow ModelFacts lookup, and nothing wrote one for a model still open at add-in shutdown | (a) a sync pauses and resumes the pass instead (sync epoch; `FinishWalk` writes `complete: false` and queues a follow-up reconcile); (b) per-record guard (`TryRun`, counted in `cp.errors`) plus a job-level guard that writes a `gap` and releases change capture; (c) a `closed: true` checkpoint compacts `state.json`; (d) the closing `cp` is written first, and `ModelLogService.CloseAll` runs from `OnShutdown` |
+| 3 | 21,836 `del` at the start of a new segment — cleanup or real? | Deletion detection on a new generation compares the hash cache with a fresh walk; it can't be told from the records which it was. Candidates in code: records an earlier version logged that this one doesn't (pre-filter noise, types no logged element uses), modified element TYPES that change capture had logged as `el` (then "deleted" by every full walk), areas logged as `node` by change capture but never by the walk, plus real deletions not yet reconciled from a session that never reached its `cp` | Every `del` now carries `reason` (`deleted`/`filtered`/`unreferenced`), decided by asking the model whether the element still exists. Change capture no longer logs element types as `el` (they update their `type` record) or areas as `node` |
+| 4a | `rel.roomFrom/To` 4% | Only the document's last phase was tried; rooms exist per phase | Doors/windows: also the instance's created phase, then every other phase; then a geometric fallback (`rel.roomSource: "geometric"`) |
+| 4b | `h.mark` 12% | Most likely the model's own data: `h.mark` is `ALL_MODEL_MARK`, present only when Mark is filled in — never invented | No code change. To verify: count `el` records whose `p` has a non-empty `builtin:ALL_MODEL_MARK`; it should equal the `h.mark` count |
+| 4c | `el.sheets` 4% with 322 sheets | `sheets` counted only TAGGED elements | Now also every sheet whose placed model views show the element (per-view visibility, one view per idle step) |
+| 5 | ~315k records, live segment 72 MB+ in one heavy session | No rotation outside open/sync; every sync-restarted snapshot re-wrote the full state; the noise of #1; `p` rewritten whenever "Edited by" (the worksharing borrower) changed | Size-based continuation rotation (see "Rotation"); passes resume instead of restarting; #1's filter; `EDITED_BY` excluded from `p` like any other value that changes on its own |
+
+**Still to verify in Revit** (not possible in this sandbox): the per-view visibility pass's cost on
+the largest views (3D views especially) against the 50 ms slice budget; that `DocumentClosing` is
+raised for every open model when Revit itself exits (`CloseAll` covers it if not); the counts above
+after one session on v0.6.1 (`el` without lines/detail items, `del` reasons, `roomFrom/To`, `sheets`,
+segment sizes).
+
 ## Order, verification and done
 
 | Order | Work | Why this order | Status |
@@ -576,7 +614,9 @@ follow-up.
    export actually assigned.
 9. **Sync safety:** start a Synchronize with Central while a reconcile is visibly in progress
    (right after opening a large model). Revit must not crash. The log must show no records
-   between the sync starting and finishing, then a fresh reconcile ending in a `cp`. Repeat with
+   between the sync starting and finishing; then the same pass resumes (no second `header`/full
+   state), ends in a `cp` with `complete: false`, and a follow-up reconcile ends in a `cp` with
+   `complete: true`. Repeat with
    Reload Latest and with closing the model mid-reconcile (its closing `cp` should read
    `complete: false`).
 10. **Post-event pairing:** confirm Revit raises `DocumentSynchronizedWithCentral`,

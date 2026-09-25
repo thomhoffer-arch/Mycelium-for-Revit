@@ -51,22 +51,70 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// pass), and never annotation/view/schedule objects that occasionally carry a
         /// CategoryType.Model category as a Revit quirk (checked by TYPE, not just category, so
         /// that quirk can't let noise back in).</summary>
+        ///
+        /// <para>v0.6.1 (real-model review, 25 Sep): Revit files "Lines" (<c>OST_Lines</c> — model
+        /// AND detail lines) and "Detail Items" (<c>OST_DetailComponents</c>) under
+        /// <see cref="CategoryType.Model"/>, so the category-type check alone let 6,275 lines
+        /// and 5,116 detail items through (~27% of all `el` records). Now also excluded: anything
+        /// owned by a single view (<see cref="Element.ViewSpecific"/> — detail lines, detail
+        /// components, filled/masking regions, detail groups: 2D drafting, never a building
+        /// element, whatever category Revit files it under), every <see cref="CurveElement"/>
+        /// (model lines, room/space separation lines, area boundaries, sketch lines), element
+        /// TYPES (a modified <see cref="ElementType"/> reaches this from change capture — it
+        /// belongs in `type`, never `el`), and the 2D/annotation-only categories below by
+        /// <see cref="BuiltInCategory"/> — locale-independent, unlike the display names
+        /// above.</para></summary>
         public static bool IsLoggableModelElement(Element el)
         {
+            if (el is ElementType) return false;
+
             var cat = el.Category;
             if (cat is null) return false;
             if (string.IsNullOrEmpty(cat.Name) || cat.Name.StartsWith("<", StringComparison.Ordinal)) return false;
             if (cat.CategoryType != CategoryType.Model) return false;
             if (NoiseCategoryNames.Contains(cat.Name)) return false;
+            try { if (NoiseCategoryIds.Contains(cat.Id.Value)) return false; } catch { }
+
+            try { if (el.ViewSpecific) return false; } catch { }
 
             if (el is SpatialElement) return false; // Room, Space, Area — belongs in `node`, not `el`
 
             if (el is View || el is ViewSheet || el is Viewport || el is Sketch || el is SketchPlane ||
                 el is Dimension || el is IndependentTag || el is ScheduleSheetInstance ||
-                el is AreaScheme || el is Material)
+                el is AreaScheme || el is Material || el is CurveElement || el is ReferencePlane)
                 return false;
 
             return true;
+        }
+
+        // 2D / annotation-only categories Revit nonetheless files under CategoryType.Model (or
+        // that are otherwise never building elements), by BuiltInCategory — resolved by NAME at
+        // runtime (Enum.TryParse, same defensive pattern as QuantityCandidates below) so a name
+        // missing from one of this repo's two Revit API targets simply drops out instead of
+        // failing the build.
+        private static readonly HashSet<long> NoiseCategoryIds = ResolveCategoryIds(
+            "OST_Lines",                   // model + detail lines (the reported 6,275)
+            "OST_DetailComponents",        // detail items (the reported 5,116)
+            "OST_IOSDetailGroups",         // detail groups
+            "OST_SketchLines",
+            "OST_RoomSeparationLines",
+            "OST_MEPSpaceSeparationLines",
+            "OST_AreaSchemeLines",
+            "OST_InsulationLines",
+            "OST_SunPath",
+            "OST_Cameras",
+            "OST_LegendComponents",
+            "OST_IOSSketchGrid",           // work plane grid
+            "OST_RasterImages",
+            "OST_Matchline",
+            "OST_CLines");                 // reference planes
+
+        private static HashSet<long> ResolveCategoryIds(params string[] names)
+        {
+            var ids = new HashSet<long>();
+            foreach (var n in names)
+                if (Enum.TryParse<BuiltInCategory>(n, out var bic)) ids.Add((long)bic);
+            return ids;
         }
 
         // ── Header ───────────────────────────────────────────────────────────────
@@ -386,10 +434,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var p = new JsonObject();
             foreach (Parameter param in mat.Parameters)
             {
-                if (!param.HasValue) continue;
-                var v = ElementContextReader.ReadParamValue(param);
-                if (v is null) continue;
-                p[param.Definition.Name] = v;
+                // Per parameter: one unreadable parameter must not lose the whole material.
+                try
+                {
+                    if (!param.HasValue) continue;
+                    if (ParamDefId(param) is { } pid && VolatileParamIds.Contains(pid)) continue;
+                    var v = ElementContextReader.ReadParamValue(param);
+                    if (v is null) continue;
+                    p[param.Definition.Name] = v;
+                }
+                catch { }
             }
             if (p.Count > 0) fields["params"] = p;
             return fields;
@@ -409,11 +463,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var p = new JsonObject();
             foreach (Parameter param in type.Parameters)
             {
-                if (!param.HasValue) continue;
-                onParam(param, true);
-                var id = ParamDefId(param);
-                if (id is null) continue;
-                p[id] = ElementContextReader.ReadParamTyped(param)["value"]?.DeepClone();
+                // Per parameter: one unreadable parameter must not lose the whole type record.
+                try
+                {
+                    if (!param.HasValue) continue;
+                    var id = ParamDefId(param);
+                    if (id is not null && VolatileParamIds.Contains(id)) continue;
+                    onParam(param, true);
+                    if (id is null) continue;
+                    p[id] = ElementContextReader.ReadParamTyped(param)["value"]?.DeepClone();
+                }
+                catch { }
             }
             if (p.Count > 0) fields["p"] = p;
             return fields;
@@ -475,6 +535,88 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return index;
         }
 
+        // View types that show model elements (plans, sections, elevations, 3D, callouts).
+        // Drafting views, legends, schedules, reports, walkthroughs etc. never show a model
+        // element, so they're skipped rather than paying a visibility pass for nothing.
+        private static readonly HashSet<ViewType> ModelViewTypes = new()
+        {
+            ViewType.FloorPlan, ViewType.CeilingPlan, ViewType.EngineeringPlan, ViewType.AreaPlan,
+            ViewType.Elevation, ViewType.Section, ViewType.Detail, ViewType.ThreeD,
+        };
+
+        /// <summary>Every (view, sheet number) pair where a model-showing view (see
+        /// <see cref="ModelViewTypes"/>) is placed on a sheet — the work list for the
+        /// "which sheets does this element appear on" index behind <c>el.sheets</c> (the
+        /// real-model review found `sheets` on only 4% of elements with 322 sheets in the model:
+        /// it only ever counted TAGGED elements). One cheap pass; the expensive per-view
+        /// visibility pass is <see cref="AddVisibleElements"/>, one view per idle step.</summary>
+        public static List<(ElementId ViewId, string SheetNumber)> VisibleSheetViews(Document doc)
+        {
+            var result = new List<(ElementId, string)>();
+            foreach (ViewSheet sheet in new FilteredElementCollector(doc).OfClass(typeof(ViewSheet)))
+            {
+                ICollection<ElementId> placed;
+                string number;
+                try { placed = sheet.GetAllPlacedViews(); number = sheet.SheetNumber; } catch { continue; }
+                foreach (var vid in placed)
+                {
+                    try
+                    {
+                        if (doc.GetElement(vid) is View v && !v.IsTemplate && ModelViewTypes.Contains(v.ViewType))
+                            result.Add((vid, number));
+                    }
+                    catch { }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>Category ids of every <see cref="CategoryType.Model"/> category — a quick
+        /// pre-filter for <see cref="AddVisibleElements"/>, so the (slow) per-view visibility
+        /// check never runs on the view's annotation (tags, dimensions, text) at all. Null when
+        /// it can't be built; the caller then collects unfiltered.</summary>
+        public static ElementMulticategoryFilter? ModelCategoryFilter(Document doc)
+        {
+            try
+            {
+                var ids = new List<ElementId>();
+                foreach (Category c in doc.Settings.Categories)
+                {
+                    try { if (c.CategoryType == CategoryType.Model) ids.Add(c.Id); } catch { }
+                }
+                return ids.Count > 0 ? new ElementMulticategoryFilter(ids) : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Adds <paramref name="sheetNumber"/> to <paramref name="index"/> for every
+        /// element VISIBLE in <paramref name="viewId"/> (<c>new FilteredElementCollector(doc,
+        /// viewId)</c> — Revit's own visibility, including crop, view filters and hidden
+        /// categories). Returns false when the view couldn't be collected (the index is then
+        /// simply missing that view's sheet — never a guessed value). NEEDS LIVE-REVIT CHECK:
+        /// per-view cost on the largest views (large 3D views especially) against the 50 ms idle
+        /// slice budget.</summary>
+        public static bool AddVisibleElements(
+            Document doc, ElementId viewId, string sheetNumber, ElementFilter? categoryFilter,
+            Dictionary<ElementId, List<string>> index)
+        {
+            ICollection<ElementId> ids;
+            try
+            {
+                var collector = new FilteredElementCollector(doc, viewId).WhereElementIsNotElementType();
+                if (categoryFilter is not null) collector = collector.WherePasses(categoryFilter);
+                ids = collector.ToElementIds();
+            }
+            catch { return false; }
+
+            foreach (var id in ids)
+            {
+                if (!index.TryGetValue(id, out var list)) index[id] = list = new List<string>();
+                if (!list.Contains(sheetNumber)) list.Add(sheetNumber);
+            }
+            return true;
+        }
+
         // ── Elements (el) ────────────────────────────────────────────────────────
 
         /// <summary>Builds the full field-group set for one element (docs/MODEL_LOG.md's
@@ -484,7 +626,9 @@ namespace Loam.Revit.Connector.ModelLogCapture
         /// this method knowing anything about the writer/hash-cache. <paramref
         /// name="taggedSheets"/> (optional — see <see cref="BuildTaggedSheetIndex"/>) supplies
         /// <c>sheets</c>: the sheet numbers of every sheet a tag on this element is placed
-        /// on.</summary>
+        /// on. <paramref name="visibleSheets"/> (optional — see <see cref="VisibleSheetViews"/>/
+        /// <see cref="AddVisibleElements"/>) adds the sheets whose placed views SHOW this element;
+        /// <c>sheets</c> is the union of both, in first-seen order.</summary>
         public static JsonObject BuildElementFields(
             Element el,
             IReadOnlyDictionary<ElementId, string> nodeIdByLevelOrSpace,
@@ -492,7 +636,8 @@ namespace Loam.Revit.Connector.ModelLogCapture
             Phase? defaultPhase,
             Action<Parameter, bool> onParamDef,
             IReadOnlyDictionary<ElementId, List<string>>? taggedSheets = null,
-            IReadOnlyDictionary<ElementId, List<string>>? hostedIndex = null)
+            IReadOnlyDictionary<ElementId, List<string>>? hostedIndex = null,
+            IReadOnlyDictionary<ElementId, List<string>>? visibleSheets = null)
         {
             var fields = new JsonObject { ["eid"] = el.Id.Value };
 
@@ -558,7 +703,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             var mats = BuildMaterials(el);
             if (mats is not null) fields["mats"] = mats;
 
-            if (taggedSheets is not null && taggedSheets.TryGetValue(el.Id, out var sheetNums) && sheetNums.Count > 0)
+            List<string>? sheetNums = null;
+            if (visibleSheets is not null && visibleSheets.TryGetValue(el.Id, out var shown))
+                foreach (var s in shown) (sheetNums ??= new List<string>()).Add(s);
+            if (taggedSheets is not null && taggedSheets.TryGetValue(el.Id, out var tagged))
+                foreach (var s in tagged)
+                {
+                    sheetNums ??= new List<string>();
+                    if (!sheetNums.Contains(s)) sheetNums.Add(s);
+                }
+            if (sheetNums is { Count: > 0 })
             {
                 var arr = new JsonArray();
                 foreach (var s in sheetNums) arr.Add(s);
@@ -646,16 +800,16 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // #3): doors are the common case, but get_FromRoom/get_ToRoom apply to any
             // FamilyInstance Revit considers room-bounding-adjacent. Referenced by NODE id (the
             // room is logged as a `node` record, never as `el` — see IsLoggableModelElement),
-            // matching `loc.storey`/`loc.space`'s own reference convention.
+            // matching `loc.storey`/`loc.space`'s own reference convention. See
+            // ResolveFromToRooms for the doors/windows fallbacks (v0.6.1: only 4% coverage).
             try
             {
                 if (el is FamilyInstance fi2 && phase is not null)
                 {
-                    Room? from = null, to = null;
-                    try { from = fi2.get_FromRoom(phase); } catch { }
-                    try { to = fi2.get_ToRoom(phase); } catch { }
+                    var (from, to, geometric) = ResolveFromToRooms(fi2, phase);
                     if (from is not null) rel["roomFrom"] = NodeId(from.Id);
                     if (to is not null) rel["roomTo"] = NodeId(to.Id);
+                    if (geometric && (from is not null || to is not null)) rel["roomSource"] = "geometric";
                 }
             }
             catch { }
@@ -759,6 +913,94 @@ namespace Loam.Revit.Connector.ModelLogCapture
             return rel.Count > 0 ? rel : null;
         }
 
+        /// <summary>From/To room for a family instance. Tries <paramref name="defaultPhase"/>
+        /// first (the document's last phase — the only thing v0.6.0 tried, which found rooms for
+        /// just 4% of elements). Rooms exist per phase, so a model whose rooms live in an
+        /// earlier phase than the last one resolved nothing at all; for DOORS and WINDOWS only
+        /// (the categories where every instance sits between two spaces — other families would
+        /// just pay extra API calls for nothing), this then tries the instance's own created
+        /// phase, then every other phase from last to first, and finally — only when Revit's own
+        /// From/To Room is unset in every phase — samples a point just beyond each face of the
+        /// door/window along its facing direction (the same fallback <c>pdra_get_door_rooms</c>
+        /// already uses), reported with <c>geometric: true</c> so the caller can mark it
+        /// (<c>rel.roomSource</c>) as derived rather than Revit's own value.</summary>
+        private static (Room? From, Room? To, bool Geometric) ResolveFromToRooms(FamilyInstance fi, Phase defaultPhase)
+        {
+            var (from, to) = FromToIn(fi, defaultPhase);
+            if (from is not null || to is not null) return (from, to, false);
+
+            long? catId = null;
+            try { catId = fi.Category?.Id.Value; } catch { }
+            if (catId != (long)BuiltInCategory.OST_Doors && catId != (long)BuiltInCategory.OST_Windows)
+                return (null, null, false);
+
+            var phases = new List<Phase>();
+            try
+            {
+                if (fi.CreatedPhaseId != ElementId.InvalidElementId && fi.Document.GetElement(fi.CreatedPhaseId) is Phase created)
+                    phases.Add(created);
+            }
+            catch { }
+            try
+            {
+                var all = fi.Document.Phases;
+                for (var i = all.Size - 1; i >= 0; i--)
+                    if (all.get_Item(i) is Phase ph && !phases.Exists(x => x.Id == ph.Id)) phases.Add(ph);
+            }
+            catch { }
+            phases.RemoveAll(ph => ph.Id == defaultPhase.Id); // already tried
+
+            foreach (var ph in phases)
+            {
+                (from, to) = FromToIn(fi, ph);
+                if (from is not null || to is not null) return (from, to, false);
+            }
+
+            // Geometric fallback: the default phase first, then the others, same order as above.
+            phases.Insert(0, defaultPhase);
+            foreach (var ph in phases)
+            {
+                (from, to) = GeometricFromTo(fi, ph);
+                if (from is not null || to is not null) return (from, to, true);
+            }
+            return (null, null, false);
+        }
+
+        private static (Room? From, Room? To) FromToIn(FamilyInstance fi, Phase phase)
+        {
+            Room? from = null, to = null;
+            try { from = fi.get_FromRoom(phase); } catch { }
+            try { to = fi.get_ToRoom(phase); } catch { }
+            return (from, to);
+        }
+
+        /// <summary>Mirrors <c>GetDoorRoomsTool.TryGeometricRooms</c>: a point just beyond each
+        /// face of the host wall along the instance's facing direction. The point is lifted 1 ft
+        /// above the instance's own location (a door's location sits exactly on the level —
+        /// on a room's bottom face, where the containment test is unreliable).</summary>
+        private static (Room? From, Room? To) GeometricFromTo(FamilyInstance fi, Phase phase)
+        {
+            try
+            {
+                if ((fi.Location as LocationPoint)?.Point is not XYZ pt) return (null, null);
+                var f = fi.FacingOrientation;
+                var fh = new XYZ(f.X, f.Y, 0);
+                fh = fh.GetLength() > 1e-6 ? fh.Normalize() : XYZ.BasisY;
+
+                double offset = 1.0; // ~305 mm beyond the centre
+                if (fi.Host is Wall w) { try { offset = w.Width / 2.0 + 0.5; } catch { } }
+
+                var lifted = pt + XYZ.BasisZ;
+                Room? RoomAt(XYZ p)
+                {
+                    try { return fi.Document.GetRoomAtPoint(p, phase) as Room; } catch { return null; }
+                }
+                // Same orientation convention as GetDoorRoomsTool: facing side = "from".
+                return (RoomAt(lifted + fh.Multiply(offset)), RoomAt(lifted - fh.Multiply(offset)));
+            }
+            catch { return (null, null); }
+        }
+
         // Resolved by NAME at runtime (Enum.TryParse), not referenced as compile-time
         // BuiltInParameter members — mirrors ElementContextReader.ResolveBips' own defensive
         // pattern, since which of these apply varies per category (a wall's own length lives on
@@ -847,6 +1089,17 @@ namespace Loam.Revit.Connector.ModelLogCapture
             catch { return null; }
         }
 
+        /// <summary>Parameters whose value changes on its own, without the element itself
+        /// changing — per docs/MODEL_LOG.md ("leave out values that change on their own … or
+        /// every save looks like a change to every element"). <c>EDITED_BY</c> ("Edited by") is
+        /// the element's current worksharing BORROWER: it flips when an element is borrowed and
+        /// again when a sync relinquishes it, so keeping it made every element touched in a
+        /// session re-write its whole `p` group after each sync.</summary>
+        private static readonly HashSet<string> VolatileParamIds = new(StringComparer.Ordinal)
+        {
+            "builtin:" + BuiltInParameter.EDITED_BY,
+        };
+
         private static JsonObject? BuildInstanceParams(Element el, Action<Parameter, bool> onParamDef)
         {
             var p = new JsonObject();
@@ -855,8 +1108,9 @@ namespace Loam.Revit.Connector.ModelLogCapture
                 foreach (Parameter param in el.Parameters)
                 {
                     if (!param.HasValue) continue;
-                    onParamDef(param, false);
                     var id = ParamDefId(param);
+                    if (id is not null && VolatileParamIds.Contains(id)) continue;
+                    onParamDef(param, false);
                     if (id is null) continue;
                     var typed = ElementContextReader.ReadParamTyped(param);
                     p[id] = typed["value"]?.DeepClone();

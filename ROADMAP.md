@@ -86,6 +86,12 @@ log instead. Loam reads the log; nobody calls anyone.
       wrote 434 GB and took 33 minutes. It's now a base file plus an append-only journal,
       compacted only when worth it. A no-change pass or a no-op edit writes nothing. The same
       snapshot now takes 6.4 s and writes 103 MB.
+- [x] **Round 13 — v0.6.0 real-model review** (docs/MODEL_LOG.md's "Round 13"): lines/detail
+      items/view-owned/curve elements out of `el`; `del.reason`; closing `cp` hardened (sync no
+      longer restarts a pass, per-record + job-level error guards, `cp.errors`, shutdown safety
+      net, `state.json` compacted on close); doors/windows room from/to across phases +
+      geometric fallback; `el.sheets` from view visibility; size-based continuation rotation;
+      `EDITED_BY` out of `p`. Producer version `0.6.1`.
 
 **Not done — needs an actual Revit session (tracked, not forgotten):**
 - [ ] Verify the derived IFC GlobalId against a real IFC export (docs/MODEL_LOG.md's verification

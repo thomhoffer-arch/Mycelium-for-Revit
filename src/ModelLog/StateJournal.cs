@@ -21,7 +21,7 @@ namespace Loam.Revit.Connector.ModelLog
     ///   hr  hash-cache remove: {op:"hr", f:family, id}
     ///   pd  pdef seen:         {op:"pd", id}
     ///   cs  cat seen:          {op:"cs", id}
-    ///   m   scalar fields:     {op:"m", seq, seg, closed, mv?, pv?, lcv?}
+    ///   m   scalar fields:     {op:"m", seq, seg, closed, mv?, pv?, lcv?, gs?}
     ///     (LastSeq is carried for completeness but is never trusted over the log tail — see
     ///     ModelLogWriter's recovery logic in its constructor)
     ///
@@ -64,6 +64,7 @@ namespace Loam.Revit.Connector.ModelLog
             if (state.LastModelVersion is not null) obj["mv"] = state.LastModelVersion;
             if (state.LastProducerVersion is not null) obj["pv"] = state.LastProducerVersion;
             if (state.LastCompleteModelVersion is not null) obj["lcv"] = state.LastCompleteModelVersion;
+            if (state.GenerationSegment > 0) obj["gs"] = state.GenerationSegment;
             return obj.ToJsonString();
         }
 
@@ -129,6 +130,9 @@ namespace Loam.Revit.Connector.ModelLog
                             state.LastModelVersion = root.TryGetProperty("mv", out var mv) ? mv.GetString() : null;
                             state.LastProducerVersion = root.TryGetProperty("pv", out var pv) ? pv.GetString() : null;
                             state.LastCompleteModelVersion = root.TryGetProperty("lcv", out var lcv) ? lcv.GetString() : null;
+                            // Absent in a journal written before this field existed — keep
+                            // whatever the base already had rather than reset it to 0.
+                            if (root.TryGetProperty("gs", out var gs)) state.GenerationSegment = gs.GetInt64();
                             break;
                         default:
                             break; // unknown op — ignore just this line, keep replaying

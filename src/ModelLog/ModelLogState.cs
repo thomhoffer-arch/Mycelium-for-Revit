@@ -23,6 +23,15 @@ namespace Loam.Revit.Connector.ModelLog
         /// ModelLogCapture.ModelLogService.ReconcileJob.</summary>
         public string? LastCompleteModelVersion { get; set; }
 
+        /// <summary>The segment number where the current log generation's full state begins
+        /// (the segment <c>BeginSnapshot</c>/<c>BeginNewGeneration</c> wrote its header into).
+        /// Every later segment up to the active one is a CONTINUATION (a size-based rotation that
+        /// carries a header but no full state) — a reader rebuilds the current state by reading
+        /// from this segment forward, and retention never deletes it or anything after it.
+        /// 0 = unknown (a state.json written before this field existed): retention then keeps
+        /// every segment, the safe direction, until the next generation sets it.</summary>
+        public long GenerationSegment { get; set; }
+
         public HashCache Cache { get; set; } = new();
 
         /// <summary>Which <c>state.&lt;gen&gt;.jsonl</c> delta journal this base was last

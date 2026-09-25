@@ -30,4 +30,23 @@ namespace Loam.Revit.Connector.ModelLog
         /// <see cref="ModelLogWriter.WriteIfChanged"/>'s hash-cache change detection.</summary>
         public static bool IsWriteOnce(string kind) => kind == Pdef || kind == Cat;
     }
+
+    /// <summary>
+    /// The <c>reason</c> values a <c>del</c> record carries (docs/MODEL_LOG.md), so a reader can
+    /// tell a real deletion in the model from a record merely leaving the log's scope.
+    /// </summary>
+    public static class DeleteReasons
+    {
+        /// <summary>The element no longer exists in the model — a real deletion.</summary>
+        public const string Deleted = "deleted";
+
+        /// <summary>The element still exists in the model but is no longer logged in this
+        /// family — e.g. an upgraded connector's noise filter now excludes it (lines, detail
+        /// items). Cleanup, NOT a deletion in the model.</summary>
+        public const string Filtered = "filtered";
+
+        /// <summary>A <c>type</c> that still exists in the model but that no logged element
+        /// references any more. Cleanup, NOT a deletion in the model.</summary>
+        public const string Unreferenced = "unreferenced";
+    }
 }
