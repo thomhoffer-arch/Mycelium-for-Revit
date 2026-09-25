@@ -125,31 +125,27 @@ namespace Loam.Revit.Connector.ModelLog
         /// <summary>Deletes finished (gzipped) segments older than <paramref
         /// name="retentionDays"/> — owner only (we already returned above when
         /// <see cref="LockHeldElsewhere"/>), and never the active segment (never gzipped anyway,
-        /// so <c>*.jsonl.gz</c> can't match it) or the single most-recently-finished one: every
-        /// segment starts with its own full header + full state (see
-        /// <see cref="BeginNewGeneration"/>/the rotation rule), so that one alone is always
-        /// enough to keep reading the log from; anything older is redundant history, not a
-        /// requirement for correctness. <paramref name="retentionDays"/> &lt;= 0 disables this
-        /// (keep everything). Best-effort: a delete failure (file in use, permissions) is simply
+        /// so <c>*.jsonl.gz</c> can't match it), nor any segment of the CURRENT generation
+        /// (<see cref="ModelLogState.GenerationSegment"/> onward): the generation's first segment
+        /// holds its full state and every later one is a continuation a reader needs to replay
+        /// on top of it (see <see cref="RotateContinuationIfDue"/>). Anything before the current
+        /// generation is redundant history, not a requirement for correctness. When the
+        /// generation start is unknown (a state written before it was tracked) nothing is
+        /// deleted at all. <paramref name="retentionDays"/> &lt;= 0 disables this (keep
+        /// everything). Best-effort: a delete failure (file in use, permissions) is simply
         /// retried at the next startup.</summary>
         private void ApplyRetentionPolicy(int retentionDays)
         {
             if (retentionDays <= 0) return;
+            var generationStart = _state.GenerationSegment;
+            if (generationStart <= 0) return; // unknown — never risk deleting the current generation's full state
             try
             {
-                long newestFinished = -1;
-                foreach (var f in Directory.EnumerateFiles(LogDirectory, "*.jsonl.gz"))
-                {
-                    var stem = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(f));
-                    if (long.TryParse(stem, out var n) && n > newestFinished) newestFinished = n;
-                }
-                if (newestFinished < 0) return; // nothing finished yet — never delete the only history there is
-
                 var cutoff = DateTime.UtcNow.AddDays(-retentionDays);
                 foreach (var f in Directory.EnumerateFiles(LogDirectory, "*.jsonl.gz"))
                 {
                     var stem = Path.GetFileNameWithoutExtension(Path.GetFileNameWithoutExtension(f));
-                    if (!long.TryParse(stem, out var n) || n == newestFinished) continue;
+                    if (!long.TryParse(stem, out var n) || n >= generationStart) continue;
                     try { if (File.GetLastWriteTimeUtc(f) < cutoff) File.Delete(f); }
                     catch { /* best-effort — retried next startup */ }
                 }
@@ -245,27 +241,79 @@ namespace Loam.Revit.Connector.ModelLog
 
         // ── Header / segment rotation ────────────────────────────────────────────
 
-        /// <summary>First line of every segment. Callers pass the same header fields on every
-        /// rotation so a reader can open any segment on its own (the handoff's rotation rule) —
-        /// model identity, producer/version, display units, coordinates, the field-role map.
-        /// A no-op once already written for the current segment.</summary>
+        /// <summary>First line of every segment — model identity, producer/version, display
+        /// units, coordinates, the field-role map — plus where this segment sits in its log
+        /// generation: <c>segment</c> (its own number), <c>generationStart</c> (the segment
+        /// holding the generation's full state) and, on a size-based continuation segment only,
+        /// <c>continuation: true</c> (see <see cref="RotateContinuationIfDue"/>). A no-op once
+        /// already written for the current segment.</summary>
         public void WriteHeader(JsonObject headerFields)
         {
             if (LockHeldElsewhere) return;
             if (_headerWrittenThisSegment) return;
             var fields = new JsonObject { ["schema"] = SchemaVersion };
             foreach (var kv in headerFields) fields[kv.Key] = kv.Value?.DeepClone();
+            fields["segment"] = _segment!.SegmentNumber;
+            if (_state.GenerationSegment > 0)
+            {
+                fields["generationStart"] = _state.GenerationSegment;
+                if (_state.GenerationSegment != _segment.SegmentNumber) fields["continuation"] = true;
+            }
             Append(RecordKinds.Header, fields);
             _headerWrittenThisSegment = true;
         }
 
-        /// <summary>True once the active segment has grown past the rotation threshold — the
-        /// signal <see cref="ModelLogCapture.ModelLogService"/> uses to run a NEW-GENERATION pass
-        /// (<see cref="BeginNewGeneration"/>) instead of an ordinary reconcile, so a rotated
-        /// segment always starts with a header AND full state. There is no size-triggered
-        /// rotation left inside a plain reconcile — that used to rotate with only a header, the
-        /// bug this property's caller fixes at the root.</summary>
+        /// <summary>True once the active segment has grown past the rotation threshold
+        /// (<see cref="LogSegmentWriter.RotateAtBytes"/>) — see <see
+        /// cref="RotateContinuationIfDue"/>.</summary>
         public bool RotationDue => !LockHeldElsewhere && _segment!.ShouldRotate();
+
+        /// <summary>How many size-based continuation segments a generation may accumulate before
+        /// the next open/sync starts a fresh generation (a new full state) instead of yet another
+        /// continuation — bounds how much change history a reader must replay on top of the
+        /// generation's full state. <see cref="LogSegmentWriter.RotateAtBytes"/> × this is the
+        /// most plain log (before gzip) a reader ever replays after the full state.</summary>
+        public const int MaxContinuationSegments = 4;
+
+        /// <summary>True when the current generation already spans more than <see
+        /// cref="MaxContinuationSegments"/> continuation segments (or its start is unknown — a
+        /// state written before generations were tracked — and the active segment is past the
+        /// rotation threshold): the caller should run a NEW-GENERATION pass (<see
+        /// cref="BeginNewGeneration"/>, a fresh full state) rather than another continuation
+        /// rotation. Only checked at open/sync, never mid-session.</summary>
+        public bool NewGenerationDue
+        {
+            get
+            {
+                if (LockHeldElsewhere) return false;
+                if (_state.GenerationSegment <= 0) return _segment!.ShouldRotate();
+                var continuations = _segment!.SegmentNumber - _state.GenerationSegment;
+                return continuations > MaxContinuationSegments
+                    || (continuations == MaxContinuationSegments && _segment.ShouldRotate());
+            }
+        }
+
+        /// <summary>Size-based rotation (the fix for a single heavy session growing the live
+        /// segment past 72 MB): once the active segment is past <see
+        /// cref="LogSegmentWriter.RotateAtBytes"/>, closes it (gzipped in the background) and
+        /// starts a CONTINUATION segment — a header with <c>continuation: true</c> and
+        /// <c>generationStart</c>, then simply the next records. It deliberately carries no full
+        /// state: re-writing every element on every rotation would multiply the log's size, the
+        /// opposite of what rotation is for. A reader rebuilds the current state by reading from
+        /// <c>generationStart</c> forward; retention keeps that whole range (see
+        /// <see cref="ApplyRetentionPolicy"/>), and <see cref="NewGenerationDue"/> bounds how long
+        /// it can get. Call only at a record boundary between passes (after a change batch or a
+        /// checkpoint), never in the middle of a snapshot/reconcile walk. <paramref
+        /// name="headerFields"/> is only invoked when a rotation actually happens (building a
+        /// header touches the Revit API). Returns true when it rotated.</summary>
+        public bool RotateContinuationIfDue(Func<JsonObject> headerFields)
+        {
+            if (LockHeldElsewhere) return false;
+            if (!_segment!.ShouldRotate()) return false;
+            _pendingChange = null; // never carried across a rotation — it belongs to a batch that already ended
+            RotateAndReheader(headerFields());
+            return true;
+        }
 
         /// <summary>Call before starting a full snapshot/reconcile pass: rotates first if the
         /// active segment is already past the size threshold, then (re-)writes the header so a
@@ -276,9 +324,17 @@ namespace Loam.Revit.Connector.ModelLog
         public void BeginSnapshot(JsonObject headerFields)
         {
             if (LockHeldElsewhere) return;
-            if (_segment!.ShouldRotate()) RotateAndReheader(headerFields);
+            if (_segment!.ShouldRotate())
+            {
+                _segment.Rotate();
+                _state.CurrentSegment = _segment.SegmentNumber;
+            }
+            // This segment now carries the full state that follows — the generation starts here.
+            _state.GenerationSegment = _segment.SegmentNumber;
             _headerWrittenThisSegment = false; // a snapshot always re-asserts the header
             WriteHeader(headerFields);
+            _journalBuffer.Add(StateJournal.MetaOp(_state));
+            FlushJournalBuffer();
         }
 
         private void RotateAndReheader(JsonObject headerFields)
@@ -310,6 +366,7 @@ namespace Loam.Revit.Connector.ModelLog
                 _segment.Rotate();
                 _state.CurrentSegment = _segment.SegmentNumber;
             }
+            _state.GenerationSegment = _segment.SegmentNumber;
             _headerWrittenThisSegment = false;
             WriteHeader(headerFields);
 
@@ -340,9 +397,16 @@ namespace Loam.Revit.Connector.ModelLog
         /// version (see <see cref="ModelLogState.LastCompleteModelVersion"/>); anything else
         /// clears the baseline rather than risk it being wrong (e.g. edits made, then the model
         /// closed without saving — reopening must not skip re-checking those edits).</summary>
+        /// <paramref name="skippedErrors"/>, when above zero, is written as <c>errors</c>: how
+        /// many individual elements/records the pass had to skip because the Revit API threw
+        /// while reading them (the pass itself carried on — see ModelLogService's per-element
+        /// guard) — so a reader can tell a clean pass from one that silently lost something.
+        /// A <paramref name="closed"/> checkpoint also compacts the state unconditionally, so
+        /// state.json itself (not just its delta journal) reads <c>LastCheckpointClosed: true</c>
+        /// after a clean close.
         public void WriteCheckpoint(
             bool complete, string? modelVersion, int? elementCount, bool closed,
-            int? modelSaves = null, bool documentUnmodified = false)
+            int? modelSaves = null, bool documentUnmodified = false, int skippedErrors = 0)
         {
             if (LockHeldElsewhere) return;
             var fields = new JsonObject
@@ -354,6 +418,7 @@ namespace Loam.Revit.Connector.ModelLog
             if (modelVersion is not null) fields["modelVersion"] = modelVersion;
             if (elementCount is not null) fields["elementCount"] = elementCount.Value;
             if (modelSaves is not null) fields["modelSaves"] = modelSaves.Value;
+            if (skippedErrors > 0) fields["errors"] = skippedErrors;
             Append(RecordKinds.Checkpoint, fields);
 
             _state.LastCheckpointClosed = closed;
@@ -361,7 +426,8 @@ namespace Loam.Revit.Connector.ModelLog
             _state.LastCompleteModelVersion = (complete && documentUnmodified) ? modelVersion : null;
             _journalBuffer.Add(StateJournal.MetaOp(_state));
             FlushJournalBuffer();
-            MaybeCompact();
+            if (closed) CompactNow();
+            else MaybeCompact();
         }
 
         /// <summary>Call once per <c>DocumentOpened</c>, right after deciding whether this is a
@@ -387,6 +453,19 @@ namespace Loam.Revit.Connector.ModelLog
         /// missed events while it wasn't running (or crashed mid-session). The reconcile that
         /// follows closes the gap with its own checkpoint. A no-op on a brand-new log (nothing
         /// to have a gap in yet) or when the last checkpoint was already closed.</summary>
+        /// <summary>Unconditional <c>gap</c>: the connector knows it just failed to record
+        /// something (e.g. a snapshot/reconcile pass aborted by an exception) — closed, like any
+        /// gap, by the next checkpoint.</summary>
+        public void WriteGap(string reason)
+        {
+            if (LockHeldElsewhere) return;
+            Append(RecordKinds.Gap, new JsonObject
+            {
+                ["fromSeq"] = _state.LastSeq + 1,
+                ["reason"] = reason,
+            });
+        }
+
         public void WriteGapIfNeeded(string reason)
         {
             if (LockHeldElsewhere) return;
@@ -409,7 +488,14 @@ namespace Loam.Revit.Connector.ModelLog
         /// hash differs are written (new values, never a value-level diff — the handoff's rule
         /// #1), plus an <c>unset</c> array naming any field-group that disappeared entirely
         /// (e.g. every instance parameter was cleared).</summary>
-        public bool WriteIfChanged(string family, string id, JsonObject fullFields, bool forceFullState = false)
+        /// <param name="keepIfAbsent">Field-groups the caller could NOT compute this time (e.g.
+        /// `sheets` when the whole-model view-visibility index hasn't been built in this
+        /// session): absent from <paramref name="fullFields"/> means "unknown, keep what was last
+        /// written" for these — never an <c>unset</c> — and their previous hash is carried over
+        /// so the next pass that can compute them compares against the right value.</param>
+        public bool WriteIfChanged(
+            string family, string id, JsonObject fullFields, bool forceFullState = false,
+            IReadOnlyCollection<string>? keepIfAbsent = null)
         {
             var newHashes = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var kv in fullFields)
@@ -417,6 +503,10 @@ namespace Loam.Revit.Connector.ModelLog
                     newHashes[kv.Key] = RecordHash.Of(kv.Value);
 
             var prevHashes = _state.Cache.Get(family, id);
+            if (keepIfAbsent is not null && prevHashes is not null)
+                foreach (var key in keepIfAbsent)
+                    if (!newHashes.ContainsKey(key) && prevHashes.TryGetValue(key, out var kept))
+                        newHashes[key] = kept;
 
             if (prevHashes is null || forceFullState)
             {
@@ -490,12 +580,16 @@ namespace Loam.Revit.Connector.ModelLog
         /// family: a deleted ElementId never resolves back to one). <paramref name="family"/>
         /// defaults to <c>el</c> (the original, still most common case) and is written as the
         /// `del` record's own `of` field for every OTHER family — omitted for `el` so existing
-        /// readers, which only ever saw `el` deletions, are unaffected.</summary>
-        public void WriteDelete(string uniqueId, long? elementId = null, string family = RecordKinds.El)
+        /// readers, which only ever saw `el` deletions, are unaffected. <paramref name="reason"/>
+        /// (see <see cref="DeleteReasons"/>) tells a reader whether this is a real deletion in the
+        /// model or only the record leaving the log's scope — omitted when the caller doesn't
+        /// know.</summary>
+        public void WriteDelete(string uniqueId, long? elementId = null, string family = RecordKinds.El, string? reason = null)
         {
             var fields = new JsonObject { ["id"] = uniqueId };
             if (elementId is not null) fields["eid"] = elementId.Value;
             if (family != RecordKinds.El) fields["of"] = family;
+            if (reason is not null) fields["reason"] = reason;
             Append(RecordKinds.Del, fields);
             _state.Cache.Remove(family, uniqueId);
             _journalBuffer.Add(StateJournal.HashRemoveOp(family, uniqueId));

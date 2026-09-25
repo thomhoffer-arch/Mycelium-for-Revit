@@ -50,7 +50,7 @@ namespace Loam.Revit.Connector
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Loam", "RevitConnector", "model-logs")
                 : settings.ModelLogRoot!;
-            _modelLog = new ModelLogService(modelLogRoot, "0.6.0", retentionDays: settings.ModelLogRetentionDays);
+            _modelLog = new ModelLogService(modelLogRoot, "0.6.1", retentionDays: settings.ModelLogRetentionDays);
 
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();
@@ -88,6 +88,9 @@ namespace Loam.Revit.Connector
                 _ctrl.DocumentClosing                  -= OnDocumentClosing;
             }
             application.Idling -= OnIdling;
+            // Safety net: a closing checkpoint for any model whose DocumentClosing this add-in
+            // never saw (see ModelLogService.CloseAll) — a no-op for models already closed.
+            try { _modelLog?.CloseAll(); } catch { /* best-effort — never block shutdown */ }
             _events?.Dispose();
             _server?.Stop();
             return Result.Succeeded;
@@ -181,12 +184,12 @@ namespace Loam.Revit.Connector
         // stays paused (safe) until that document closes, rather than risking the crash.
         private void OnDocumentSaving(object sender, DocumentSavingEventArgs e)
         {
-            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: false); } catch { }
+            try { _modelLog?.BeginDocumentBusy(e.Document, isSyncOrReload: false); } catch { }
         }
 
         private void OnDocumentSavingAs(object sender, DocumentSavingAsEventArgs e)
         {
-            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: false); } catch { }
+            try { _modelLog?.BeginDocumentBusy(e.Document, isSyncOrReload: false); } catch { }
         }
 
         private void OnDocumentSavedAs(object sender, DocumentSavedAsEventArgs e)
@@ -196,12 +199,12 @@ namespace Loam.Revit.Connector
 
         private void OnDocumentSynchronizing(object sender, DocumentSynchronizingWithCentralEventArgs e)
         {
-            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: true); } catch { }
+            try { _modelLog?.BeginDocumentBusy(e.Document, isSyncOrReload: true); } catch { }
         }
 
         private void OnDocumentReloadingLatest(object sender, DocumentReloadingLatestEventArgs e)
         {
-            try { _modelLog?.BeginDocumentBusy(e.Document, invalidatesWalks: true); } catch { }
+            try { _modelLog?.BeginDocumentBusy(e.Document, isSyncOrReload: true); } catch { }
         }
 
         private void OnDocumentSaved(object sender, DocumentSavedEventArgs e)
@@ -232,8 +235,11 @@ namespace Loam.Revit.Connector
 
         private void OnDocumentClosing(object sender, DocumentClosingEventArgs e)
         {
-            try { Emit("closed", e.Document); } catch { }
+            // The model log's closing checkpoint FIRST: Emit below resolves ModelFacts (worksharing/
+            // cloud path lookups that can be slow), and nothing it does may stand between a closing
+            // model and its `closed: true` checkpoint.
             try { _modelLog?.OnDocumentClosing(e.Document); } catch { /* best-effort — never block close */ }
+            try { Emit("closed", e.Document); } catch { }
             _factsCache.Remove(e.Document);
             _pendingLoamChanges.Remove(e.Document);
         }

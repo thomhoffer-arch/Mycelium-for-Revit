@@ -657,20 +657,40 @@ namespace ModelLog.Tests
             File.SetLastWriteTimeUtc(path, DateTime.UtcNow.AddDays(-daysOld));
         }
 
+        private static void SeedState(string dir, ModelLogState state) =>
+            StateStore.Save(Path.Combine(dir, "state.json"), state);
+
         [Fact]
-        public void Retention_DeletesOldFinishedSegments_KeepsNewestAndActive()
+        public void Retention_DeletesOldSegmentsBeforeCurrentGeneration_KeepsGenerationAndActive()
         {
             var dir = Path.Combine(_root, "model-a");
             Directory.CreateDirectory(dir);
             MakeOldGzSegment(dir, 1, daysOld: 120);
             MakeOldGzSegment(dir, 2, daysOld: 100);
-            MakeOldGzSegment(dir, 3, daysOld: 10); // newest finished — kept regardless of age
+            MakeOldGzSegment(dir, 3, daysOld: 100); // current generation's full state — kept regardless of age
+            MakeOldGzSegment(dir, 4, daysOld: 95);  // continuation of that generation — kept too
+            SeedState(dir, new ModelLogState { CurrentSegment = 5, GenerationSegment = 3 });
 
             using var w = new ModelLogWriter(_root, "model-a", retentionDays: 90);
 
-            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl.gz"))); // older than retention
-            Assert.False(File.Exists(Path.Combine(dir, "000002.jsonl.gz"))); // older than retention
-            Assert.True(File.Exists(Path.Combine(dir, "000003.jsonl.gz"))); // newest finished segment — always kept
+            Assert.False(File.Exists(Path.Combine(dir, "000001.jsonl.gz"))); // older than retention, previous generation
+            Assert.False(File.Exists(Path.Combine(dir, "000002.jsonl.gz")));
+            Assert.True(File.Exists(Path.Combine(dir, "000003.jsonl.gz")));
+            Assert.True(File.Exists(Path.Combine(dir, "000004.jsonl.gz")));
+        }
+
+        [Fact]
+        public void Retention_GenerationStartUnknown_DeletesNothing()
+        {
+            var dir = Path.Combine(_root, "model-a");
+            Directory.CreateDirectory(dir);
+            MakeOldGzSegment(dir, 1, daysOld: 400);
+            MakeOldGzSegment(dir, 2, daysOld: 400);
+
+            using var w = new ModelLogWriter(_root, "model-a", retentionDays: 90); // no state → GenerationSegment 0
+
+            Assert.True(File.Exists(Path.Combine(dir, "000001.jsonl.gz")));
+            Assert.True(File.Exists(Path.Combine(dir, "000002.jsonl.gz")));
         }
 
         [Fact]
@@ -724,6 +744,203 @@ namespace ModelLog.Tests
             w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" });
 
             Assert.False(w.RotationDue); // the new segment starts empty
+        }
+
+        private static void Pad(ModelLogWriter w, int mib)
+        {
+            var padding = new string('x', 1024 * 1024);
+            for (var i = 0; i < mib; i++) w.Append(RecordKinds.Project, new JsonObject { ["pad"] = padding });
+        }
+
+        [Fact]
+        public void RotateContinuationIfDue_NotDue_DoesNothingAndNeverBuildsHeader()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.BeginSnapshot(new JsonObject { ["title"] = "Test.rvt" });
+
+            var rotated = w.RotateContinuationIfDue(() => throw new InvalidOperationException("header must not be built"));
+
+            Assert.False(rotated);
+            Assert.False(File.Exists(Seg(2)));
+        }
+
+        [Fact]
+        public void RotateContinuationIfDue_PastThreshold_StartsContinuationSegmentWithoutFullState()
+        {
+            var w = new ModelLogWriter(_root, "model-a");
+            w.BeginSnapshot(new JsonObject { ["title"] = "Test.rvt" });
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+            Pad(w, 65);
+
+            Assert.True(w.RotateContinuationIfDue(() => new JsonObject { ["title"] = "Test.rvt" }));
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(2, 1, "W")); // an ordinary partial state after rotation
+            w.Dispose();
+
+            Assert.True(File.Exists(Path.Combine(_root, "model-a", "000001.jsonl.gz")));
+            var lines = File.ReadAllLines(Seg(2)).Select(l => JsonNode.Parse(l)!.AsObject()).ToList();
+            Assert.Equal(2, lines.Count); // header + the partial state — no full state re-written
+            Assert.Equal("header", lines[0]["k"]!.GetValue<string>());
+            Assert.True(lines[0]["continuation"]!.GetValue<bool>());
+            Assert.Equal(1, lines[0]["generationStart"]!.GetValue<long>());
+            Assert.Equal(2, lines[0]["segment"]!.GetValue<long>());
+            Assert.Equal("el", lines[1]["k"]!.GetValue<string>());
+            Assert.False(lines[1].ContainsKey("h")); // partial: only the changed field-group
+        }
+
+        [Fact]
+        public void BeginSnapshot_HeaderIsGenerationStart_NotContinuation()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.BeginSnapshot(new JsonObject { ["title"] = "Test.rvt" });
+            w.FlushState();
+
+            var header = JsonNode.Parse(File.ReadAllLines(Seg(1)).First())!.AsObject();
+            Assert.Equal(1, header["generationStart"]!.GetValue<long>());
+            Assert.False(header.ContainsKey("continuation"));
+        }
+
+        [Fact]
+        public void GenerationSegment_SurvivesReopen()
+        {
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                w.Append(RecordKinds.Project, new JsonObject { ["number"] = "1" });
+                w.BeginNewGeneration(new JsonObject { ["title"] = "Test.rvt" }); // generation starts at segment 2
+            }
+            using var reopened = new ModelLogWriter(_root, "model-a");
+            reopened.RotateContinuationIfDue(() => new JsonObject()); // not due — just proves nothing throws
+            Assert.False(reopened.NewGenerationDue);
+            Assert.Equal(2, StateStore.Load(Path.Combine(_root, "model-a", "state.json")).GenerationSegment);
+        }
+
+        [Fact]
+        public void NewGenerationDue_AfterMaxContinuationSegments()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.BeginSnapshot(new JsonObject { ["title"] = "Test.rvt" });
+            for (var i = 0; i < ModelLogWriter.MaxContinuationSegments; i++)
+            {
+                Assert.False(w.NewGenerationDue);
+                Pad(w, 65);
+                Assert.True(w.RotateContinuationIfDue(() => new JsonObject { ["title"] = "Test.rvt" }));
+            }
+            Assert.False(w.NewGenerationDue); // at the limit, but the active continuation isn't full yet
+            Pad(w, 65);
+            Assert.True(w.NewGenerationDue);
+        }
+
+        [Fact]
+        public void NewGenerationDue_UnknownGenerationStart_FallsBackToSizeThreshold()
+        {
+            using var w = new ModelLogWriter(_root, "model-a"); // never snapshotted → GenerationSegment 0
+            Assert.False(w.NewGenerationDue);
+            Pad(w, 65);
+            Assert.True(w.NewGenerationDue);
+        }
+
+        [Theory]
+        [InlineData(DeleteReasons.Deleted)]
+        [InlineData(DeleteReasons.Filtered)]
+        [InlineData(DeleteReasons.Unreferenced)]
+        public void WriteDelete_WithReason_WritesReasonField(string reason)
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+            w.WriteDelete("guid-1", reason: reason);
+            w.FlushState();
+
+            var parsed = JsonNode.Parse(File.ReadAllLines(Seg(1)).Last())!.AsObject();
+            Assert.Equal(reason, parsed["reason"]!.GetValue<string>());
+        }
+
+        [Fact]
+        public void WriteDelete_NoReason_OmitsReasonField()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteDelete("guid-1");
+            w.FlushState();
+
+            var parsed = JsonNode.Parse(File.ReadAllLines(Seg(1)).Last())!.AsObject();
+            Assert.False(parsed.ContainsKey("reason"));
+        }
+
+        [Fact]
+        public void ClosedCheckpoint_CompactsSoStateJsonItselfReadsClosed()
+        {
+            var statePath = Path.Combine(_root, "model-a", "state.json");
+            using (var w = new ModelLogWriter(_root, "model-a"))
+            {
+                w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"));
+                w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 1, closed: false);
+                w.WriteCheckpoint(complete: true, modelVersion: "v1", elementCount: 1, closed: true);
+            }
+
+            // Read the BASE file alone, not base+journal — what a person inspecting state.json sees.
+            var baseOnly = System.Text.Json.JsonSerializer.Deserialize<ModelLogState>(File.ReadAllText(statePath))!;
+            Assert.True(baseOnly.LastCheckpointClosed);
+        }
+
+        [Fact]
+        public void WriteCheckpoint_SkippedErrors_WrittenOnlyWhenPositive()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteCheckpoint(complete: true, modelVersion: null, elementCount: null, closed: false);
+            w.WriteCheckpoint(complete: true, modelVersion: null, elementCount: null, closed: false, skippedErrors: 3);
+            w.FlushState();
+
+            var lines = File.ReadAllLines(Seg(1)).Select(l => JsonNode.Parse(l)!.AsObject()).ToList();
+            Assert.False(lines[0].ContainsKey("errors"));
+            Assert.Equal(3, lines[1]["errors"]!.GetValue<int>());
+        }
+
+        [Fact]
+        public void WriteGap_AlwaysWrites()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            w.WriteGap("snapshot failed");
+            w.FlushState();
+
+            var parsed = JsonNode.Parse(File.ReadAllLines(Seg(1)).Last())!.AsObject();
+            Assert.Equal("gap", parsed["k"]!.GetValue<string>());
+            Assert.Equal("snapshot failed", parsed["reason"]!.GetValue<string>());
+        }
+
+        [Fact]
+        public void WriteIfChanged_KeepIfAbsent_NeverUnsetsAndKeepsHash()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            var full = El(1, 1, "W");
+            full["sheets"] = new JsonArray { "A101", "A102" };
+            w.WriteIfChanged(RecordKinds.El, "guid-1", full);
+
+            // `sheets` unknown this time (no visibility index) and nothing else changed: no write.
+            Assert.False(w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W"), keepIfAbsent: new[] { "sheets" }));
+
+            // Something else changed: partial write of that group only, no `unset: ["sheets"]`.
+            Assert.True(w.WriteIfChanged(RecordKinds.El, "guid-1", El(2, 1, "W"), keepIfAbsent: new[] { "sheets" }));
+            w.FlushState();
+            var partial = JsonNode.Parse(File.ReadAllLines(Seg(1)).Last())!.AsObject();
+            Assert.False(partial.ContainsKey("unset"));
+            Assert.False(partial.ContainsKey("sheets"));
+
+            // Kept hash carried over: the same sheets computed again later is not a change.
+            var again = El(2, 1, "W");
+            again["sheets"] = new JsonArray { "A101", "A102" };
+            Assert.False(w.WriteIfChanged(RecordKinds.El, "guid-1", again));
+        }
+
+        [Fact]
+        public void WriteIfChanged_WithoutKeepIfAbsent_StillUnsetsMissingGroup()
+        {
+            using var w = new ModelLogWriter(_root, "model-a");
+            var full = El(1, 1, "W");
+            full["sheets"] = new JsonArray { "A101" };
+            w.WriteIfChanged(RecordKinds.El, "guid-1", full);
+
+            Assert.True(w.WriteIfChanged(RecordKinds.El, "guid-1", El(1, 1, "W")));
+            w.FlushState();
+            var partial = JsonNode.Parse(File.ReadAllLines(Seg(1)).Last())!.AsObject();
+            Assert.Equal("sheets", partial["unset"]![0]!.GetValue<string>());
         }
 
         [Fact]
