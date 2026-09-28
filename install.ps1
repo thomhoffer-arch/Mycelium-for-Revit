@@ -78,6 +78,37 @@ foreach ($version in $detected) {
     New-Item -ItemType Directory -Force $addinDir | Out-Null
     Expand-Archive -Force -Path $zipPath -DestinationPath $addinDir
     Write-Host "    Revit ${version}: done." -ForegroundColor Green
+
+    # ── Guard against a stale duplicate manifest (crash report, 28 Sep) ─────────
+    # Revit loads .addin manifests from BOTH the per-user folder above AND the
+    # all-users "%ProgramData%\Autodesk\Revit\Addins\<version>" folder. This
+    # installer only ever writes to the per-user one, but a manual/all-users copy
+    # left behind in ProgramData (this installer has never written there — any
+    # copy found is from a manual install or an older tool) registers the SAME
+    # <AddInId> a second time. Two manifests sharing one AddInId is unsupported:
+    # which DLL Revit actually loads for that id is undefined, so an old,
+    # unpatched build sitting in ProgramData can silently shadow the fresh one
+    # just installed here — exactly what a live crash report traced back to (a
+    # May build in ProgramData still active alongside a September build here).
+    # Removing the stale copy is safe: it is never this installer's own file,
+    # and leaving two DLLs registered under one AddInId is strictly worse than
+    # having only the one this installer just verified.
+    $allUsersAddinDir = Join-Path $env:ProgramData "Autodesk\Revit\Addins\$version"
+    $staleManifest = Join-Path $allUsersAddinDir 'LoamRevitConnector.addin'
+    if (Test-Path $staleManifest) {
+        Write-Host "    [WARN] Found a duplicate manifest at $staleManifest" -ForegroundColor Yellow
+        Write-Host "           (same add-in registered for ALL users, separate from the per-user" -ForegroundColor Yellow
+        Write-Host "           copy above) — Revit would load both under the same AddInId, which" -ForegroundColor Yellow
+        Write-Host "           can silently run a stale/old build instead of this one. Removing it." -ForegroundColor Yellow
+        try {
+            Remove-Item -Force $staleManifest -ErrorAction Stop
+            $staleDll = Join-Path $allUsersAddinDir 'LoamRevitConnector.dll'
+            if (Test-Path $staleDll) { Remove-Item -Force $staleDll -ErrorAction SilentlyContinue }
+            Write-Host "    Removed stale all-users manifest for Revit ${version}." -ForegroundColor Green
+        } catch {
+            Write-Host "    [WARN] Could not remove $staleManifest — remove it manually to avoid Revit loading two copies." -ForegroundColor Yellow
+        }
+    }
 }
 
 Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
