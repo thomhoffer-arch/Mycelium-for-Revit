@@ -126,6 +126,13 @@ The installer auto-detects Revit 2024, 2025, and 2026, downloads the correct bui
 
 Launch Revit and open a project — the MCP server starts automatically.
 
+The installer only ever writes to the per-user add-in folder
+(`%APPDATA%\Autodesk\Revit\Addins\<version>`). If it finds a copy of this connector already
+registered for all users (`%ProgramData%\Autodesk\Revit\Addins\<version>`) — e.g. from a manual
+install — it removes that copy: both manifests share the same `AddInId`, and Revit's behavior
+when two different builds are registered under one id is undefined, so a stale all-users copy
+can silently shadow the version this installer just verified.
+
 ---
 
 ## Repo layout
