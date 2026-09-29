@@ -50,7 +50,8 @@ namespace Loam.Revit.Connector
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Loam", "RevitConnector", "model-logs")
                 : settings.ModelLogRoot!;
-            _modelLog = new ModelLogService(modelLogRoot, "0.6.1", retentionDays: settings.ModelLogRetentionDays);
+            _modelLog = new ModelLogService(modelLogRoot, "0.6.1", retentionDays: settings.ModelLogRetentionDays,
+                enableVisibleSheetsIndex: settings.ModelLogVisibleSheetsEnabled);
 
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();

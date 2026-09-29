@@ -39,6 +39,21 @@ namespace Loam.Revit.Connector.RevitBridge
         /// everything).</summary>
         public int ModelLogRetentionDays { get; set; } = 90;
 
+        /// <summary>HOTFIX (live report, 29 Sep: "regenerating views/sheets/graphics ... the whole
+        /// time", Revit unusable): defaults OFF. The `el.sheets` "which sheets show this element"
+        /// index (see <c>RecordBuilder.AddVisibleElements</c>) walks a VIEW-SCOPED
+        /// <c>FilteredElementCollector</c> for every model view placed on any sheet — exactly the
+        /// "Generating graphics for ..." trigger <c>GetSheetsTool</c>'s own ROOT FIX note already
+        /// identified and blocked for the on-demand MCP tool. That fix never covered this
+        /// automatic background pass: it re-runs on every model open, every sync/reload, and every
+        /// full reconcile (which a routine edit to a Grid/Level/Room/Sheet/Viewport/Phase/
+        /// DesignOption forces — see <c>ModelLogService.RequiresFullReconcile</c>), so on a model
+        /// with many sheets it can force Revit to regenerate every placed view's graphics
+        /// repeatedly during ordinary work. Set true only once a non-disruptive way to build this
+        /// index exists; until then `sheets` is populated from tags alone, same as before
+        /// v0.6.1.</summary>
+        public bool ModelLogVisibleSheetsEnabled { get; set; } = false;
+
         /// <summary>True when this settings file exists but explicitly carries an empty/blank
         /// token (or failed to parse) — the caller must refuse to start the MCP server in this
         /// case, never fall back to running unauthenticated.</summary>
