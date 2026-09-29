@@ -1288,9 +1288,10 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // view's graphics, and this walk (unlike the MCP tool's own already-fixed version of
             // the same call) re-runs on every open/sync/reload/full-reconcile, not once per
             // explicit request.
+            Dictionary<ElementId, List<string>>? visibleSheets = null;
             if (_enableVisibleSheetsIndex)
             {
-                var visibleSheets = new Dictionary<ElementId, List<string>>();
+                visibleSheets = new Dictionary<ElementId, List<string>>();
                 List<(ElementId ViewId, string SheetNumber)> sheetViews;
                 try { sheetViews = RecordBuilder.VisibleSheetViews(doc); }
                 catch { sheetViews = new List<(ElementId, string)>(); errors.Count++; }
