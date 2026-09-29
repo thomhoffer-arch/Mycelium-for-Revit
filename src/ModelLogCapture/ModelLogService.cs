@@ -114,13 +114,21 @@ namespace Loam.Revit.Connector.ModelLogCapture
         // than a one-time snapshot (every sync/reload, every full reconcile).
         private readonly bool _enableVisibleSheetsIndex;
 
-        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null, int retentionDays = 90, bool enableVisibleSheetsIndex = false)
+        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null, int retentionDays = 90, bool enableVisibleSheetsIndex = false, Action<string, double>? onSliceOverBudget = null)
         {
             _modelLogRoot = modelLogRoot;
             _producerVersion = producerVersion;
             _retentionDays = retentionDays;
             _enableVisibleSheetsIndex = enableVisibleSheetsIndex;
-            _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }), onJobFailed: (_, __) => { });
+            // DIAGNOSTICS (dev handoff, 29 Sep freeze report): previously both callbacks defaulted
+            // to a no-op, so nobody could see when or how long the connector blocked Revit's UI
+            // thread — a slice that overran its budget, or a snapshot/reconcile's total time, left
+            // no trace anywhere. Both are now always wired (App.cs supplies real handlers; tests
+            // and any other caller that passes nothing still get the no-op default).
+            _idle = new IdleSliceRunner(
+                onJobFinished ?? ((_, __, ___) => { }),
+                onSliceOverBudget: onSliceOverBudget,
+                onJobFailed: (_, __) => { });
         }
 
         // ── Sync/reload/save/close safety ──────────────────────────────────────

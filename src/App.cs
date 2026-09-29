@@ -50,8 +50,20 @@ namespace Loam.Revit.Connector
                 ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "Loam", "RevitConnector", "model-logs")
                 : settings.ModelLogRoot!;
+            // DIAGNOSTICS (dev handoff, 29 Sep freeze report): "slice overruns are invisible in
+            // production" — IdleSliceRunner already measures a job's total time/steps and flags any
+            // single slice that overran its 50ms budget, but ModelLogService used to wire neither
+            // callback, so nobody could see when or how long the connector blocked Revit's UI
+            // thread. One small perf log, connector-wide (idle-time jobs aren't scoped to a single
+            // document's own writer), so a freeze report can be matched against real numbers
+            // instead of guesswork.
+            var perfLogPath = Path.Combine(modelLogRoot, "_perf.log");
             _modelLog = new ModelLogService(modelLogRoot, "0.6.1", retentionDays: settings.ModelLogRetentionDays,
-                enableVisibleSheetsIndex: settings.ModelLogVisibleSheetsEnabled);
+                enableVisibleSheetsIndex: settings.ModelLogVisibleSheetsEnabled,
+                onJobFinished: (name, totalMs, steps) =>
+                    LogPerf(perfLogPath, $"finished job={name} totalMs={totalMs:F1} steps={steps}"),
+                onSliceOverBudget: (name, sliceMs) =>
+                    LogPerf(perfLogPath, $"overbudget job={name} sliceMs={sliceMs:F1}"));
 
             // Event-driven push to Loam (additive; no-op if Loam isn't running).
             _events = new LoamEventClient();
@@ -411,6 +423,20 @@ namespace Loam.Revit.Connector
             if (doc is null) return;
             var facts = RefreshFacts(doc);
             _events?.Send(kind, facts, cause);
+        }
+
+        /// <summary>Best-effort append of one diagnostic line (see the perf-log wiring in
+        /// OnStartup) — never throws, never blocks noticeably (these callbacks fire rarely: once
+        /// per finished idle job, or only on the rare slice that overran its budget), and never
+        /// competes with a model's own log for its lock or format.</summary>
+        private static void LogPerf(string path, string line)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.AppendAllText(path, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ") + " " + line + Environment.NewLine);
+            }
+            catch { /* best-effort — never throw out of Idling */ }
         }
 
         // ── ModelFacts cache ────────────────────────────────────────────────────
