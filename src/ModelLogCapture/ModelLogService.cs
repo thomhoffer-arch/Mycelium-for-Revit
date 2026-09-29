@@ -107,11 +107,19 @@ namespace Loam.Revit.Connector.ModelLogCapture
 
         private readonly int _retentionDays;
 
-        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null, int retentionDays = 90)
+        // HOTFIX (live report, 29 Sep: "regenerating views/sheets/graphics ... the whole time") —
+        // see ConnectorSettings.ModelLogVisibleSheetsEnabled's own doc comment for why this
+        // defaults false: the per-view visibility pass in WalkModel forces Revit to regenerate
+        // graphics for every model view placed on a sheet, and WalkModel re-runs far more often
+        // than a one-time snapshot (every sync/reload, every full reconcile).
+        private readonly bool _enableVisibleSheetsIndex;
+
+        public ModelLogService(string modelLogRoot, string producerVersion, Action<string, double, int>? onJobFinished = null, int retentionDays = 90, bool enableVisibleSheetsIndex = false)
         {
             _modelLogRoot = modelLogRoot;
             _producerVersion = producerVersion;
             _retentionDays = retentionDays;
+            _enableVisibleSheetsIndex = enableVisibleSheetsIndex;
             _idle = new IdleSliceRunner(onJobFinished ?? ((_, __, ___) => { }), onJobFailed: (_, __) => { });
         }
 
@@ -1274,21 +1282,29 @@ namespace Loam.Revit.Connector.ModelLogCapture
             // el.sheets: the sheets whose placed views SHOW each element (v0.6.1 — before, only
             // tagged elements got `sheets`: 4% of elements with 322 sheets in the model). One
             // Revit visibility pass per model view placed on a sheet, ONE VIEW PER IDLE STEP
-            // (the expensive part of this whole walk on a model with many sheets).
-            var visibleSheets = new Dictionary<ElementId, List<string>>();
-            List<(ElementId ViewId, string SheetNumber)> sheetViews;
-            try { sheetViews = RecordBuilder.VisibleSheetViews(doc); }
-            catch { sheetViews = new List<(ElementId, string)>(); errors.Count++; }
-            var modelCategoryFilter = RecordBuilder.ModelCategoryFilter(doc);
-            yield return true;
-            foreach (var (viewId, sheetNumber) in sheetViews)
+            // (the expensive part of this whole walk on a model with many sheets) — DISABLED BY
+            // DEFAULT (see ConnectorSettings.ModelLogVisibleSheetsEnabled): AddVisibleElements'
+            // view-scoped FilteredElementCollector is exactly what forces Revit to regenerate that
+            // view's graphics, and this walk (unlike the MCP tool's own already-fixed version of
+            // the same call) re-runs on every open/sync/reload/full-reconcile, not once per
+            // explicit request.
+            if (_enableVisibleSheetsIndex)
             {
-                if (isStale()) yield break;
-                if (!RecordBuilder.AddVisibleElements(doc, viewId, sheetNumber, modelCategoryFilter, visibleSheets))
-                    errors.Count++;
+                var visibleSheets = new Dictionary<ElementId, List<string>>();
+                List<(ElementId ViewId, string SheetNumber)> sheetViews;
+                try { sheetViews = RecordBuilder.VisibleSheetViews(doc); }
+                catch { sheetViews = new List<(ElementId, string)>(); errors.Count++; }
+                var modelCategoryFilter = RecordBuilder.ModelCategoryFilter(doc);
                 yield return true;
+                foreach (var (viewId, sheetNumber) in sheetViews)
+                {
+                    if (isStale()) yield break;
+                    if (!RecordBuilder.AddVisibleElements(doc, viewId, sheetNumber, modelCategoryFilter, visibleSheets))
+                        errors.Count++;
+                    yield return true;
+                }
+                cache.VisibleSheets = visibleSheets;
             }
-            cache.VisibleSheets = visibleSheets;
 
             var typeIds = new HashSet<ElementId>();
             void OnParamDef(Parameter p, bool isType)
